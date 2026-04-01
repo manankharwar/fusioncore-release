@@ -31,7 +31,9 @@ FusionCore is that replacement.
 | TF validation | Silent failure | Silent failure | Startup check + exact fix commands |
 | Multiple sensor sources | No | No | Yes: 2x GPS, multiple IMUs |
 | compass_msgs/Azimuth | No | No | Yes: ROS 2 native port |
-| Delay compensation | No | No | Yes: retrodiction up to 500ms |
+| Delay compensation | No | No | Yes: full IMU replay retrodiction up to 500ms |
+| Ground constraint | No | No | Yes: VZ=0 pseudo-measurement for wheeled robots |
+| Sensor dropout detection | Silent | Silent | Per-sensor staleness with SensorHealth enum |
 | Maintenance | Abandoned | Slow | Active, issues answered in 24h |
 | License | BSD-3 | BSD-3 | Apache 2.0 |
 | ROS 2 Jazzy | Ported | Native | Native, built from scratch |
@@ -87,6 +89,8 @@ ros2 topic hz /fusion/odom
 
 FusionCore uses a ROS 2 lifecycle node. Configure first (load parameters, validate TF tree, check transforms), then activate (start processing sensor data). This prevents the filter from starting with bad initial values or missing transforms.
 
+> **WSL2 note:** If `ros2 lifecycle set` returns "Node not found", use the launch file's built-in auto-configure instead. The Gazebo launch file (`fusioncore_gazebo.launch.py`) configures and activates the node automatically via `EmitEvent(ChangeState(...))` 12 seconds after startup, bypassing DDS discovery latency that affects WSL2.
+
 ---
 
 ## Sensor topics
@@ -128,8 +132,11 @@ fusioncore:
     encoder.vel_noise: 0.05     # m/s
     encoder.yaw_noise: 0.02     # rad/s
 
-    gnss.base_noise_xy: 1.0     # meters: scaled automatically by HDOP
-    gnss.base_noise_z: 2.0      # meters
+    gnss.base_noise_xy: 1.0     # meters: scaled automatically by HDOP. Must be 1.0 when
+                                # NavSatFix provides covariance: fusion_node sets
+                                # fix.hdop = sqrt(var_xy), so sigma = 1.0 * sqrt(var_xy).
+                                # Setting this to NOISE_H double-shrinks R.
+    gnss.base_noise_z: 1.0      # meters: same reasoning: set to 1.0, not NOISE_V
     gnss.heading_noise: 0.02    # rad: for dual antenna
     gnss.max_hdop: 4.0          # reject fixes worse than this
     gnss.min_satellites: 4
@@ -236,6 +243,16 @@ FusionCore uses the covariance values sensors actually publish rather than ignor
 
 **IMU orientation:** Reads `orientation_covariance` from the message. Uses it directly when meaningful, falls back to config params when not.
 
+### Non-holonomic ground constraint
+
+For wheeled ground robots, FusionCore fuses a `VZ = 0` pseudo-measurement on every encoder update. This prevents vertical velocity from drifting due to IMU noise and keeps altitude estimation stable even when GPS has weak vertical observability.
+
+Call `update_ground_constraint(timestamp)` after every `update_encoder()` call in your integration. Do not call this for aerial vehicles or robots that can move vertically.
+
+### Sensor dropout detection
+
+FusionCore tracks the last update time for each sensor independently. If a sensor goes silent for longer than `stale_timeout` (default 1.0 second), `get_status()` returns `SensorHealth::STALE` for that sensor. The filter continues running on the remaining sensors and recovers automatically when the missing sensor resumes. This is reported via `FusionCoreStatus` so your application can alert the operator or take action without polling every topic individually.
+
 ### compass_msgs/Azimuth
 
 peci1 (Great Contributor, ROS Discourse) suggested using `compass_msgs/Azimuth` as a standard heading message format. The upstream package is ROS 1 only. FusionCore ships a ROS 2 native port with the identical message definition.
@@ -250,13 +267,15 @@ FusionCore saves a full state snapshot (21-dimensional state + covariance) on ev
 
 This is approximate retrodiction: the re-prediction uses the motion model rather than replaying actual IMU history. For smooth motion at normal robot speeds the approximation error is small compared to GPS noise. Full IMU replay retrodiction is on the roadmap.
 
+**Update:** Full IMU replay retrodiction is now implemented. Every raw IMU message is stored in a ring buffer (configurable size, default 100 messages = 1 second at 100Hz). When a delayed GPS fix arrives, FusionCore restores the closest snapshot before the fix timestamp, re-fuses the fix at the correct time, then replays all buffered IMU messages forward to now rather than using one big predict(dt). This eliminates the motion-model approximation error for delayed measurements entirely.
+
 ---
 
 ## Simulation
 
 FusionCore ships with a Gazebo Harmonic simulation world so you can test the full fusion pipeline without physical hardware. It includes a differential drive robot with a 100Hz IMU and GPS, in an outdoor environment with the GPS origin set to Hamilton, Ontario.
 
-One thing worth knowing up front: Gazebo Harmonic's built-in NavSat sensor has a known bug (gz-sim issue #2163) where it periodically outputs GPS fixes at completely wrong coordinates: sometimes 100km away. Rather than fight a broken sensor, the simulation derives GPS from Gazebo's ground truth world pose and adds realistic Gaussian noise (1m horizontal, 2m vertical). This gives you a clean, honest GPS model for testing the filter.
+One thing worth knowing up front: Gazebo Harmonic's built-in NavSat sensor has a known bug (gz-sim issue #2163) where it periodically outputs GPS fixes at completely wrong coordinates: sometimes 100km away. Rather than fight a broken sensor, the simulation derives GPS from Gazebo's ground truth world pose and adds realistic Gaussian noise (0.5m horizontal, 0.3m vertical 1-sigma). This gives you a clean, honest GPS model for testing the filter.
 
 ### Running the simulation
 
@@ -350,6 +369,7 @@ fusioncore/
 
 **Working and tested:**
 - UKF core: 42 unit tests passing via colcon test
+- UKF numerical stability: P symmetrization + identity-shift Cholesky repair
 - IMU + encoder + GPS fusion
 - Automatic IMU bias estimation
 - ECEF GPS conversion with quality-aware noise scaling
@@ -363,16 +383,17 @@ fusioncore/
 - Heading observability tracking: DUAL_ANTENNA / IMU_ORIENTATION / GPS_TRACK
 - Mahalanobis outlier rejection: GPS jumps verified rejected in testing
 - Adaptive noise covariance: automatic R estimation from innovation sequence
-- GPS delay compensation: retrodiction up to 500ms
+- GPS delay compensation: full IMU replay retrodiction up to 500ms (per-message replay, not approximate)
+- Non-holonomic ground constraint: VZ=0 pseudo-measurement for wheeled robots
+- Sensor dropout detection: per-sensor staleness tracking via FusionCoreStatus
 - ROS 2 Jazzy lifecycle node at 100Hz
 - Gazebo Harmonic simulation world
 
 **Known limitations:**
-- Delay compensation uses approximate retrodiction (one forward prediction step, not full IMU replay). Accurate for smooth motion, may introduce small inconsistencies during high-acceleration maneuvers.
 - GNSS antenna lever arm is fixed and known: does not estimate it from data.
+- In Gazebo simulation, residual y-axis drift (~0.3m) can occur from real Gazebo physics (wheel contact forces, slight crabbing). This is not a filter error: the robot's true center of mass drifts relative to the GPS-derived ENU origin.
 
 **Roadmap:**
-- Full IMU replay retrodiction
 - Ackermann and omnidirectional steering motion models
 
 ---

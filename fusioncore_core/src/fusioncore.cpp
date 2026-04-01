@@ -16,8 +16,8 @@ bool FusionCore::is_outlier(
   double threshold) const
 {
   // Mahalanobis distance squared: d² = νᵀ · S⁻¹ · ν
-  // .value() extracts scalar from 1x1 matrix — works for all dimensions
-  double d2 = (innovation.transpose() * S.inverse() * innovation).value();
+  // Use LDLT decomposition — numerically stable when S is near-singular.
+  double d2 = innovation.dot(S.ldlt().solve(innovation));
   return d2 > threshold;
 }
 
@@ -98,6 +98,7 @@ void FusionCore::init(const State& initial_state, double timestamp_seconds) {
 
   // Reset snapshot buffer
   snapshot_buffer_.clear();
+  imu_buffer_.clear();
 
   // Initialize adaptive noise matrices
   init_adaptive_R();
@@ -114,6 +115,8 @@ void FusionCore::reset() {
   heading_source_    = HeadingSource::NONE;
   gnss_pos_set_      = false;
   distance_traveled_ = 0.0;
+  snapshot_buffer_.clear();
+  imu_buffer_.clear();
 }
 
 void FusionCore::save_snapshot() {
@@ -155,18 +158,19 @@ bool FusionCore::apply_delayed_measurement(
     return true;
   }
 
-  // Find the snapshot closest to but before measurement_timestamp
-  const StateSnapshot* best = nullptr;
+  // Fix 7: copy snapshot by value — raw pointer into std::deque is invalidated
+  // by any push_back/pop_front between pointer capture and use.
+  StateSnapshot best_snap;
+  bool found = false;
   for (auto it = snapshot_buffer_.rbegin(); it != snapshot_buffer_.rend(); ++it) {
     if (it->timestamp <= measurement_timestamp) {
-      best = &(*it);
+      best_snap = *it;
+      found = true;
       break;
     }
   }
-
-  if (!best) {
-    // All snapshots are after measurement — use oldest
-    best = &snapshot_buffer_.front();
+  if (!found) {
+    best_snap = snapshot_buffer_.front();
   }
 
   // Save current state to restore after re-prediction
@@ -176,20 +180,48 @@ bool FusionCore::apply_delayed_measurement(
   double current_gnss     = last_gnss_time_;
 
   // Roll back to snapshot
-  ukf_.init(best->state);
-  last_timestamp_     = best->timestamp;
-  last_imu_time_      = best->last_imu_time;
-  last_encoder_time_  = best->last_encoder_time;
-  last_gnss_time_     = best->last_gnss_time;
+  ukf_.init(best_snap.state);
+  last_timestamp_     = best_snap.timestamp;
+  last_imu_time_      = best_snap.last_imu_time;
+  last_encoder_time_  = best_snap.last_encoder_time;
+  last_gnss_time_     = best_snap.last_gnss_time;
 
   // Apply the delayed measurement (predict_to inside apply_fn handles timing)
   apply_fn();
 
-  // Re-predict forward to where we were
-  double dt = current_time - last_timestamp_;
-  if (dt > config_.min_dt && dt <= config_.max_dt) {
-    ukf_.predict(dt);
+  // ── Full IMU replay retrodiction ──────────────────────────────────────────
+  // Instead of one big predict(dt), replay every buffered IMU message
+  // between the snapshot time and current_time in chronological order.
+  // This correctly evolves the state through all intermediate dynamics.
+  double replay_start = last_timestamp_;
+  bool replayed_any   = false;
+
+  for (const auto& imu : imu_buffer_) {
+    if (imu.timestamp <= replay_start) continue;
+    if (imu.timestamp >  current_time) break;
+
+    double dt = imu.timestamp - last_timestamp_;
+    if (dt > config_.min_dt && dt <= config_.max_dt) {
+      ukf_.predict(dt);
+      last_timestamp_ = imu.timestamp;
+
+      // Re-apply the IMU measurement so the filter sees the real dynamics
+      sensors::ImuMeasurement z;
+      z[0] = imu.wx; z[1] = imu.wy; z[2] = imu.wz;
+      z[3] = imu.ax; z[4] = imu.ay; z[5] = imu.az;
+      ukf_.update<sensors::IMU_DIM>(z, sensors::imu_measurement_function, imu.R);
+      replayed_any = true;
+    }
   }
+
+  // If no IMU messages were in the buffer, fall back to single predict step
+  if (!replayed_any) {
+    double dt = current_time - last_timestamp_;
+    if (dt > config_.min_dt && dt <= config_.max_dt) {
+      ukf_.predict(dt);
+    }
+  }
+
   last_timestamp_    = current_time;
   last_imu_time_     = current_imu;
   last_encoder_time_ = current_encoder;
@@ -202,6 +234,19 @@ void FusionCore::predict_to(double timestamp_seconds) {
   double dt = timestamp_seconds - last_timestamp_;
   if (dt < config_.min_dt) return;
   if (dt > config_.max_dt) {
+    // Gap too large for a single step (sensor dropout, startup lag, etc.).
+    // Step through in max_dt chunks so P accumulates Q proportionally to the
+    // actual elapsed time — keeps uncertainty calibrated over long dropouts.
+    double t = last_timestamp_;
+    while (t + config_.max_dt < timestamp_seconds) {
+      ukf_.predict(config_.max_dt);
+      t += config_.max_dt;
+    }
+    // Fix 4: predict the remaining partial chunk — state was only propagated to t, not timestamp_seconds
+    double dt_remaining = timestamp_seconds - t;
+    if (dt_remaining > config_.min_dt) {
+      ukf_.predict(dt_remaining);
+    }
     last_timestamp_ = timestamp_seconds;
     return;
   }
@@ -209,7 +254,7 @@ void FusionCore::predict_to(double timestamp_seconds) {
   last_timestamp_ = timestamp_seconds;
 }
 
-void FusionCore::update_distance_traveled(double x, double y) {
+void FusionCore::update_distance_traveled(double x, double y, double pre_update_speed) {
   if (!gnss_pos_set_) {
     last_gnss_x_  = x;
     last_gnss_y_  = y;
@@ -226,12 +271,13 @@ void FusionCore::update_distance_traveled(double x, double y) {
   const double MIN_STEP = 0.05;  // 5cm
   if (dist < MIN_STEP) return;
 
-  // Estimate speed from this GPS step and the time since last GNSS fix
-  // If dt is available, check that speed is meaningful (not jitter, not slip)
-  // We use the state velocity as a cross-check
-  double state_speed = std::sqrt(
-    ukf_.state().x[VX] * ukf_.state().x[VX] +
-    ukf_.state().x[VY] * ukf_.state().x[VY]);
+  // Fix 8: use pre-update speed captured before apply_gnss_update().
+  // Post-update velocity is already GNSS-corrected and not representative of
+  // motion during the GPS step. Fall back to current state if not provided.
+  double state_speed = (pre_update_speed >= 0.0)
+    ? pre_update_speed
+    : std::sqrt(ukf_.state().x[VX] * ukf_.state().x[VX] +
+                ukf_.state().x[VY] * ukf_.state().x[VY]);
 
   // Minimum forward speed to count as real motion
   // Below this threshold: could be GPS jitter, spinning in place, or sliding
@@ -274,6 +320,19 @@ void FusionCore::update_imu(
 
   // Use adaptive R if initialized, else config default
   sensors::ImuNoiseMatrix R = adaptive_initialized_ ? R_imu_ : sensors::imu_noise_matrix(config_.imu);
+
+  // Mahalanobis outlier rejection for IMU
+  if (config_.outlier_rejection) {
+    sensors::ImuMeasurement innovation_pre;
+    sensors::ImuNoiseMatrix S;
+    ukf_.predict_measurement<sensors::IMU_DIM>(z, sensors::imu_measurement_function, R, innovation_pre, S);
+    if (is_outlier<sensors::IMU_DIM>(innovation_pre, S, config_.outlier_threshold_imu)) {
+      ++imu_outliers_;
+      last_imu_time_ = timestamp_seconds;
+      return;
+    }
+  }
+
   auto innovation = ukf_.update<sensors::IMU_DIM>(z, sensors::imu_measurement_function, R);
 
   // Track innovation for adaptive noise estimation
@@ -281,6 +340,16 @@ void FusionCore::update_imu(
 
   // Save snapshot for delay compensation
   save_snapshot();
+
+  // Save IMU message for full replay retrodiction
+  ImuBufferEntry entry;
+  entry.timestamp = timestamp_seconds;
+  entry.wx = wx; entry.wy = wy; entry.wz = wz;
+  entry.ax = ax; entry.ay = ay; entry.az = az;
+  entry.R  = R;
+  imu_buffer_.push_back(entry);
+  while ((int)imu_buffer_.size() > config_.imu_buffer_size)
+    imu_buffer_.pop_front();
 
   last_imu_time_ = timestamp_seconds;
   ++update_count_;
@@ -307,11 +376,30 @@ void FusionCore::update_imu_orientation(
   if (orientation_cov != nullptr) {
     R = sensors::imu_orientation_noise_from_covariance(orientation_cov, fallback);
   } else {
-    R = sensors::imu_orientation_noise_matrix(fallback);
+    R = adaptive_initialized_ ? R_imu_orient_ : sensors::imu_orientation_noise_matrix(fallback);
   }
 
-  ukf_.update<sensors::IMU_ORIENTATION_DIM>(
-    z, sensors::imu_orientation_measurement_function, R);
+  // Mahalanobis outlier rejection for IMU orientation
+  if (config_.outlier_rejection) {
+    sensors::ImuOrientationMeasurement innovation_pre;
+    sensors::ImuOrientationNoiseMatrix S;
+    ukf_.predict_measurement<sensors::IMU_ORIENTATION_DIM>(
+      z, sensors::imu_orientation_measurement_function, R, innovation_pre, S);
+    if (is_outlier<sensors::IMU_ORIENTATION_DIM>(innovation_pre, S, config_.outlier_threshold_imu)) {
+      ++imu_outliers_;
+      last_imu_time_ = timestamp_seconds;
+      return;
+    }
+  }
+
+  // Dimension 2 (yaw) is an angle — wrap z_diff across ±π boundary
+  constexpr unsigned int IMU_ORIENT_ANGLE_DIMS = 0b100;  // bit 2 = yaw
+  auto imu_orient_innovation = ukf_.update<sensors::IMU_ORIENTATION_DIM>(
+    z, sensors::imu_orientation_measurement_function, R, IMU_ORIENT_ANGLE_DIMS);
+
+  // Track innovation for adaptive noise estimation
+  adapt_R<sensors::IMU_ORIENTATION_DIM>(
+    R_imu_orient_, imu_orient_innovations_, imu_orient_innovation, config_.adaptive_imu);
 
   // IMU orientation validates heading ONLY if the IMU has a magnetometer.
   // 6-axis IMUs integrate gyro for yaw — this drifts and is not a valid
@@ -352,6 +440,18 @@ void FusionCore::update_encoder(
   if (var_vy > 0.0) R(1,1) = var_vy;
   if (var_wz > 0.0) R(2,2) = var_wz;
 
+  // Mahalanobis outlier rejection for encoder
+  if (config_.outlier_rejection) {
+    sensors::EncoderMeasurement innovation_pre;
+    sensors::EncoderNoiseMatrix S;
+    ukf_.predict_measurement<sensors::ENCODER_DIM>(z, sensors::encoder_measurement_function, R, innovation_pre, S);
+    if (is_outlier<sensors::ENCODER_DIM>(innovation_pre, S, config_.outlier_threshold_enc)) {
+      ++enc_outliers_;
+      last_encoder_time_ = timestamp_seconds;
+      return;
+    }
+  }
+
   auto innovation = ukf_.update<sensors::ENCODER_DIM>(z, sensors::encoder_measurement_function, R);
 
   // Track innovation for adaptive noise estimation
@@ -364,6 +464,26 @@ void FusionCore::update_encoder(
   ++update_count_;
 }
 
+void FusionCore::update_ground_constraint(double timestamp_seconds) {
+  if (!initialized_) return;
+
+  // Force a minimal predict step so Q is injected into P before this update.
+  // This prevents Cholesky failure when called back-to-back with update_encoder
+  // at the same timestamp (where predict_to would be a no-op and P gets two
+  // consecutive reductions with no covariance recovery between them).
+  // Do NOT update last_timestamp_ here — advancing it would cause every
+  // subsequent GNSS message to be misclassified as delayed (triggering the
+  // retrodiction path). The 1µs UKF time mismatch is negligible.
+  ukf_.predict(config_.min_dt);
+
+  sensors::GroundConstraintMeasurement z;
+  z[0] = 0.0;  // expected: body-frame VZ = 0
+
+  sensors::GroundConstraintNoiseMatrix R = sensors::ground_constraint_noise_matrix();
+  ukf_.update<sensors::GROUND_CONSTRAINT_DIM>(
+    z, sensors::ground_constraint_measurement_function, R);
+}
+
 bool FusionCore::update_gnss(
   double timestamp_seconds,
   const sensors::GnssFix& fix
@@ -373,34 +493,43 @@ bool FusionCore::update_gnss(
 
   if (!fix.is_valid(config_.gnss)) return false;
 
-  // Track distance for GPS-track heading observability
-  update_distance_traveled(fix.x, fix.y);
-
   // Check if this measurement is delayed
   bool is_delayed = (last_timestamp_ - timestamp_seconds) > config_.min_dt;
 
   if (is_delayed) {
-    // Apply with retrodiction
+    // apply_delayed_measurement rolls back state, calls the lambda, then
+    // replays IMU forward. Capture gnss_fused so we only count fusions that
+    // actually passed the outlier gate (apply_gnss_update returns bool).
+    bool gnss_fused = false;
+    double pre_update_speed_delayed = 0.0;
     bool applied = apply_delayed_measurement(timestamp_seconds, [&]() {
       predict_to(timestamp_seconds);
-      apply_gnss_update(timestamp_seconds, fix);
+      pre_update_speed_delayed = std::sqrt(
+        ukf_.state().x[VX] * ukf_.state().x[VX] +
+        ukf_.state().x[VY] * ukf_.state().x[VY]);
+      gnss_fused = apply_gnss_update(timestamp_seconds, fix);
     });
-    if (!applied) return false;
+    if (!applied || !gnss_fused) return false;
+    update_distance_traveled(fix.x, fix.y, pre_update_speed_delayed);
     last_gnss_time_ = timestamp_seconds;
     ++update_count_;
     return true;
   }
 
-
   predict_to(timestamp_seconds);
-  apply_gnss_update(timestamp_seconds, fix);
-
+  // Fix 8: capture speed BEFORE gnss update — post-update velocity is corrected
+  // and not representative of motion during this GPS step.
+  double pre_update_speed = std::sqrt(
+    ukf_.state().x[VX] * ukf_.state().x[VX] +
+    ukf_.state().x[VY] * ukf_.state().x[VY]);
+  if (!apply_gnss_update(timestamp_seconds, fix)) return false;
+  update_distance_traveled(fix.x, fix.y, pre_update_speed);
   last_gnss_time_ = timestamp_seconds;
   ++update_count_;
   return true;
 }
 
-void FusionCore::apply_gnss_update(
+bool FusionCore::apply_gnss_update(
   double timestamp_seconds,
   const sensors::GnssFix& fix)
 {
@@ -423,19 +552,28 @@ void FusionCore::apply_gnss_update(
 
   bool use_lever_arm = !config_.gnss.lever_arm.is_zero() && heading_validated_;
 
-  Eigen::Matrix<double, sensors::GNSS_POS_DIM, 1> innovation;
+  auto h_gnss = use_lever_arm
+    ? sensors::gnss_pos_measurement_function_with_lever_arm(config_.gnss.lever_arm)
+    : std::function<sensors::GnssPosMeasurement(const StateVector&)>(
+        sensors::gnss_pos_measurement_function);
 
-  if (use_lever_arm) {
-    auto h = sensors::gnss_pos_measurement_function_with_lever_arm(
-      config_.gnss.lever_arm);
-    innovation = ukf_.update<sensors::GNSS_POS_DIM>(z, h, R);
-  } else {
-    innovation = ukf_.update<sensors::GNSS_POS_DIM>(
-      z, sensors::gnss_pos_measurement_function, R);
+  // Mahalanobis outlier rejection for GNSS position
+  if (config_.outlier_rejection) {
+    sensors::GnssPosMeasurement innovation_pre;
+    sensors::GnssPosNoiseMatrix S;
+    ukf_.predict_measurement<sensors::GNSS_POS_DIM>(z, h_gnss, R, innovation_pre, S);
+    if (is_outlier<sensors::GNSS_POS_DIM>(innovation_pre, S, config_.outlier_threshold_gnss)) {
+      ++gnss_outliers_;
+      return false;
+    }
   }
+
+  Eigen::Matrix<double, sensors::GNSS_POS_DIM, 1> innovation =
+    ukf_.update<sensors::GNSS_POS_DIM>(z, h_gnss, R);
 
   // Track innovation for adaptive GNSS noise estimation
   adapt_R<sensors::GNSS_POS_DIM>(R_gnss_, gnss_innovations_, innovation, config_.adaptive_gnss);
+  return true;
 }
 
 bool FusionCore::update_gnss_heading(
@@ -455,12 +593,15 @@ bool FusionCore::update_gnss_heading(
   sensors::GnssHdgNoiseMatrix R =
     sensors::gnss_hdg_noise_matrix(config_.gnss, heading);
 
+  // Dimension 0 (heading) is an angle — wrap z_diff across ±π boundary
+  constexpr unsigned int HDG_ANGLE_DIMS = 0b1;  // bit 0 = heading
+
   // Mahalanobis outlier rejection for heading
   if (config_.outlier_rejection) {
     sensors::GnssHdgMeasurement innovation_pre;
     sensors::GnssHdgNoiseMatrix S;
     ukf_.predict_measurement<sensors::GNSS_HDG_DIM>(
-      z, sensors::gnss_hdg_measurement_function, R, innovation_pre, S);
+      z, sensors::gnss_hdg_measurement_function, R, innovation_pre, S, HDG_ANGLE_DIMS);
     if (is_outlier<sensors::GNSS_HDG_DIM>(innovation_pre, S, config_.outlier_threshold_hdg)) {
       ++hdg_outliers_;
       return false;
@@ -468,7 +609,7 @@ bool FusionCore::update_gnss_heading(
   }
 
   ukf_.update<sensors::GNSS_HDG_DIM>(
-    z, sensors::gnss_hdg_measurement_function, R);
+    z, sensors::gnss_hdg_measurement_function, R, HDG_ANGLE_DIMS);
 
   // Dual antenna heading is the strongest possible heading validation
   // Override any weaker source
@@ -491,7 +632,7 @@ FusionCoreStatus FusionCore::get_status() const {
 
   if (!initialized_) return status;
 
-  double stale = 1.0;
+  const double stale = config_.stale_timeout;
 
   status.imu_health =
     last_imu_time_ < 0.0 ? SensorHealth::NOT_INIT :
@@ -515,6 +656,12 @@ FusionCoreStatus FusionCore::get_status() const {
   status.heading_validated = heading_validated_;
   status.heading_source    = heading_source_;
   status.distance_traveled = distance_traveled_;
+
+  // Outlier rejection counters
+  status.gnss_outliers = gnss_outliers_;
+  status.imu_outliers  = imu_outliers_;
+  status.enc_outliers  = enc_outliers_;
+  status.hdg_outliers  = hdg_outliers_;
 
   return status;
 }
