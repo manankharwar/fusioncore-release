@@ -1,14 +1,23 @@
 cmake_minimum_required(VERSION 3.16)
-project(compass_msgs)
+project(fusioncore VERSION 0.1.0)
 
-find_package(ament_cmake REQUIRED)
-find_package(rosidl_default_generators REQUIRED)
-find_package(std_msgs REQUIRED)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/Azimuth.msg"
-  DEPENDENCIES std_msgs
-)
+# Find Eigen3
+find_package(Eigen3 REQUIRED)
 
-ament_export_dependencies(rosidl_default_runtime)
-ament_package()
+# Build options
+option(BUILD_ROS "Build ROS 2 wrapper" OFF)
+option(BUILD_TESTS "Build unit tests" ON)
+
+# compass_msgs — ROS 2 port of ctu-vras/compass message definitions
+add_subdirectory(compass_msgs)
+
+# Core library (no ROS dependency)
+add_subdirectory(fusioncore_core)
+
+# ROS 2 wrapper (optional)
+if(BUILD_ROS)
+  add_subdirectory(fusioncore_ros)
+endif()
