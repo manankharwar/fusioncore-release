@@ -21,6 +21,9 @@ struct FusionCoreConfig {
   double min_dt = 1e-6;
   double max_dt = 1.0;
 
+  // How long without a sensor update before that sensor is marked STALE (seconds)
+  double stale_timeout = 1.0;
+
   // Minimum distance robot must travel (meters) before heading is considered
   // geometrically observable from GPS track alone.
   double heading_observable_distance = 5.0;
@@ -53,6 +56,10 @@ struct FusionCoreConfig {
 
   // How many state snapshots to keep. At 100Hz IMU, 50 = 0.5 seconds.
   int snapshot_buffer_size = 50;
+
+  // How many IMU messages to keep for full replay retrodiction.
+  // At 100Hz IMU and 500ms max delay: 50 messages minimum.
+  int imu_buffer_size = 100;
 
   // Does the IMU have a magnetometer (9-axis)?
   // true  — IMU orientation includes magnetically-referenced yaw (BNO08x,
@@ -89,6 +96,12 @@ struct FusionCoreStatus {
   bool          heading_validated   = false;
   HeadingSource heading_source      = HeadingSource::NONE;
   double        distance_traveled   = 0.0;  // meters since init
+
+  // Outlier rejection counters — cumulative since init()
+  int gnss_outliers = 0;
+  int imu_outliers  = 0;
+  int enc_outliers  = 0;
+  int hdg_outliers  = 0;
 };
 
 class FusionCore {
@@ -129,6 +142,11 @@ public:
     double timestamp_seconds,
     const sensors::GnssFix& fix
   );
+
+  // Non-holonomic ground constraint — fuses VZ=0 as a pseudo-measurement.
+  // Call this every encoder update to prevent altitude drift in the UKF.
+  // Only applies to wheeled ground robots; do not call for aerial vehicles.
+  void update_ground_constraint(double timestamp_seconds);
 
   // GNSS dual antenna heading update
   // Calling this validates heading via HeadingSource::DUAL_ANTENNA
@@ -175,11 +193,24 @@ private:
 
     bool ready() const { return (int)innovations.size() >= max_size / 2; }
 
-    // Estimate covariance from innovation window
+    // Estimate covariance from innovation window.
+    // Uses the sample covariance (mean-subtracted), not the autocorrelation.
+    // In a well-tuned filter innovations are zero-mean, but during startup
+    // or model mismatch the mean can be nonzero — subtracting it prevents
+    // R from being inflated by a squared bias term.
     ZMatrix estimate_covariance() const {
-      ZMatrix C = ZMatrix::Zero();
+      // Compute sample mean
+      Eigen::Matrix<double, z_dim, 1> mean = Eigen::Matrix<double, z_dim, 1>::Zero();
       for (const auto& nu : innovations)
-        C += nu * nu.transpose();
+        mean += nu;
+      mean /= (double)innovations.size();
+
+      // Compute mean-subtracted sample covariance
+      ZMatrix C = ZMatrix::Zero();
+      for (const auto& nu : innovations) {
+        Eigen::Matrix<double, z_dim, 1> d = nu - mean;
+        C += d * d.transpose();
+      }
       return C / (double)innovations.size();
     }
   };
@@ -232,6 +263,17 @@ private:
 
   std::deque<StateSnapshot> snapshot_buffer_;
 
+  // IMU message buffer for full replay retrodiction
+  // Every raw IMU message is stored so that when a delayed GNSS arrives,
+  // we replay all intermediate IMU updates instead of one big predict(dt).
+  struct ImuBufferEntry {
+    double timestamp;
+    double wx, wy, wz;
+    double ax, ay, az;
+    sensors::ImuNoiseMatrix R;
+  };
+  std::deque<ImuBufferEntry> imu_buffer_;
+
   // Heading observability tracking
   bool          heading_validated_ = false;
   HeadingSource heading_source_    = HeadingSource::NONE;
@@ -243,13 +285,13 @@ private:
   double distance_traveled_ = 0.0;
 
   void predict_to(double timestamp_seconds);
-  void apply_gnss_update(double timestamp_seconds, const sensors::GnssFix& fix);
+  bool apply_gnss_update(double timestamp_seconds, const sensors::GnssFix& fix);
   void save_snapshot();
   bool apply_delayed_measurement(
     double measurement_timestamp,
     const std::function<void()>& apply_fn
   );
-  void update_distance_traveled(double x, double y);
+  void update_distance_traveled(double x, double y, double pre_update_speed = -1.0);
 };
 
 } // namespace fusioncore
