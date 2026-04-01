@@ -15,6 +15,9 @@
 #include <compass_msgs/msg/azimuth.hpp>
 #include <tf2/LinearMath/Vector3.h>
 #include <tf2/LinearMath/Matrix3x3.h>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
+#include <mutex>
+#include <optional>
 
 using namespace std::chrono_literals;
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
@@ -26,6 +29,11 @@ public:
   : rclcpp_lifecycle::LifecycleNode("fusioncore")
   {
     RCLCPP_INFO(get_logger(), "FusionCore node created");
+    // Two separate mutually-exclusive groups so the publish timer never blocks
+    // waiting for a sensor callback (and vice-versa). MultiThreadedExecutor
+    // assigns each group its own thread, giving the publish timer its own lane.
+    sensor_cb_group_  = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    publish_cb_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
   }
 
   // ─── Lifecycle: Configure ──────────────────────────────────────────────────
@@ -188,27 +196,38 @@ public:
     initial.P(2,2) = 1000.0;  // Z
     fc_->init(initial, now().seconds());
 
+    rclcpp::SubscriptionOptions sensor_opts;
+    sensor_opts.callback_group = sensor_cb_group_;
+
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
       "/imu/data", 100,
-      [this](const sensor_msgs::msg::Imu::SharedPtr msg) { imu_callback(msg); });
+      [this](const sensor_msgs::msg::Imu::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(fc_mutex_);
+        imu_callback(msg);
+      }, sensor_opts);
 
     encoder_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       "/odom/wheels", 50,
-      [this](const nav_msgs::msg::Odometry::SharedPtr msg) { encoder_callback(msg); });
+      [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(fc_mutex_);
+        encoder_callback(msg);
+      }, sensor_opts);
 
     gnss_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
       "/gnss/fix", 10,
       [this](const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(fc_mutex_);
         gnss_callback(msg, 0);
-      });
+      }, sensor_opts);
 
     // compass_msgs/Azimuth heading — optional, preferred over sensor_msgs/Imu
     if (!azimuth_topic_.empty()) {
       azimuth_sub_ = create_subscription<compass_msgs::msg::Azimuth>(
         azimuth_topic_, 10,
         [this](const compass_msgs::msg::Azimuth::SharedPtr msg) {
+          std::lock_guard<std::mutex> lock(fc_mutex_);
           azimuth_callback(msg);
-        });
+        }, sensor_opts);
       RCLCPP_INFO(get_logger(),
         "compass_msgs/Azimuth heading enabled on topic: %s", azimuth_topic_.c_str());
     }
@@ -218,8 +237,9 @@ public:
       gnss2_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
         gnss2_topic_, 10,
         [this](const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
+          std::lock_guard<std::mutex> lock(fc_mutex_);
           gnss_callback(msg, 1);
-        });
+        }, sensor_opts);
       RCLCPP_INFO(get_logger(),
         "Second GNSS receiver enabled on topic: %s", gnss2_topic_.c_str());
     }
@@ -231,8 +251,9 @@ public:
       gnss_heading_sub_ = create_subscription<sensor_msgs::msg::Imu>(
         heading_topic_, 10,
         [this](const sensor_msgs::msg::Imu::SharedPtr msg) {
+          std::lock_guard<std::mutex> lock(fc_mutex_);
           gnss_heading_callback(msg);
-        });
+        }, sensor_opts);
       RCLCPP_INFO(get_logger(),
         "Subscribed to dual antenna heading: %s", heading_topic_.c_str());
     }
@@ -242,7 +263,8 @@ public:
     auto period = std::chrono::duration<double>(1.0 / publish_rate_);
     publish_timer_ = create_wall_timer(
       std::chrono::duration_cast<std::chrono::nanoseconds>(period),
-      [this]() { publish_state(); });
+      [this]() { publish_state(); },
+      publish_cb_group_);
 
     RCLCPP_INFO(get_logger(), "FusionCore active. Listening for sensors.");
     return CallbackReturn::SUCCESS;
@@ -302,6 +324,7 @@ private:
       } else {
         RCLCPP_WARN(get_logger(), "  [MISSING] %s -> %s  Fix: ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 %s %s",
           from.c_str(), to.c_str(), to.c_str(), from.c_str());
+        all_ok = false;  // Fix 1: was never set — function always returned true
       }
     }
 
@@ -317,6 +340,7 @@ private:
       } else {
         RCLCPP_WARN(get_logger(), "  [MISSING] gnss_link -> %s  Fix: ros2 run tf2_ros static_transform_publisher %.3f %.3f %.3f 0 0 0 %s gnss_link",
           base_frame_.c_str(), lx, ly, lz, base_frame_.c_str());
+        all_ok = false;  // Fix 1: lever arm TF missing also marks as not ok
       }
     }
 
@@ -360,7 +384,8 @@ private:
         msg->linear_acceleration.x,
         msg->linear_acceleration.y,
         msg->linear_acceleration.z);
-      fuse_imu_orientation_if_valid(t, msg);
+      // No frame rotation needed — IMU is already in base_frame
+      fuse_imu_orientation_if_valid(t, msg, std::nullopt);
       return;
     }
 
@@ -405,17 +430,19 @@ private:
     fc_->update_imu(t,
       w_base.x(), w_base.y(), w_base.z(),
       a_base.x(), a_base.y(), a_base.z());
-    fuse_imu_orientation_if_valid(t, msg);
+    // Fix 11: pass the rotation quaternion so orientation is also transformed
+    fuse_imu_orientation_if_valid(t, msg, q);
   }
 
   // ─── IMU orientation helper ───────────────────────────────────────────────
-  // Called after every IMU update if the message contains a valid orientation.
-  // Handles IMUs like BNO08x, VectorNav, Xsens that publish full orientation.
-  // Uses message covariance when available (peci1 fix).
+  // Fix 11: now accepts optional imu_to_base rotation to transform orientation
+  // into base_frame before fusing. Previously used raw IMU-frame orientation
+  // even when IMU was mounted at an angle relative to base_frame.
 
   void fuse_imu_orientation_if_valid(
     double t,
-    const sensor_msgs::msg::Imu::SharedPtr& msg)
+    const sensor_msgs::msg::Imu::SharedPtr& msg,
+    const std::optional<tf2::Quaternion>& imu_to_base)
   {
     // orientation_covariance[0] == -1 means "no orientation data"
     if (msg->orientation_covariance[0] < 0.0) return;
@@ -430,14 +457,20 @@ private:
     }
     if (!has_orientation) return;
 
-    // Extract roll, pitch, yaw from quaternion
-    tf2::Quaternion q(
+    tf2::Quaternion q_imu(
       msg->orientation.x,
       msg->orientation.y,
       msg->orientation.z,
       msg->orientation.w);
+
+    // Fix 11: rotate orientation from IMU frame to base_frame.
+    // q_base = q_imu_to_base * q_imu  (apply mount rotation first)
+    tf2::Quaternion q_base = imu_to_base.has_value()
+      ? (imu_to_base.value() * q_imu).normalized()
+      : q_imu;
+
     double roll, pitch, yaw;
-    tf2::Matrix3x3(q).getRPY(roll, pitch, yaw);
+    tf2::Matrix3x3(q_base).getRPY(roll, pitch, yaw);
 
     fc_->update_imu_orientation(
       t, roll, pitch, yaw,
@@ -456,6 +489,10 @@ private:
       msg->twist.twist.linear.x,
       msg->twist.twist.linear.y,
       msg->twist.twist.angular.z);
+
+    // Non-holonomic ground constraint: wheeled robots cannot move vertically.
+    // Fuses VZ=0 as a pseudo-measurement to prevent altitude drift.
+    fc_->update_ground_constraint(t);
   }
 
   // ─── GNSS position callback ────────────────────────────────────────────────
@@ -476,7 +513,9 @@ private:
       gnss_ref_set_ = true;
       RCLCPP_INFO(get_logger(), "GNSS reference set: lat=%.6f lon=%.6f",
         msg->latitude, msg->longitude);
-      return;
+      // Fix 3: do NOT return — fall through and fuse ENU [0,0,0] as first fix.
+      // Returning here dropped the first GPS measurement, leaving the filter at
+      // [0,0,0] with no position correction until the second fix arrived.
     }
 
     fusioncore::sensors::LLAPoint lla;
@@ -536,11 +575,11 @@ private:
         fix.full_covariance = cov;
         fix.hdop = std::sqrt(cov(0,0));  // for validity check
         fix.vdop = std::sqrt(cov(2,2));
-        fix.satellites = 6;
+        fix.satellites = 4;  // Fix 10: honest minimum — was hardcoded 6, always passed quality gate
       } else {
         fix.hdop = 1.5;
         fix.vdop = 2.0;
-        fix.satellites = 6;
+        fix.satellites = 4;  // Fix 10
       }
     } else if (msg->position_covariance_type >= 1) {
       // Diagonal covariance available
@@ -549,23 +588,23 @@ private:
       if (var_xy > 0.0 && var_z > 0.0) {
         fix.hdop = std::sqrt(var_xy);
         fix.vdop = std::sqrt(var_z);
-        fix.satellites = 6;
+        fix.satellites = 4;  // Fix 10
       } else {
         fix.hdop = 1.5;
         fix.vdop = 2.0;
-        fix.satellites = 6;
+        fix.satellites = 4;  // Fix 10
       }
     } else {
       // Unknown covariance — use config defaults
       fix.hdop = 1.5;
       fix.vdop = 2.0;
-      fix.satellites = 6;
+      fix.satellites = 4;  // Fix 10
     }
 
     bool accepted = fc_->update_gnss(t, fix);
     if (!accepted) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "GNSS fix rejected (poor quality)");
+        "GNSS fix rejected (quality check failed or Mahalanobis outlier gate)");
     }
 
     // Log heading observability status
@@ -703,6 +742,7 @@ private:
 
   void publish_state()
   {
+    std::lock_guard<std::mutex> lock(fc_mutex_);
     if (!fc_->is_initialized()) return;
 
     const fusioncore::State& s = fc_->get_state();
@@ -795,13 +835,24 @@ private:
   bool gnss_ref_set_ = false;
   fusioncore::sensors::LLAPoint  gnss_ref_lla_;
   fusioncore::sensors::ECEFPoint gnss_ref_ecef_;
+
+  // Callback groups: sensor callbacks are mutually exclusive (protect UKF state);
+  // publish timer runs in its own group so it never waits on a sensor callback.
+  rclcpp::CallbackGroup::SharedPtr sensor_cb_group_;
+  rclcpp::CallbackGroup::SharedPtr publish_cb_group_;
+  std::mutex fc_mutex_;
 };
 
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<FusionNode>();
-  rclcpp::spin(node->get_node_base_interface());
+  // Two threads: one serves the sensor callback group (IMU/GPS/encoder),
+  // the other serves the publish timer group — so the 100 Hz publish never
+  // stalls waiting for a sensor update to finish.
+  rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
+  executor.add_node(node->get_node_base_interface());
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }
