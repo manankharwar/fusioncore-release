@@ -9,12 +9,12 @@ from launch_ros.actions import Node
 def generate_launch_description():
     pkg = get_package_share_directory("fusioncore_ros")
 
-    config = LaunchConfiguration("fusioncore_config")
+    config = LaunchConfiguration("config")
 
     return LaunchDescription([
         DeclareLaunchArgument(
-            "fusioncore_config",
-            default_value=os.path.join(pkg, "config", "fusioncore.yaml"),
+            "config",
+            default_value=os.path.join(pkg, "config", "duatic_mecanum.yaml"),
             description="Path to FusionCore config file"
         ),
 
@@ -24,5 +24,11 @@ def generate_launch_description():
             name="fusioncore",
             output="screen",
             parameters=[config],
+            remappings=[
+                # Marc's IMU topic → FusionCore's expected topic
+                ("/imu/data",    "/sensor/imu/data"),
+                # Marc's mecanum wheel odometry → FusionCore's expected topic
+                ("/odom/wheels", "/mecanum_drive_controller/odom"),
+            ],
         ),
     ])
