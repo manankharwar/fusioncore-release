@@ -46,6 +46,16 @@ struct GnssLeverArm {
   }
 };
 
+// ─── GNSS fix type ───────────────────────────────────────────────────────────
+
+enum class GnssFixType {
+  NO_FIX    = 0,
+  GPS_FIX   = 1,
+  DGPS_FIX  = 2,
+  RTK_FLOAT = 3,
+  RTK_FIXED = 4
+};
+
 // ─── GNSS quality parameters ─────────────────────────────────────────────────
 
 struct GnssParams {
@@ -56,19 +66,15 @@ struct GnssParams {
   double max_vdop      = 6.0;
   int    min_satellites = 4;
 
+  // Minimum fix type required for fusion (default: any fix accepted).
+  // Set to RTK_FLOAT or RTK_FIXED to reject non-RTK fixes.
+  GnssFixType min_fix_type = GnssFixType::GPS_FIX;
+
   // Antenna offset from base_link in body frame
   GnssLeverArm lever_arm;
 };
 
 // ─── GNSS fix ────────────────────────────────────────────────────────────────
-
-enum class GnssFixType {
-  NO_FIX    = 0,
-  GPS_FIX   = 1,
-  DGPS_FIX  = 2,
-  RTK_FLOAT = 3,
-  RTK_FIXED = 4
-};
 
 struct GnssFix {
   double x = 0.0;
@@ -81,9 +87,14 @@ struct GnssFix {
   int         satellites = 0;
   GnssFixType fix_type   = GnssFixType::NO_FIX;
 
-  // Source identifier — used when fusing multiple GNSS receivers.
+  // Source identifier: used when fusing multiple GNSS receivers.
   // 0 = primary, 1 = secondary, etc.
   int source_id = 0;
+
+  // Per-measurement lever arm (antenna offset from base_link in body frame).
+  // Set by the ROS node based on which receiver produced this fix.
+  // Defaults to zero: no correction applied.
+  GnssLeverArm lever_arm;
 
   // Full 3x3 position covariance matrix (row-major, ENU frame).
   // peci1 fix: real GNSS covariance often has off-diagonal elements
@@ -93,7 +104,7 @@ struct GnssFix {
   Eigen::Matrix3d full_covariance = Eigen::Matrix3d::Identity();
 
   bool is_valid(const GnssParams& p) const {
-    return fix_type != GnssFixType::NO_FIX
+    return fix_type >= p.min_fix_type
         && hdop <= p.max_hdop
         && vdop <= p.max_vdop
         && satellites >= p.min_satellites;
@@ -105,7 +116,7 @@ struct GnssHeading {
   double accuracy_rad = 0.1;
   bool   valid        = false;
 
-  // Source identifier — matches the source_id of the GnssFix
+  // Source identifier: matches the source_id of the GnssFix
   // from the same receiver
   int source_id = 0;
 };
@@ -134,47 +145,26 @@ inline auto gnss_pos_measurement_function_with_lever_arm(
   const GnssLeverArm& lever_arm)
 {
   return [lever_arm](const StateVector& x) -> GnssPosMeasurement {
-    double roll  = x[ROLL];
-    double pitch = x[PITCH];
-    double yaw   = x[YAW];
+    double qw = x[QW], qx = x[QX], qy = x[QY], qz = x[QZ];
 
-    // Build rotation matrix body -> world (ZYX Euler)
-    double cr = std::cos(roll),  sr = std::sin(roll);
-    double cp = std::cos(pitch), sp = std::sin(pitch);
-    double cy = std::cos(yaw),   sy = std::sin(yaw);
+    // Rotation matrix body-to-world from quaternion
+    double R[3][3];
+    quat_to_rotation_matrix(qw, qx, qy, qz, R);
 
-    // R = Rz(yaw) * Ry(pitch) * Rx(roll)
-    double R00 = cy*cp;
-    double R01 = cy*sp*sr - sy*cr;
-    double R02 = cy*sp*cr + sy*sr;
-    double R10 = sy*cp;
-    double R11 = sy*sp*sr + cy*cr;
-    double R12 = sy*sp*cr - cy*sr;
-    double R20 = -sp;
-    double R21 = cp*sr;
-    double R22 = cp*cr;
-
-    // Rotate lever arm from body frame to world frame
-    double lx = lever_arm.x;
-    double ly = lever_arm.y;
-    double lz = lever_arm.z;
-
-    double offset_x = R00*lx + R01*ly + R02*lz;
-    double offset_y = R10*lx + R11*ly + R12*lz;
-    double offset_z = R20*lx + R21*ly + R22*lz;
-
+    double lx = lever_arm.x, ly = lever_arm.y, lz = lever_arm.z;
     GnssPosMeasurement z;
-    z[0] = x[X] + offset_x;
-    z[1] = x[Y] + offset_y;
-    z[2] = x[Z] + offset_z;
+    z[0] = x[X] + R[0][0]*lx + R[0][1]*ly + R[0][2]*lz;
+    z[1] = x[Y] + R[1][0]*lx + R[1][1]*ly + R[1][2]*lz;
+    z[2] = x[Z] + R[2][0]*lx + R[2][1]*ly + R[2][2]*lz;
     return z;
   };
 }
 
-// h(x): state -> expected GNSS heading
+// h(x): state -> expected GNSS heading (yaw extracted from quaternion)
 inline GnssHdgMeasurement gnss_hdg_measurement_function(const StateVector& x) {
   GnssHdgMeasurement z;
-  z[0] = x[YAW];
+  double qw = x[QW], qx = x[QX], qy = x[QY], qz = x[QZ];
+  z[0] = std::atan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz));
   return z;
 }
 
@@ -185,10 +175,10 @@ inline GnssPosNoiseMatrix gnss_pos_noise_matrix(
   const GnssFix& fix)
 {
   // peci1 fix: use full covariance matrix when available.
-  // Real GNSS receivers often report correlated X/Y errors —
+  // Real GNSS receivers often report correlated X/Y errors:
   // the off-diagonal elements matter, especially with RTK.
   if (fix.has_full_covariance) {
-    // Validate — all diagonal elements must be positive
+    // Validate: all diagonal elements must be positive
     if (fix.full_covariance(0,0) > 0.0 &&
         fix.full_covariance(1,1) > 0.0 &&
         fix.full_covariance(2,2) > 0.0) {
