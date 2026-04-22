@@ -1,45 +1,23 @@
 cmake_minimum_required(VERSION 3.16)
-project(fusioncore_core VERSION 0.1.0)
+project(fusioncore VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-find_package(ament_cmake REQUIRED)
-find_package(eigen3_cmake_module REQUIRED)
+# Find Eigen3
 find_package(Eigen3 REQUIRED)
 
-add_library(fusioncore_core STATIC
-  src/ukf.cpp
-  src/fusioncore.cpp
-)
+# Build options
+option(BUILD_ROS "Build ROS 2 wrapper" OFF)
+option(BUILD_TESTS "Build unit tests" ON)
 
-target_include_directories(fusioncore_core PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include/fusioncore_core>
-)
+# compass_msgs — ROS 2 port of ctu-vras/compass message definitions
+add_subdirectory(compass_msgs)
 
-target_link_libraries(fusioncore_core PUBLIC Eigen3::Eigen)
+# Core library (no ROS dependency)
+add_subdirectory(fusioncore_core)
 
-if(BUILD_TESTING)
-  find_package(ament_cmake_gtest REQUIRED)
-  add_subdirectory(tests)
+# ROS 2 wrapper (optional)
+if(BUILD_ROS)
+  add_subdirectory(fusioncore_ros)
 endif()
-
-ament_export_targets(fusioncore_core_targets HAS_LIBRARY_TARGET)
-ament_export_dependencies(eigen3_cmake_module Eigen3)
-ament_export_include_directories(include/fusioncore_core)
-
-install(
-  DIRECTORY include/
-  DESTINATION include/fusioncore_core
-)
-
-install(
-  TARGETS fusioncore_core
-  EXPORT fusioncore_core_targets
-  ARCHIVE DESTINATION lib
-  LIBRARY DESTINATION lib
-  RUNTIME DESTINATION bin
-)
-
-ament_package()
