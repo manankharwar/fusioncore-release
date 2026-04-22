@@ -17,6 +17,9 @@ find_package(compass_msgs REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(fusioncore_core REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
+find_package(PROJ REQUIRED)
 
 add_executable(fusioncore_node
   src/fusion_node.cpp
@@ -40,12 +43,14 @@ ament_target_dependencies(fusioncore_node
   tf2_ros
   tf2_geometry_msgs
   fusioncore_core
-
   compass_msgs
+  diagnostic_msgs
+  std_srvs
 )
 
 target_link_libraries(fusioncore_node
   Eigen3::Eigen
+  PROJ::proj
 )
 
 # Explicitly link the static library
@@ -66,5 +71,12 @@ install(TARGETS fusioncore_node
 install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME}
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+
+  ament_add_gtest(test_proj_axis_order tests/test_proj_axis_order.cpp)
+  target_link_libraries(test_proj_axis_order PROJ::proj)
+endif()
 
 ament_package()

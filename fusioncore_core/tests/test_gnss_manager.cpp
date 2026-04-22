@@ -53,9 +53,9 @@ TEST(GNSSManagerTest, GoodFixIsAccepted) {
 TEST(GNSSManagerTest, GNSSCorrectsDriftedPosition) {
   FusionCore fc;
 
-  // Start at 5m from the GNSS fix — realistic drift, within Mahalanobis bounds.
+  // Start at 5m from the GNSS fix: realistic drift, within Mahalanobis bounds.
   // (A 99m error would be correctly rejected as a statistical outlier by the
-  // chi-squared gate. That is working as intended — outlier rejection guards
+  // chi-squared gate. That is working as intended: outlier rejection guards
   // against GPS jumps, not against bad initial conditions. Initialize from GPS.)
   State initial;
   initial.x     = StateVector::Zero();
@@ -85,8 +85,7 @@ TEST(GNSSManagerTest, DualAntennaHeadingUpdate) {
   FusionCore fc;
 
   State initial;
-  initial.x       = StateVector::Zero();
-  initial.x[YAW]  = 0.0;   // facing east
+  // State() default-constructs with QW=1 (identity) = yaw 0, facing east
   initial.P       = StateMatrix::Identity() * 1.0;
   fc.init(initial, 0.0);
 
@@ -100,8 +99,8 @@ TEST(GNSSManagerTest, DualAntennaHeadingUpdate) {
   EXPECT_TRUE(accepted);
 
   // Yaw should have moved toward 45 degrees
-  EXPECT_GT(fc.get_state().x[YAW], 0.0);
-  EXPECT_NEAR(fc.get_state().x[YAW], M_PI/4.0, 0.3);
+  EXPECT_GT(fc.get_state().yaw(), 0.0);
+  EXPECT_NEAR(fc.get_state().yaw(), M_PI/4.0, 0.3);
 }
 
 // ─── Test 5: Invalid heading is rejected ─────────────────────────────────────
@@ -122,7 +121,7 @@ TEST(GNSSManagerTest, InvalidHeadingRejected) {
 
 // ─── Test 6: Stefan's full configuration ─────────────────────────────────────
 // GNSS + IMU + encoders, outdoor wheeled robot, 10 seconds
-// GNSS corrects position drift — this is what Stefan needed
+// GNSS corrects position drift: this is what Stefan needed
 
 TEST(GNSSManagerTest, StefanFullConfigurationWithGNSSCorrection) {
   FusionCoreConfig config;
@@ -151,7 +150,7 @@ TEST(GNSSManagerTest, StefanFullConfigurationWithGNSSCorrection) {
   for (int i = 1; i <= 1000; ++i) {
     double t = i * 0.01;
 
-    // IMU @ 100Hz — flat robot driving forward, send gravity on az.
+    // IMU @ 100Hz: flat robot driving forward, send gravity on az.
     fc.update_imu(t, 0,0,0, 0,0,9.81);
 
     // Encoder @ 50Hz
