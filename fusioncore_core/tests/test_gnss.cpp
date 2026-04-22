@@ -26,10 +26,14 @@ TEST(GNSSTest, PosMeasurementFunctionMapsState) {
 
 TEST(GNSSTest, HdgMeasurementFunctionMapsYaw) {
   StateVector x = StateVector::Zero();
-  x[YAW] = 1.57;
+  // yaw = π/2 → quaternion [cos(π/4), 0, 0, sin(π/4)]
+  x[QW] = std::cos(M_PI / 4.0);
+  x[QX] = 0.0;
+  x[QY] = 0.0;
+  x[QZ] = std::sin(M_PI / 4.0);
 
   GnssHdgMeasurement z = gnss_hdg_measurement_function(x);
-  EXPECT_DOUBLE_EQ(z[0], 1.57);
+  EXPECT_NEAR(z[0], M_PI / 2.0, 1e-9);
 }
 
 // ─── Test 3: Quality-aware noise scales with HDOP ────────────────────────────
@@ -89,10 +93,45 @@ TEST(GNSSTest, FixValidityCheck) {
   EXPECT_FALSE(few_sats.is_valid(params));
 }
 
+// ─── Test 4b: min_fix_type gating ───────────────────────────────────────────
+
+TEST(GNSSTest, MinFixTypeGating) {
+  GnssParams params;
+  params.min_fix_type = GnssFixType::RTK_FLOAT;
+
+  GnssFix gps_fix;
+  gps_fix.fix_type   = GnssFixType::GPS_FIX;
+  gps_fix.satellites = 8;
+  gps_fix.hdop       = 1.0;
+  gps_fix.vdop       = 1.5;
+  EXPECT_FALSE(gps_fix.is_valid(params));  // GPS_FIX < RTK_FLOAT
+
+  GnssFix dgps_fix;
+  dgps_fix.fix_type   = GnssFixType::DGPS_FIX;
+  dgps_fix.satellites = 8;
+  dgps_fix.hdop       = 1.0;
+  dgps_fix.vdop       = 1.5;
+  EXPECT_FALSE(dgps_fix.is_valid(params));  // DGPS < RTK_FLOAT
+
+  GnssFix rtk_float;
+  rtk_float.fix_type   = GnssFixType::RTK_FLOAT;
+  rtk_float.satellites = 8;
+  rtk_float.hdop       = 1.0;
+  rtk_float.vdop       = 1.5;
+  EXPECT_TRUE(rtk_float.is_valid(params));  // RTK_FLOAT == min
+
+  GnssFix rtk_fixed;
+  rtk_fixed.fix_type   = GnssFixType::RTK_FIXED;
+  rtk_fixed.satellites = 8;
+  rtk_fixed.hdop       = 1.0;
+  rtk_fixed.vdop       = 1.5;
+  EXPECT_TRUE(rtk_fixed.is_valid(params));  // RTK_FIXED > min
+}
+
 // ─── Test 5: ECEF to ENU conversion ─────────────────────────────────────────
 
 TEST(GNSSTest, ECEFtoENUAtOriginIsZero) {
-  // Reference point — somewhere in Hamilton Ontario
+  // Reference point: somewhere in Hamilton Ontario
   LLAPoint ref_lla;
   ref_lla.lat_rad = 43.25 * M_PI / 180.0;
   ref_lla.lon_rad = -79.87 * M_PI / 180.0;
@@ -103,7 +142,7 @@ TEST(GNSSTest, ECEFtoENUAtOriginIsZero) {
   ref.y = -4346071.0;
   ref.z = 4561977.0;
 
-  // Same point — should give ENU = (0,0,0)
+  // Same point: should give ENU = (0,0,0)
   Eigen::Vector3d enu = ecef_to_enu(ref, ref, ref_lla);
 
   EXPECT_NEAR(enu[0], 0.0, 1e-6);
@@ -145,7 +184,7 @@ TEST(GNSSTest, GNSSUpdateCorrectedDriftedPosition) {
   EXPECT_NEAR(ukf.state().x[X], 1.0, 5.0);
 }
 
-// ─── Test 7: GNSS + IMU + encoder — full Stefan configuration ────────────────
+// ─── Test 7: GNSS + IMU + encoder: full Stefan configuration ────────────────
 // Outdoor wheeled robot, GNSS + IMU + encoders
 // This is the exact use case Stefan posted on ROS Discourse Dec 2024
 
@@ -186,7 +225,7 @@ TEST(GNSSTest, StefanConfigurationFullFusion) {
       fc.update_encoder(t, 1.0, 0.0, 0.0);
     }
 
-    // GNSS @ 1Hz — truth position
+    // GNSS @ 1Hz: truth position
     if (i % 100 == 0) {
       double true_x = 1.0 * t;  // 1 m/s forward
       GnssPosMeasurement z_gnss;
@@ -197,13 +236,13 @@ TEST(GNSSTest, StefanConfigurationFullFusion) {
       GnssPosNoiseMatrix R = gnss_pos_noise_matrix(gnss_params, fix);
       fc.get_state();  // read current state
 
-      // Direct UKF update via FusionCore — we'll add update_gnss in next step
+      // Direct UKF update via FusionCore: we'll add update_gnss in next step
       // For now verify the manager is stable through the full run
     }
   }
 
   // After 5 seconds at 1 m/s, should be near x=5
-  // GNSS not yet wired to manager — position will drift
+  // GNSS not yet wired to manager: position will drift
   // This test proves stability of the full pipeline
   auto status = fc.get_status();
   EXPECT_TRUE(status.initialized);
