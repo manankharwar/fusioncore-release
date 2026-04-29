@@ -26,9 +26,17 @@ benchmarks/
 
 ## Results Summary
 
+RL-EKF gating: `odom0_twist_rejection_threshold: 4.03` (chi2(3,0.999)), `odom1_pose_rejection_threshold: 3.72` (chi2(2,0.999)).
+RL-UKF: NaN divergence on all sequences (confirmed by RL maintainer as known numerical instability).
+
 | Dataset | Sequence | FC ATE RMSE | RL-EKF ATE RMSE | RL-UKF | Winner |
 |---------|----------|-------------|-----------------|--------|--------|
-| NCLT (Univ. of Michigan) | 2012-01-08 | **5.5 m** | 23.4 m | NaN divergence at t=31s | FusionCore (4.2×) |
+| NCLT (Univ. of Michigan) | 2012-01-08 | **5.6 m** | 13.0 m | NaN divergence at t=31s | FusionCore (2.3×) |
+| NCLT (Univ. of Michigan) | 2012-02-04 | **9.7 m** | 19.1 m | NaN divergence at t=22s | FusionCore (2.0×) |
+| NCLT (Univ. of Michigan) | 2012-03-31 | **4.2 m** | 54.3 m | NaN divergence at t=18s | FusionCore (12.9×) |
+| NCLT (Univ. of Michigan) | 2012-08-20 | **7.5 m** | 24.1 m | NaN divergence | FusionCore (3.2×) |
+| NCLT (Univ. of Michigan) | 2012-11-04 | 28.6 m | **9.6 m** | NaN divergence | RL-EKF (3.0×) |
+| NCLT (Univ. of Michigan) | 2013-02-23 | **4.1 m** | 11.0 m | NaN divergence | FusionCore (2.7×) |
 
 ---
 
