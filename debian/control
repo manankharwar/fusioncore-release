@@ -1,0 +1,13 @@
+Source: ros-jazzy-compass-msgs
+Section: misc
+Priority: optional
+Maintainer: Manan Kharwar <manankharwar@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), ros-jazzy-ament-cmake, ros-jazzy-rosidl-default-generators, ros-jazzy-rosidl-default-runtime, ros-jazzy-std-msgs, ros-jazzy-ros-workspace, ros-jazzy-rosidl-typesupport-fastrtps-c, ros-jazzy-rosidl-typesupport-fastrtps-cpp
+Homepage: https://index.ros.org/p/compass_msgs/#jazzy
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-compass-msgs
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-jazzy-rosidl-default-runtime, ros-jazzy-std-msgs, ros-jazzy-ros-workspace
+Description: ROS 2 port of compass_msgs: messages related to compass and azimuth.
+ Message definition identical to ctu-vras/compass for compatibility.
