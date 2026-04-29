@@ -1,3 +1,4 @@
+release_repo_url: https://manankharwar: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@github.com/manankharwar/fusioncore-release.git
 tracks:
   humble:
     actions:
