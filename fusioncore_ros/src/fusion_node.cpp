@@ -20,6 +20,7 @@
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <diagnostic_msgs/msg/key_value.hpp>
 #include <std_srvs/srv/trigger.hpp>
+#include "fusioncore_ros/srv/from_ll.hpp"
 #include <mutex>
 #include <optional>
 #include <proj.h>
@@ -140,6 +141,8 @@ public:
     declare_parameter("outlier_threshold_imu",  15.09);
     declare_parameter("outlier_threshold_enc",  11.34);
     declare_parameter("outlier_threshold_hdg",  10.83);
+    declare_parameter("gnss.coast_n",           5);
+    declare_parameter("gnss.coast_q_factor",    20.0);
 
     declare_parameter("adaptive.imu",     true);
     declare_parameter("adaptive.encoder", true);
@@ -259,6 +262,8 @@ public:
     config.outlier_threshold_imu  = get_parameter("outlier_threshold_imu").as_double();
     config.outlier_threshold_enc  = get_parameter("outlier_threshold_enc").as_double();
     config.outlier_threshold_hdg  = get_parameter("outlier_threshold_hdg").as_double();
+    config.gnss_coast_n           = get_parameter("gnss.coast_n").as_int();
+    config.gnss_coast_q_factor    = get_parameter("gnss.coast_q_factor").as_double();
 
     config.adaptive_imu     = get_parameter("adaptive.imu").as_bool();
     config.adaptive_encoder = get_parameter("adaptive.encoder").as_bool();
@@ -298,10 +303,6 @@ public:
       "FusionCore configured. base_frame=%s odom_frame=%s rate=%.0fHz",
       base_frame_.c_str(), odom_frame_.c_str(), publish_rate_);
 
-    // TF validation: check transforms exist before starting
-    rclcpp::sleep_for(std::chrono::milliseconds(500));
-    validate_transforms();
-
     return CallbackReturn::SUCCESS;
   }
 
@@ -310,6 +311,7 @@ public:
   CallbackReturn on_activate(const rclcpp_lifecycle::State &)
   {
     RCLCPP_INFO(get_logger(), "Activating FusionCore...");
+    validate_transforms();
 
     // Do NOT initialize the filter here with now().seconds().
     // With use_sim_time:true, now() may return 0 if /clock hasn't started yet.
@@ -432,6 +434,44 @@ public:
         RCLCPP_INFO(get_logger(), "Filter reset via ~/reset service.");
       });
 
+    // fromLL service: converts GPS lat/lon/alt to map frame x/y/z.
+    // Drop-in replacement for robot_localization's /fromLL service used by
+    // nav2_waypoint_follower for GPS waypoint navigation.
+    from_ll_srv_ = create_service<fusioncore_ros::srv::FromLL>(
+      "/fromLL",
+      [this](
+        const fusioncore_ros::srv::FromLL::Request::SharedPtr request,
+        fusioncore_ros::srv::FromLL::Response::SharedPtr response)
+      {
+        std::lock_guard<std::mutex> lock(fc_mutex_);
+        if (!gnss_ref_set_) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+            "fromLL called before GPS reference is set. "
+            "Wait for a GPS fix before requesting waypoint conversion.");
+          response->map_point.x = 0.0;
+          response->map_point.y = 0.0;
+          response->map_point.z = 0.0;
+          return;
+        }
+        fusioncore::sensors::LLAPoint lla;
+        lla.lat_rad = request->ll_point.latitude  * M_PI / 180.0;
+        lla.lon_rad = request->ll_point.longitude * M_PI / 180.0;
+        lla.alt_m   = request->ll_point.altitude;
+        fusioncore::sensors::ECEFPoint ecef;
+        gnss_to_output(lla, ecef);
+        Eigen::Vector3d enu;
+        if (convert_to_enu_at_reference_) {
+          enu = fusioncore::sensors::ecef_to_enu(ecef, gnss_ref_ecef_, gnss_ref_lla_);
+        } else {
+          enu = Eigen::Vector3d(ecef.x - gnss_ref_ecef_.x,
+                                ecef.y - gnss_ref_ecef_.y,
+                                ecef.z - gnss_ref_ecef_.z);
+        }
+        response->map_point.x = enu[0];
+        response->map_point.y = enu[1];
+        response->map_point.z = enu[2];
+      });
+
     RCLCPP_INFO(get_logger(), "FusionCore active. Listening for sensors.");
     return CallbackReturn::SUCCESS;
   }
@@ -450,6 +490,7 @@ public:
     publish_timer_.reset();
     diag_timer_.reset();
     reset_srv_.reset();
+    from_ll_srv_.reset();
     odom_pub_.reset();
     pose_pub_.reset();
     diag_pub_.reset();
@@ -1466,6 +1507,7 @@ private:
   rclcpp::TimerBase::SharedPtr                                                publish_timer_;
   rclcpp::TimerBase::SharedPtr                                                diag_timer_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr                          reset_srv_;
+  rclcpp::Service<fusioncore_ros::srv::FromLL>::SharedPtr                     from_ll_srv_;
 
   std::string base_frame_;
   std::string odom_frame_;
