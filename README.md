@@ -1,3 +1,31 @@
+## fusioncore (jazzy) - 0.2.1-2
+
+The packages in the `fusioncore` repository were released into the `jazzy` distro by running `/usr/bin/bloom-release fusioncore --track jazzy --ros-distro jazzy` on `Wed, 29 Apr 2026 04:04:16 -0000`
+
+These packages were released:
+- `compass_msgs`
+- `fusioncore_core`
+- `fusioncore_datasets`
+- `fusioncore_gazebo`
+- `fusioncore_ros`
+
+Version of package(s) in repository `fusioncore`:
+
+- upstream repository: https://github.com/manankharwar/fusioncore
+- release repository: https://github.com/manankharwar/fusioncore-release.git
+- rosdistro version: `0.2.0-1`
+- old version: `0.2.1-1`
+- new version: `0.2.1-2`
+
+Versions of tools used:
+
+- bloom version: `0.14.2`
+- catkin_pkg version: `1.1.0`
+- rosdep version: `0.26.0`
+- rosdistro version: `1.0.1`
+- vcstools version: `0.1.42`
+
+
 ## fusioncore (jazzy) - 0.2.1-1
 
 The packages in the `fusioncore` repository were released into the `jazzy` distro by running `/usr/bin/bloom-release fusioncore --track jazzy --ros-distro jazzy` on `Wed, 29 Apr 2026 03:59:55 -0000`
