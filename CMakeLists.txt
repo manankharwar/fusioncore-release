@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fusioncore_core VERSION 0.1.0)
+project(fusioncore_core VERSION 0.2.1)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,7 +22,24 @@ target_link_libraries(fusioncore_core PUBLIC Eigen3::Eigen)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
-  add_subdirectory(tests)
+
+  ament_add_gtest(test_ukf tests/test_ukf.cpp)
+  target_link_libraries(test_ukf fusioncore_core Eigen3::Eigen)
+
+  ament_add_gtest(test_imu tests/test_imu.cpp)
+  target_link_libraries(test_imu fusioncore_core Eigen3::Eigen)
+
+  ament_add_gtest(test_encoder tests/test_encoder.cpp)
+  target_link_libraries(test_encoder fusioncore_core Eigen3::Eigen)
+
+  ament_add_gtest(test_fusioncore tests/test_fusioncore.cpp)
+  target_link_libraries(test_fusioncore fusioncore_core Eigen3::Eigen)
+
+  ament_add_gtest(test_gnss tests/test_gnss.cpp)
+  target_link_libraries(test_gnss fusioncore_core Eigen3::Eigen)
+
+  ament_add_gtest(test_gnss_manager tests/test_gnss_manager.cpp)
+  target_link_libraries(test_gnss_manager fusioncore_core Eigen3::Eigen)
 endif()
 
 ament_export_targets(fusioncore_core_targets HAS_LIBRARY_TARGET)
