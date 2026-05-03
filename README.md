@@ -3,9 +3,13 @@
 [![CI](https://github.com/manankharwar/fusioncore/actions/workflows/ci.yml/badge.svg)](https://github.com/manankharwar/fusioncore/actions/workflows/ci.yml)
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19834991-blue)](https://doi.org/10.5281/zenodo.19834991)
 [![Docs](https://img.shields.io/badge/docs-manankharwar.github.io%2Ffusioncore-blue)](https://manankharwar.github.io/fusioncore/)
+[![Paper](https://img.shields.io/badge/paper-arXiv%20preprint-b31b1b)](paper/fusioncore_arxiv.pdf)
 
 **ROS 2 sensor fusion: IMU + wheel encoders + GPS fused via UKF at 100 Hz. 22-state filter with IMU bias estimation, adaptive noise covariance, and chi-squared outlier rejection on every sensor.**
 
+<p align="center">
+  <img width="900" height="500" alt="LinkedIn1-ezgif com-optimize" src="https://github.com/user-attachments/assets/e1e07cfb-74e0-48b9-9bfd-32b68ee5a6ef"/>
+</p>
 ---
 
 ## Why I built this
@@ -39,11 +43,13 @@ RL-EKF run with `odom0_twist_rejection_threshold: 4.03` and `odom1_pose_rejectio
 
 ## Install
 
+Supports **ROS 2 Jazzy** (Ubuntu 24.04) and **Humble** (Ubuntu 22.04).
+
 ```bash
 mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
 git clone https://github.com/manankharwar/fusioncore.git
 cd ~/ros2_ws
-source /opt/ros/jazzy/setup.bash
+source /opt/ros/jazzy/setup.bash  # or /opt/ros/humble/setup.bash
 rosdep install --from-paths src --ignore-src -r -y
 colcon build && source install/setup.bash
 ```
