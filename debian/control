@@ -1,0 +1,13 @@
+Source: ros-humble-fusioncore-core
+Section: misc
+Priority: optional
+Maintainer: FusionCore <kharwarm@mcmaster.ca>
+Build-Depends: debhelper (>= 9.0.0), libeigen3-dev, ros-humble-ament-cmake, ros-humble-ament-cmake-gtest <!nocheck>, ros-humble-eigen3-cmake-module, ros-humble-ros-workspace
+Homepage: https://index.ros.org/p/fusioncore_core/#humble
+Standards-Version: 3.9.2
+
+Package: ros-humble-fusioncore-core
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libeigen3-dev, ros-humble-eigen3-cmake-module, ros-humble-ros-workspace
+Description: Pure C++ UKF sensor fusion library underlying FusionCore.
+ Fuses IMU, wheel encoders and GPS in a 22-state unscented Kalman filter. Includes ECEF GPS conversion, IMU bias estimation, adaptive noise covariance, chi-squared outlier gating, and ZUPT. No ROS dependency, usable standalone.
