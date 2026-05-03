@@ -1,0 +1,12 @@
+Source: ros-jazzy-fusioncore-datasets
+Section: misc
+Priority: optional
+Maintainer: Manan Kharwar <manankharwar2001@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), ros-jazzy-ament-cmake, ros-jazzy-ros-workspace
+Homepage: https://index.ros.org/p/fusioncore_datasets/#jazzy
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-fusioncore-datasets
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-jazzy-fusioncore-ros, ros-jazzy-geometry-msgs, ros-jazzy-nav-msgs, ros-jazzy-rclpy, ros-jazzy-robot-localization, ros-jazzy-rosgraph-msgs, ros-jazzy-sensor-msgs, ros-jazzy-ros-workspace
+Description: NCLT dataset adapter and benchmark pipeline for FusionCore vs robot_localization
