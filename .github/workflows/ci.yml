@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: jazzy
+
+      - name: Install rosdep dependencies
+        run: |
+          source /opt/ros/jazzy/setup.sh
+          sudo rosdep init 2>/dev/null || true
+          rosdep update
+          rosdep install -r --from-paths . --ignore-src --rosdistro jazzy -y
+
+      - name: Build
+        run: |
+          source /opt/ros/jazzy/setup.sh
+          colcon build \
+            --packages-up-to compass_msgs fusioncore_core fusioncore_ros \
+            --cmake-args -DBUILD_TESTING=ON \
+            --event-handlers console_cohesion+
+
+      - name: Test
+        run: |
+          source /opt/ros/jazzy/setup.sh
+          source install/local_setup.bash
+          colcon test \
+            --packages-select compass_msgs fusioncore_core fusioncore_ros \
+            --event-handlers console_direct+
+
+      - name: Check test results
+        run: |
+          source /opt/ros/jazzy/setup.sh
+          colcon test-result --verbose
