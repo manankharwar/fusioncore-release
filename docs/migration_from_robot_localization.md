@@ -125,7 +125,9 @@ fusioncore:
     gnss.base_noise_z: 5.0
     gnss.max_hdop: 4.0
     gnss.min_satellites: 4
-    gnss.min_fix_type: 1     # 1=GPS, 2=DGPS, 3=RTK_FLOAT, 4=RTK_FIXED
+    gnss.min_fix_type: 1     # 1=GPS, 2=DGPS/RTK_FIXED, 4=RTK_FIXED only
+                             # WARNING: sensor_msgs/NavSatFix has no RTK_FLOAT status.
+                             # Setting min_fix_type: 3 will silently starve the filter. Use 2 or 4.
 
     outlier_rejection: true
     outlier_threshold_gnss: 16.27
@@ -215,7 +217,7 @@ velocity_smoother:
 # if you had AMCL, remove it: FusionCore handles global localization via GPS
 ```
 
-Also remove AMCL if you had it. FusionCore publishes the `map → odom` TF directly via GPS: AMCL would conflict with it.
+Also remove AMCL if you had it. FusionCore publishes `odom → base_link` TF and a `/fromLL` service for GPS waypoint navigation. AMCL publishes `map → odom` for map-based localization, which is not needed when GPS provides global positioning and will conflict with the TF tree.
 
 ---
 
@@ -275,7 +277,7 @@ FusionCore publishes to `/fusion/odom`. Any downstream node that was reading `/o
 | `imu0_relative` | not needed | |
 | `imu0_queue_size` | not needed | |
 | `imu0_remove_gravitational_acceleration` | `imu.remove_gravitational_acceleration` | Logic is inverted: see Step 2 above |
-| `mahalanobis_threshold` | `outlier_threshold_gnss/imu/enc/hdg` | FC has per-sensor thresholds instead of one global value |
+| `odomN_pose_rejection_threshold`, `odomN_twist_rejection_threshold` | `outlier_threshold_gnss/imu/enc/hdg` | Both use Mahalanobis distance. RL exposes raw scalar thresholds with no guidance on chi-squared calibration per DOF: you set them manually. FC defaults are chi-squared critical values pre-calibrated to each sensor's measurement DOF. |
 | `process_noise_covariance` | `ukf.q_position`, `ukf.q_velocity`, etc. | FC exposes named scalars instead of a 15×15 matrix |
 | `initial_estimate_covariance` | not configurable | FC initializes automatically from first sensor readings |
 | `print_diagnostics` | always on | FC publishes to `/diagnostics` at 1 Hz |
