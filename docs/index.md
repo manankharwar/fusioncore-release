@@ -25,18 +25,21 @@ robot_localization is a solid, well-maintained package used on tens of thousands
 |---|---|---|
 | GPS fusion | navsat_transform node required; ECEF TF frame added in rolling-devel | Filter state runs natively in ECEF: no UTM projection |
 | IMU bias estimation | Not in state vector | Gyro + accel bias as filter states |
-| Outlier rejection | Single global Mahalanobis threshold | Chi-squared gating per sensor |
+| Outlier rejection | Mahalanobis threshold (manual scalars, no DOF guidance) | Mahalanobis chi-squared gate (pre-calibrated to sensor DOF) |
 | Adaptive noise | Fixed config values | Auto from innovation sequence |
 | ZUPT | Not built-in | Auto when stationary |
 | Delay compensation | `smooth_lagged_data` + `history_length` | IMU ring buffer replay |
 | GPS fix quality gating | Not built-in | HDOP, satellite count, fix type |
 | Dual antenna heading | Not built-in | Yes |
 | Inertial coast mode | Not built-in | Auto on sustained GPS dropout |
-| ROS 2 Jazzy | Ported from ROS 1 | Native, from scratch |
+| ROS 2 Jazzy / Humble | Ported from ROS 1 | Native, from scratch |
 
 ---
 
 ## Install
+
+!!! note "Humble users"
+    Replace `jazzy` with `humble` in the commands below (Ubuntu 22.04).
 
 ```bash
 mkdir -p ~/ros2_ws/src
