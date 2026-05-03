@@ -1,4 +1,4 @@
-release_repo_url: https://manankharwar:REDACTED@github.com/manankharwar/fusioncore-release.git
+release_repo_url: https://github.com/manankharwar/fusioncore-release.git
 tracks:
   humble:
     actions:
