@@ -1,9 +1,11 @@
 #pragma once
 #include "fusioncore/ukf.hpp"
 #include "fusioncore/state.hpp"
+#include "fusioncore/motion_model.hpp"
 #include "fusioncore/sensors/imu.hpp"
 #include "fusioncore/sensors/encoder.hpp"
 #include "fusioncore/sensors/gnss.hpp"
+#include "fusioncore/sensors/vslam.hpp"
 #include <chrono>
 #include <optional>
 #include <string>
@@ -18,6 +20,7 @@ struct FusionCoreConfig {
   sensors::ImuParams     imu;
   sensors::EncoderParams encoder;
   sensors::GnssParams    gnss;
+  sensors::VslamParams   vslam;
   double min_dt = 1e-6;
   double max_dt = 1.0;
 
@@ -38,6 +41,7 @@ struct FusionCoreConfig {
   double outlier_threshold_imu   = 15.09;  // chi2(6, 0.999): 6D IMU
   double outlier_threshold_enc   = 11.34;  // chi2(3, 0.999): 3D encoder
   double outlier_threshold_hdg   = 10.83;  // chi2(1, 0.999): 1D heading
+  double outlier_threshold_vslam = 22.46;  // chi2(6, 0.999): 6D pose
 
   // Adaptive noise covariance
   // Whether to enable adaptive R estimation for each sensor
@@ -60,6 +64,10 @@ struct FusionCoreConfig {
   // How many IMU messages to keep for full replay retrodiction.
   // At 100Hz IMU and 500ms max delay: 50 messages minimum.
   int imu_buffer_size = 100;
+
+  // Optional custom motion model. nullptr = use ConstantVelocityAcceleration (default).
+  // Set via create_motion_model("DifferentialDrive") etc. before passing to FusionCore.
+  std::shared_ptr<MotionModelBase> motion_model = nullptr;
 
   // Zero-velocity update (ZUPT) parameters
   // Velocity threshold below which the robot is considered stationary (m/s and rad/s)
@@ -85,6 +93,12 @@ struct FusionCoreConfig {
   // Multiplier applied to q_position each predict step while in coast mode.
   // 20.0 ≈ 4.5× position sigma growth per second at 100Hz IMU.
   double gnss_coast_q_factor = 20.0;
+  // After gnss_coast_n consecutive rejections, inflate R by this factor and
+  // retry the gate. Fixes that pass the relaxed gate are accepted with a
+  // down-weighted Kalman gain rather than hard-rejected.
+  // 3.0 = loosen the gate by ~1.7x in sigma units; keeps spike rejection intact.
+  // 0.0 or 1.0 = disabled (no R inflation, only Q inflation from coast mode).
+  double gnss_degraded_noise_multiplier = 3.0;
 };
 
 // How heading was validated: tracked per filter run
@@ -115,10 +129,13 @@ struct FusionCoreStatus {
   double        distance_traveled   = 0.0;  // meters since init
 
   // Outlier rejection counters: cumulative since init()
-  int gnss_outliers = 0;
-  int imu_outliers  = 0;
-  int enc_outliers  = 0;
-  int hdg_outliers  = 0;
+  int gnss_outliers  = 0;
+  int imu_outliers   = 0;
+  int enc_outliers   = 0;
+  int hdg_outliers   = 0;
+  int vslam_outliers = 0;
+
+  SensorHealth vslam_health = SensorHealth::NOT_INIT;
 };
 
 class FusionCore {
@@ -160,6 +177,14 @@ public:
     const sensors::GnssFix& fix
   );
 
+  // VSLAM pose update: 6-DOF position + orientation in local ENU frame.
+  // Ignores the twist component of nav_msgs/Odometry entirely.
+  // Returns true if accepted, false if rejected by the outlier gate.
+  bool update_pose(
+    double timestamp_seconds,
+    const sensors::VslamPose& pose
+  );
+
   // Non-holonomic ground constraint: fuses VZ=0 as a pseudo-measurement.
   // Call this every encoder update to prevent altitude drift in the UKF.
   // Only applies to wheeled ground robots; do not call for aerial vehicles.
@@ -194,6 +219,7 @@ private:
   double last_imu_time_     = -1.0;
   double last_encoder_time_ = -1.0;
   double last_gnss_time_    = -1.0;
+  double last_vslam_time_   = -1.0;
   int    update_count_      = 0;
 
   // ─── Adaptive noise covariance ───────────────────────────────────────────
@@ -242,12 +268,14 @@ private:
   InnovationWindow<sensors::ENCODER_DIM>          encoder_innovations_;
   InnovationWindow<sensors::GNSS_POS_DIM>         gnss_innovations_;
   InnovationWindow<sensors::IMU_ORIENTATION_DIM>  imu_orient_innovations_;
+  InnovationWindow<sensors::VSLAM_POSE_DIM>       vslam_innovations_;
 
   // Current adaptive R estimates: start at config values, drift toward truth
   sensors::ImuNoiseMatrix             R_imu_;
   sensors::EncoderNoiseMatrix         R_encoder_;
   sensors::GnssPosNoiseMatrix         R_gnss_;
   sensors::ImuOrientationNoiseMatrix  R_imu_orient_;
+  sensors::VslamPoseNoiseMatrix       R_vslam_;
 
   // Minimum R floors: adaptive R must never drop below the initially configured value.
   // A constant innovation bias (e.g. sim gravity ≠ WGS84 gravity) has zero variance
@@ -257,6 +285,7 @@ private:
   sensors::EncoderNoiseMatrix         R_encoder_floor_;
   sensors::GnssPosNoiseMatrix         R_gnss_floor_;
   sensors::ImuOrientationNoiseMatrix  R_imu_orient_floor_;
+  sensors::VslamPoseNoiseMatrix       R_vslam_floor_;
 
   bool adaptive_initialized_ = false;
 
@@ -265,6 +294,7 @@ private:
   int imu_outliers_    = 0;
   int enc_outliers_    = 0;
   int hdg_outliers_    = 0;
+  int vslam_outliers_  = 0;
 
   // Inertial coast mode tracking
   int  gnss_consecutive_rejects_ = 0;
