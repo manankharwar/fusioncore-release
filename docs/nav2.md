@@ -88,7 +88,7 @@ velocity_smoother:
     odom_topic: /fusion/odom
 ```
 
-Also remove AMCL if you had it. FusionCore publishes the `map → odom` TF directly via GPS. Running AMCL alongside it will cause TF conflicts.
+Also remove AMCL if you had it. FusionCore publishes `odom → base_link` only: not `map → odom`. The `global_frame` in bt_navigator, global_costmap, and behavior_server must be set to `odom` for GPS-only navigation. Running AMCL alongside FusionCore will cause TF conflicts on `odom → base_link`.
 
 ---
 
