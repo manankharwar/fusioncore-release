@@ -1,5 +1,7 @@
 #include "fusioncore/fusioncore.hpp"
+#include "fusioncore/motion_model.hpp"
 #include "fusioncore/sensors/gnss.hpp"
+#include "fusioncore/sensors/vslam.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
@@ -23,6 +25,9 @@
 #include "fusioncore_ros/srv/from_ll.hpp"
 #include <mutex>
 #include <optional>
+#include <set>
+#include <fstream>
+#include <sstream>
 #include <proj.h>
 
 using namespace std::chrono_literals;
@@ -57,7 +62,15 @@ public:
     // or IMU-Z drift from moving the costmap rolling window out of the
     // 2D navigation plane. Orientation (roll/pitch) is untouched.
     declare_parameter("publish.force_2d", false);
+    // Set to false when another node owns the odom->base_link TF
+    // (e.g. a separate sensor fusion layer). FusionCore will still
+    // publish /fusion/odom; only the TF broadcast is suppressed.
+    declare_parameter("publish.tf", true);
 
+    // Primary IMU topic. Override when your driver publishes at a non-default topic
+    // (e.g. Clearpath Microstrain at /sensors/imu_0/data, Realsense at /camera/imu).
+    // Using a launch-time remap is equivalent and preferred for readability.
+    declare_parameter("imu.topic", std::string("/imu/data"));
     declare_parameter("imu.gyro_noise",  0.005);
     // Set to true if IMU has a magnetometer (9-axis: BNO08x, VectorNav, Xsens)
     // Set to false for 6-axis IMUs: yaw from gyro integration drifts
@@ -75,6 +88,16 @@ public:
     // already subtracted gravity, enable this to add gravity back before fusing.
     declare_parameter("imu.remove_gravitational_acceleration", false);
 
+    // Optional second IMU source. When non-empty, FusionCore subscribes to this
+    // topic and calls update_imu() for each message, treating the two sensors as
+    // independent measurements of the same state. Uses the same noise model as
+    // the primary IMU. Useful when your platform has two IMUs and you want
+    // redundancy rather than pre-merging them externally (e.g. VESC IMU + D435i).
+    // Leave empty to disable.
+    declare_parameter("imu2.topic",    std::string(""));
+    declare_parameter("imu2.frame_id", std::string(""));
+    declare_parameter("imu2.remove_gravitational_acceleration", false);
+
     declare_parameter("encoder.vel_noise", 0.05);
     declare_parameter("encoder.yaw_noise", 0.02);
 
@@ -82,9 +105,27 @@ public:
     // When non-empty, FusionCore subscribes to this topic as nav_msgs/Odometry
     // and fuses twist.linear.x/y + twist.angular.z using the same update_encoder
     // path as the primary wheel encoder. Per-axis covariance is taken from the
-    // message twist.covariance when positive; otherwise adaptive/config noise
-    // is used. Leave empty to disable.
-    declare_parameter("encoder2.topic", std::string(""));
+    // message twist.covariance when positive; otherwise encoder2.vel_noise and
+    // encoder2.yaw_noise are used as fallback. Leave empty to disable.
+    declare_parameter("encoder2.topic",     std::string(""));
+    declare_parameter("encoder2.vel_noise", 0.05);
+    declare_parameter("encoder2.yaw_noise", 0.02);
+
+    // GPS velocity topic: fuses horizontal speed from any receiver that outputs
+    // nav_msgs/Odometry with velocity in the ENU (world) frame.
+    // linear.x = east, linear.y = north. Rotated to body frame internally.
+    // Leave empty to disable. Works with F9P, Septentrio, and any bridge node
+    // that republishes GPS velocity as nav_msgs/Odometry.
+    declare_parameter("gnss.velocity_topic", std::string(""));
+
+    // Radar Doppler velocity topic: fuses ego-velocity from a 4D imaging radar.
+    // Accepts nav_msgs/Odometry with velocity in the robot body frame:
+    //   linear.x = forward (m/s), linear.y = lateral (m/s)
+    // A bridge node extracts ego-velocity from raw radar point cloud Doppler and
+    // publishes here. Works indoors and outdoors, all weather conditions.
+    // Leave empty to disable.
+    declare_parameter("radar.velocity_topic", std::string(""));
+    declare_parameter("radar.vel_noise",      0.1);   // m/s fallback when msg cov <= 0
 
     declare_parameter("gnss.base_noise_xy",  1.0);
     declare_parameter("gnss.base_noise_z",   2.0);
@@ -139,10 +180,19 @@ public:
     declare_parameter("outlier_rejection",      true);
     declare_parameter("outlier_threshold_gnss", 16.27);
     declare_parameter("outlier_threshold_imu",  15.09);
-    declare_parameter("outlier_threshold_enc",  11.34);
-    declare_parameter("outlier_threshold_hdg",  10.83);
-    declare_parameter("gnss.coast_n",           5);
-    declare_parameter("gnss.coast_q_factor",    20.0);
+    declare_parameter("outlier_threshold_enc",   11.34);
+    declare_parameter("outlier_threshold_hdg",   10.83);
+    declare_parameter("outlier_threshold_vslam", 22.46);
+    // VSLAM pose input (ORB-SLAM3, RTAB-Map, Kimera, etc.)
+    declare_parameter("vslam.topic",              std::string(""));
+    declare_parameter("vslam.position_noise",     0.1);
+    declare_parameter("vslam.orientation_noise",  0.02);
+    declare_parameter("vslam.frame_id",           std::string(""));
+    declare_parameter("vslam.reinit_n",           10);
+
+    declare_parameter("gnss.coast_n",                    5);
+    declare_parameter("gnss.coast_q_factor",             20.0);
+    declare_parameter("gnss.degraded_noise_multiplier",  3.0);
 
     declare_parameter("adaptive.imu",     true);
     declare_parameter("adaptive.encoder", true);
@@ -165,6 +215,27 @@ public:
     // Only activates if the robot is stationary during the window (encoder check).
     declare_parameter("init.stationary_window", 0.0);
 
+    // Wait for all configured sensors before starting the filter (default false).
+    // When true, FusionCore holds initialization until every subscribed sensor
+    // has published at least one message, so the filter starts with a full set
+    // of measurements rather than drifting on IMU alone.
+    // init.sensor_wait_timeout: give up and start anyway after this many seconds.
+    declare_parameter("init.wait_for_all_sensors", false);
+    declare_parameter("init.sensor_wait_timeout",  10.0);
+
+    // Checkpoint path for deterministic replay (save/load filter state).
+    // ~/save_checkpoint saves the current state to this file.
+    // ~/load_checkpoint restores state from this file (re-run from any point in a bag).
+    declare_parameter("replay.checkpoint_path",
+      std::string("/tmp/fusioncore_checkpoint.txt"));
+
+    // Motion model: controls how sigma points are propagated in the predict step.
+    // "ConstantVelocityAcceleration" (default): no platform constraints.
+    // "DifferentialDrive": zeros lateral velocity (VY) each predict step.
+    // "Ackermann": same lateral constraint; wheelbase stored for future extensions.
+    declare_parameter("motion_model", std::string("ConstantVelocityAcceleration"));
+    declare_parameter("motion_model_params.wheelbase", 0.55);
+
     declare_parameter("ukf.q_position",     0.01);
     declare_parameter("ukf.q_orientation",  1e-9);
     declare_parameter("ukf.q_velocity",     0.1);
@@ -177,6 +248,7 @@ public:
     odom_frame_   = get_parameter("odom_frame").as_string();
     publish_rate_ = get_parameter("publish_rate").as_double();
     force_2d_     = get_parameter("publish.force_2d").as_bool();
+    publish_tf_   = get_parameter("publish.tf").as_bool();
     heading_topic_ = get_parameter("gnss.heading_topic").as_string();
     gnss2_topic_    = get_parameter("gnss.fix2_topic").as_string();
     azimuth_topic_  = get_parameter("gnss.azimuth_topic").as_string();
@@ -190,6 +262,7 @@ public:
     config.imu_has_magnetometer = get_parameter("imu.has_magnetometer").as_bool();
     config.imu.accel_noise_y = config.imu.accel_noise_x;
     config.imu.accel_noise_z = config.imu.accel_noise_x;
+    imu_topic_          = get_parameter("imu.topic").as_string();
     imu_remove_gravity_ = get_parameter("imu.remove_gravitational_acceleration").as_bool();
     imu_frame_override_ = get_parameter("imu.frame_id").as_string();
     RCLCPP_INFO(get_logger(), "IMU gravity removal: %s",
@@ -197,11 +270,20 @@ public:
     if (!imu_frame_override_.empty())
       RCLCPP_INFO(get_logger(), "IMU frame override: %s", imu_frame_override_.c_str());
 
+    imu2_topic_          = get_parameter("imu2.topic").as_string();
+    imu2_frame_override_ = get_parameter("imu2.frame_id").as_string();
+    imu2_remove_gravity_ = get_parameter("imu2.remove_gravitational_acceleration").as_bool();
+
     config.encoder.vel_noise_x  = get_parameter("encoder.vel_noise").as_double();
     config.encoder.vel_noise_y  = config.encoder.vel_noise_x;
     config.encoder.vel_noise_wz = get_parameter("encoder.yaw_noise").as_double();
 
-    encoder2_topic_ = get_parameter("encoder2.topic").as_string();
+    encoder2_topic_     = get_parameter("encoder2.topic").as_string();
+    enc2_vel_noise_     = get_parameter("encoder2.vel_noise").as_double();
+    enc2_yaw_noise_     = get_parameter("encoder2.yaw_noise").as_double();
+    gnss_vel_topic_    = get_parameter("gnss.velocity_topic").as_string();
+    radar_vel_topic_   = get_parameter("radar.velocity_topic").as_string();
+    radar_vel_noise_   = get_parameter("radar.vel_noise").as_double();
 
     config.gnss.base_noise_xy  = get_parameter("gnss.base_noise_xy").as_double();
     config.gnss.base_noise_z   = get_parameter("gnss.base_noise_z").as_double();
@@ -260,10 +342,19 @@ public:
     config.outlier_rejection      = get_parameter("outlier_rejection").as_bool();
     config.outlier_threshold_gnss = get_parameter("outlier_threshold_gnss").as_double();
     config.outlier_threshold_imu  = get_parameter("outlier_threshold_imu").as_double();
-    config.outlier_threshold_enc  = get_parameter("outlier_threshold_enc").as_double();
-    config.outlier_threshold_hdg  = get_parameter("outlier_threshold_hdg").as_double();
-    config.gnss_coast_n           = get_parameter("gnss.coast_n").as_int();
-    config.gnss_coast_q_factor    = get_parameter("gnss.coast_q_factor").as_double();
+    config.outlier_threshold_enc   = get_parameter("outlier_threshold_enc").as_double();
+    config.outlier_threshold_hdg   = get_parameter("outlier_threshold_hdg").as_double();
+    config.outlier_threshold_vslam = get_parameter("outlier_threshold_vslam").as_double();
+
+    vslam_topic_          = get_parameter("vslam.topic").as_string();
+    vslam_frame_override_ = get_parameter("vslam.frame_id").as_string();
+    config.vslam.position_noise    = get_parameter("vslam.position_noise").as_double();
+    config.vslam.orientation_noise = get_parameter("vslam.orientation_noise").as_double();
+    vslam_reinit_n_       = get_parameter("vslam.reinit_n").as_int();
+
+    config.gnss_coast_n                    = get_parameter("gnss.coast_n").as_int();
+    config.gnss_coast_q_factor             = get_parameter("gnss.coast_q_factor").as_double();
+    config.gnss_degraded_noise_multiplier  = get_parameter("gnss.degraded_noise_multiplier").as_double();
 
     config.adaptive_imu     = get_parameter("adaptive.imu").as_bool();
     config.adaptive_encoder = get_parameter("adaptive.encoder").as_bool();
@@ -275,7 +366,7 @@ public:
     config.ukf.q_orientation  = get_parameter("ukf.q_orientation").as_double();
     if (config.ukf.q_orientation > 1e-3) {
       RCLCPP_ERROR(get_logger(),
-        "ukf.q_orientation=%.2e is too large — quaternion math will corrupt at IMU rates. "
+        "ukf.q_orientation=%.2e is too large: quaternion math will corrupt at IMU rates. "
         "Set to 1.0e-9 or remove the line from your config (default is 1.0e-9).",
         config.ukf.q_orientation);
       return CallbackReturn::FAILURE;
@@ -291,7 +382,28 @@ public:
     zupt_angular_threshold_  = get_parameter("zupt.angular_threshold").as_double();
     zupt_noise_sigma_        = get_parameter("zupt.noise_sigma").as_double();
 
-    init_window_duration_ = get_parameter("init.stationary_window").as_double();
+    init_window_duration_    = get_parameter("init.stationary_window").as_double();
+    wait_for_all_sensors_    = get_parameter("init.wait_for_all_sensors").as_bool();
+    sensor_wait_timeout_     = get_parameter("init.sensor_wait_timeout").as_double();
+    checkpoint_path_         = get_parameter("replay.checkpoint_path").as_string();
+
+    const std::string motion_model_name =
+      get_parameter("motion_model").as_string();
+    const double wheelbase =
+      get_parameter("motion_model_params.wheelbase").as_double();
+
+    if (!motion_model_name.empty() &&
+        motion_model_name != "ConstantVelocityAcceleration" &&
+        motion_model_name != "CVA") {
+      try {
+        config.motion_model = fusioncore::create_motion_model(
+          motion_model_name, {{"wheelbase", wheelbase}});
+        RCLCPP_INFO(get_logger(), "Motion model: %s", motion_model_name.c_str());
+      } catch (const std::exception& e) {
+        RCLCPP_ERROR(get_logger(), "%s", e.what());
+        return CallbackReturn::FAILURE;
+      }
+    }
 
     fc_ = std::make_unique<fusioncore::FusionCore>(config);
 
@@ -331,11 +443,23 @@ public:
     sensor_opts.callback_group = sensor_cb_group_;
 
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-      "/imu/data", 100,
+      imu_topic_, 100,
       [this](const sensor_msgs::msg::Imu::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(fc_mutex_);
         imu_callback(msg);
       }, sensor_opts);
+    RCLCPP_INFO(get_logger(), "IMU topic: %s", imu_topic_.c_str());
+
+    if (!imu2_topic_.empty()) {
+      imu2_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+        imu2_topic_, 100,
+        [this](const sensor_msgs::msg::Imu::SharedPtr msg) {
+          std::lock_guard<std::mutex> lock(fc_mutex_);
+          imu2_callback(msg);
+        }, sensor_opts);
+      RCLCPP_INFO(get_logger(),
+        "Second IMU enabled on topic: %s", imu2_topic_.c_str());
+    }
 
     encoder_sub_ = create_subscription<nav_msgs::msg::Odometry>(
       "/odom/wheels", 50,
@@ -356,6 +480,39 @@ public:
         }, sensor_opts);
       RCLCPP_INFO(get_logger(),
         "Second encoder-twist source enabled on topic: %s", encoder2_topic_.c_str());
+    }
+
+    if (!vslam_topic_.empty()) {
+      vslam_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        vslam_topic_, 50,
+        [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
+          std::lock_guard<std::mutex> lock(fc_mutex_);
+          vslam_callback(msg);
+        }, sensor_opts);
+      RCLCPP_INFO(get_logger(),
+        "VSLAM pose fusion enabled on topic: %s", vslam_topic_.c_str());
+    }
+
+    if (!gnss_vel_topic_.empty()) {
+      gnss_vel_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        gnss_vel_topic_, 10,
+        [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
+          std::lock_guard<std::mutex> lock(fc_mutex_);
+          gnss_vel_callback(msg);
+        }, sensor_opts);
+      RCLCPP_INFO(get_logger(),
+        "GPS velocity fusion enabled on topic: %s", gnss_vel_topic_.c_str());
+    }
+
+    if (!radar_vel_topic_.empty()) {
+      radar_vel_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        radar_vel_topic_, 10,
+        [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
+          std::lock_guard<std::mutex> lock(fc_mutex_);
+          radar_vel_callback(msg);
+        }, sensor_opts);
+      RCLCPP_INFO(get_logger(),
+        "Radar Doppler velocity fusion enabled on topic: %s", radar_vel_topic_.c_str());
     }
 
     gnss_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
@@ -479,6 +636,96 @@ public:
         response->map_point.z = enu[2];
       });
 
+    // Checkpoint services: save/load full filter state for deterministic replay.
+    save_checkpoint_srv_ = create_service<std_srvs::srv::Trigger>(
+      "~/save_checkpoint",
+      [this](const std_srvs::srv::Trigger::Request::SharedPtr,
+             std_srvs::srv::Trigger::Response::SharedPtr response)
+      {
+        std::lock_guard<std::mutex> lock(fc_mutex_);
+        if (!fc_->is_initialized()) {
+          response->success = false;
+          response->message = "Filter not initialized.";
+          return;
+        }
+        std::ofstream f(checkpoint_path_);
+        if (!f) {
+          response->success = false;
+          response->message = "Cannot open: " + checkpoint_path_;
+          return;
+        }
+        const auto& s = fc_->get_state();
+        f << "t=" << last_imu_time_ << "\n";
+        f << "x=";
+        for (int i = 0; i < fusioncore::STATE_DIM; ++i)
+          f << s.x[i] << (i + 1 < fusioncore::STATE_DIM ? " " : "\n");
+        f << "P=";
+        for (int r = 0; r < fusioncore::STATE_DIM; ++r)
+          for (int c = 0; c < fusioncore::STATE_DIM; ++c)
+            f << s.P(r, c) <<
+              (r == fusioncore::STATE_DIM - 1 && c == fusioncore::STATE_DIM - 1 ? "\n" : " ");
+        response->success = true;
+        response->message = "Saved to " + checkpoint_path_;
+        RCLCPP_INFO(get_logger(), "State checkpoint saved to %s at t=%.3f",
+          checkpoint_path_.c_str(), last_imu_time_);
+      });
+
+    load_checkpoint_srv_ = create_service<std_srvs::srv::Trigger>(
+      "~/load_checkpoint",
+      [this](const std_srvs::srv::Trigger::Request::SharedPtr,
+             std_srvs::srv::Trigger::Response::SharedPtr response)
+      {
+        std::lock_guard<std::mutex> lock(fc_mutex_);
+        std::ifstream f(checkpoint_path_);
+        if (!f) {
+          response->success = false;
+          response->message = "Cannot open: " + checkpoint_path_;
+          return;
+        }
+        fusioncore::State restored;
+        double t = 0.0;
+        std::string line;
+        while (std::getline(f, line)) {
+          if (line.substr(0, 2) == "t=") {
+            t = std::stod(line.substr(2));
+          } else if (line.substr(0, 2) == "x=") {
+            std::istringstream ss(line.substr(2));
+            for (int i = 0; i < fusioncore::STATE_DIM; ++i) ss >> restored.x[i];
+          } else if (line.substr(0, 2) == "P=") {
+            std::istringstream ss(line.substr(2));
+            for (int r = 0; r < fusioncore::STATE_DIM; ++r)
+              for (int c = 0; c < fusioncore::STATE_DIM; ++c)
+                ss >> restored.P(r, c);
+          }
+        }
+        fc_->init(restored, t);
+        response->success = true;
+        response->message = "Loaded from " + checkpoint_path_;
+        RCLCPP_INFO(get_logger(), "State checkpoint loaded from %s at t=%.3f",
+          checkpoint_path_.c_str(), t);
+      });
+
+    // Sensor wait: populate the expected set based on configured sources.
+    if (wait_for_all_sensors_) {
+      sensors_expected_.clear();
+      sensors_received_.clear();
+      sensor_wait_done_ = false;
+      sensors_expected_.insert("IMU");
+      sensors_expected_.insert("Encoder");
+      if (reference_use_first_fix_)        sensors_expected_.insert("GNSS");
+      if (!imu2_topic_.empty())            sensors_expected_.insert("IMU2");
+      if (!encoder2_topic_.empty())        sensors_expected_.insert("Encoder2");
+      if (!vslam_topic_.empty())           sensors_expected_.insert("VSLAM");
+      if (!gnss_vel_topic_.empty())        sensors_expected_.insert("GPSVel");
+      if (!radar_vel_topic_.empty())       sensors_expected_.insert("RadarVel");
+      if (!heading_topic_.empty() ||
+          !azimuth_topic_.empty())         sensors_expected_.insert("Heading");
+      if (!gnss2_topic_.empty())           sensors_expected_.insert("GNSS2");
+      activate_time_ = this->now().seconds();
+      RCLCPP_INFO(get_logger(), "Waiting for %zu sensor(s) before starting filter.",
+        sensors_expected_.size());
+    }
+
     RCLCPP_INFO(get_logger(), "FusionCore active. Listening for sensors.");
     return CallbackReturn::SUCCESS;
   }
@@ -488,8 +735,14 @@ public:
   CallbackReturn on_deactivate(const rclcpp_lifecycle::State &)
   {
     imu_sub_.reset();
+    imu2_sub_.reset();
     encoder_sub_.reset();
     encoder2_sub_.reset();
+    vslam_sub_.reset();
+    vslam_origin_set_          = false;
+    vslam_consecutive_rejects_ = 0;
+    gnss_vel_sub_.reset();
+    radar_vel_sub_.reset();
     gnss_sub_.reset();
     gnss2_sub_.reset();
     gnss_heading_sub_.reset();
@@ -498,6 +751,11 @@ public:
     diag_timer_.reset();
     reset_srv_.reset();
     from_ll_srv_.reset();
+    save_checkpoint_srv_.reset();
+    load_checkpoint_srv_.reset();
+    sensors_expected_.clear();
+    sensors_received_.clear();
+    sensor_wait_done_ = false;
     odom_pub_.reset();
     pose_pub_.reset();
     diag_pub_.reset();
@@ -604,6 +862,19 @@ private:
 
   // ─── IMU callback: with frame transform ──────────────────────────────────
 
+  // Helper: mark a sensor as received for the sensor-wait feature.
+  void mark_sensor_received(const std::string& name) {
+    if (wait_for_all_sensors_ && sensors_expected_.count(name))
+      sensors_received_.insert(name);
+  }
+
+  // Helper: format a set of sensor names as "A, B, C" for log messages.
+  static std::string format_sensor_set(const std::set<std::string>& s) {
+    std::string out;
+    for (const auto& n : s) { if (!out.empty()) out += ", "; out += n; }
+    return out;
+  }
+
   void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg)
   {
     double t = rclcpp::Time(msg->header.stamp).seconds();
@@ -612,8 +883,36 @@ private:
     // message timestamp. This avoids a large dead prediction step when
     // use_sim_time:true and /clock hasn't started before on_activate().
     last_imu_time_ = t;
+    mark_sensor_received("IMU");
 
     if (pending_init_) {
+      // Sensor wait gate: hold initialization until all expected sensors checked in.
+      if (wait_for_all_sensors_ && !sensor_wait_done_) {
+        if (sensors_received_ != sensors_expected_) {
+          double elapsed = this->now().seconds() - activate_time_;
+          if (elapsed < sensor_wait_timeout_) {
+            std::set<std::string> missing;
+            for (const auto& s : sensors_expected_)
+              if (!sensors_received_.count(s)) missing.insert(s);
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+              "Waiting for sensors (%.1fs / %.1fs): missing [%s]",
+              elapsed, sensor_wait_timeout_, format_sensor_set(missing).c_str());
+            return;
+          }
+          std::set<std::string> missing;
+          for (const auto& s : sensors_expected_)
+            if (!sensors_received_.count(s)) missing.insert(s);
+          RCLCPP_WARN(get_logger(),
+            "Sensor wait timed out after %.1fs. Missing: [%s]. Starting anyway.",
+            sensor_wait_timeout_, format_sensor_set(missing).c_str());
+        } else {
+          RCLCPP_INFO(get_logger(),
+            "All %zu configured sensors ready. Starting filter.",
+            sensors_expected_.size());
+        }
+        sensor_wait_done_ = true;
+      }
+
       if (init_window_duration_ <= 0.0) {
         fusioncore::State initial;
         initial.P = fusioncore::StateMatrix::Identity() * 0.1;
@@ -627,7 +926,12 @@ private:
         // Static bias window: collect IMU samples before starting the filter.
         if (!init_window_collecting_) {
           init_window_collecting_ = true;
-          init_window_start_      = t;
+          // Use message timestamp when valid (non-zero): makes the window deterministic
+          // during bag replay with use_sim_time:true. Fall back to wall clock only for
+          // drivers that publish zero-stamped messages (the original bug fix path).
+          init_window_start_is_msg_time_ = (t > 0.0);
+          init_window_start_ = init_window_start_is_msg_time_
+            ? t : this->now().seconds();
           init_window_aborted_    = false;
           init_win_n_             = 0;
           init_win_wx_ = init_win_wy_ = init_win_wz_ = 0.0;
@@ -658,8 +962,11 @@ private:
           ++init_win_orient_n_;
         }
 
-        // Window complete?
-        if (t - init_window_start_ >= init_window_duration_) {
+        // Window complete? Use same time source that was chosen at window start.
+        double window_elapsed = init_window_start_is_msg_time_
+          ? (t - init_window_start_)
+          : (this->now().seconds() - init_window_start_);
+        if (window_elapsed >= init_window_duration_) {
           fusioncore::State initial;
           initial.P = fusioncore::StateMatrix::Identity() * 0.1;
           initial.P(0,0) = 1000.0;
@@ -805,6 +1112,88 @@ private:
     fuse_imu_orientation_if_valid(t, msg, q);
   }
 
+  // Second IMU callback. Mirrors imu_callback but skips filter initialization
+  // (only the primary IMU drives init). Treats the second sensor as an
+  // independent measurement of the same state; both update_imu() calls are
+  // valid because they fuse independent noise realizations.
+  void imu2_callback(const sensor_msgs::msg::Imu::SharedPtr msg)
+  {
+    mark_sensor_received("IMU2");
+    if (!fc_->is_initialized()) return;
+
+    double t = rclcpp::Time(msg->header.stamp).seconds();
+
+    std::string imu_frame = imu2_frame_override_.empty()
+      ? (msg->header.frame_id.empty() ? "imu_link" : msg->header.frame_id)
+      : imu2_frame_override_;
+
+    if (imu_frame == base_frame_) {
+      double ax = msg->linear_acceleration.x;
+      double ay = msg->linear_acceleration.y;
+      double az = msg->linear_acceleration.z;
+      if (imu2_remove_gravity_) {
+        tf2::Vector3 g_base = gravity_in_body_frame();
+        ax += g_base.x(); ay += g_base.y(); az += g_base.z();
+      }
+      fc_->update_imu(t,
+        msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z,
+        ax, ay, az);
+      fuse_imu_orientation_if_valid(t, msg, std::nullopt);
+      return;
+    }
+
+    geometry_msgs::msg::TransformStamped tf_stamped;
+    try {
+      tf_stamped = tf_buffer_->lookupTransform(
+        base_frame_, imu_frame, tf2::TimePointZero);
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Cannot transform IMU2 from %s to %s: %s"
+        " -- Fix: ros2 run tf2_ros static_transform_publisher"
+        " --frame-id %s --child-frame-id %s",
+        imu_frame.c_str(), base_frame_.c_str(), ex.what(),
+        base_frame_.c_str(), imu_frame.c_str());
+      double ax = msg->linear_acceleration.x;
+      double ay = msg->linear_acceleration.y;
+      double az = msg->linear_acceleration.z;
+      if (imu2_remove_gravity_) {
+        tf2::Vector3 g_base = gravity_in_body_frame();
+        ax += g_base.x(); ay += g_base.y(); az += g_base.z();
+      }
+      fc_->update_imu(t,
+        msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z,
+        ax, ay, az);
+      return;
+    }
+
+    tf2::Quaternion q(
+      tf_stamped.transform.rotation.x,
+      tf_stamped.transform.rotation.y,
+      tf_stamped.transform.rotation.z,
+      tf_stamped.transform.rotation.w);
+    tf2::Matrix3x3 R(q);
+
+    tf2::Vector3 w(msg->angular_velocity.x,
+                   msg->angular_velocity.y,
+                   msg->angular_velocity.z);
+    tf2::Vector3 w_base = R * w;
+
+    tf2::Vector3 a(msg->linear_acceleration.x,
+                   msg->linear_acceleration.y,
+                   msg->linear_acceleration.z);
+    tf2::Vector3 a_base = R * a;
+
+    if (imu2_remove_gravity_) {
+      tf2::Vector3 g_base = gravity_in_body_frame();
+      a_base += g_base;
+    }
+
+    fc_->update_imu(t,
+      w_base.x(), w_base.y(), w_base.z(),
+      a_base.x(), a_base.y(), a_base.z());
+    fuse_imu_orientation_if_valid(t, msg, q);
+  }
+
   // Returns the specific-force gravity contribution in body frame.
   // For an upright ENU robot this is [0, 0, +9.81].
   // Use: add this to a "true acceleration" reading to recover specific force,
@@ -862,6 +1251,7 @@ private:
 
   void encoder_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
+    mark_sensor_received("Encoder");
     // If collecting the bias window, abort it if the robot moves.
     if (init_window_collecting_) {
       double speed = std::abs(msg->twist.twist.linear.x);
@@ -917,18 +1307,19 @@ private:
 
   void encoder2_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
+    mark_sensor_received("Encoder2");
     if (!fc_->is_initialized()) return;
 
     double t = rclcpp::Time(msg->header.stamp).seconds();
 
     // Extract per-axis variances from the Odometry twist covariance (6x6, row-major).
     // Indices: vx=0, vy=7, wz=35 (diagonal elements for linear.x, linear.y, angular.z).
-    // Pass -1.0 for any axis where the message reports zero or negative variance,
-    // so update_encoder falls back to adaptive/config noise for that axis.
+    // Fall back to encoder2.vel_noise / encoder2.yaw_noise when the message
+    // reports zero or negative variance (e.g. KISS-ICP, RealSense T265).
     const auto& cov = msg->twist.covariance;
-    double var_vx = (cov[0]  > 0.0) ? cov[0]  : -1.0;
-    double var_vy = (cov[7]  > 0.0) ? cov[7]  : -1.0;
-    double var_wz = (cov[35] > 0.0) ? cov[35] : -1.0;
+    double var_vx = (cov[0]  > 0.0) ? cov[0]  : enc2_vel_noise_ * enc2_vel_noise_;
+    double var_vy = (cov[7]  > 0.0) ? cov[7]  : enc2_vel_noise_ * enc2_vel_noise_;
+    double var_wz = (cov[35] > 0.0) ? cov[35] : enc2_yaw_noise_ * enc2_yaw_noise_;
 
     const double vx = msg->twist.twist.linear.x;
     const double vy = msg->twist.twist.linear.y;
@@ -937,10 +1328,171 @@ private:
     fc_->update_encoder(t, vx, vy, wz, var_vx, var_vy, var_wz);
   }
 
+  // ─── VSLAM pose callback ──────────────────────────────────────────────────
+  // Accepts nav_msgs/Odometry. Uses pose component only; twist is ignored.
+  // Covariance is extracted from pose.covariance (6x6 row-major):
+  //   [0,7,14] = position variance (x,y,z), [21,28,35] = orientation variance (r,p,y).
+  // Falls back to config noise when covariance is zero or negative.
+  //
+  // Frame alignment: VSLAM has its own map frame origin (always starts at 0,0,0).
+  // The filter's odom frame may have a different origin if the robot moved before
+  // VSLAM initialized, or if VSLAM reinitializes after tracking loss.
+  // We track a 3D offset (odom_origin - vslam_origin) and apply it to every
+  // VSLAM measurement so the filter sees poses in odom frame coordinates.
+  // After vslam_reinit_n_ consecutive gate rejections we re-anchor, which handles
+  // ORB-SLAM3 reinitializations that produce large discontinuous pose jumps.
+
+  void vslam_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
+  {
+    mark_sensor_received("VSLAM");
+    if (!fc_->is_initialized()) return;
+
+    double t = rclcpp::Time(msg->header.stamp).seconds();
+
+    // Raw pose in VSLAM map frame
+    fusioncore::sensors::VslamPose pose;
+    const double raw_x = msg->pose.pose.position.x;
+    const double raw_y = msg->pose.pose.position.y;
+    const double raw_z = msg->pose.pose.position.z;
+
+    const auto& q = msg->pose.pose.orientation;
+    double raw_roll, raw_pitch, raw_yaw;
+    fusioncore::quat_to_euler(q.w, q.x, q.y, q.z, raw_roll, raw_pitch, raw_yaw);
+
+    // Anchor VSLAM map origin to filter's current odom position on first call.
+    // With init.wait_for_all_sensors: true and a stationary startup, both frames
+    // start at (0,0,0) and the offset is zero. The anchor still handles the general
+    // case where VSLAM initializes after the robot has already moved.
+    if (!vslam_origin_set_) {
+      const auto& s = fc_->get_state();
+      vslam_offset_x_ = s.x[fusioncore::X] - raw_x;
+      vslam_offset_y_ = s.x[fusioncore::Y] - raw_y;
+      vslam_offset_z_ = s.x[fusioncore::Z] - raw_z;
+      vslam_origin_set_ = true;
+      RCLCPP_INFO(get_logger(),
+        "VSLAM: map origin anchored. offset=(%.3f, %.3f, %.3f)",
+        vslam_offset_x_, vslam_offset_y_, vslam_offset_z_);
+    }
+
+    // Apply offset: translate pose from VSLAM map frame into filter odom frame
+    pose.x = raw_x + vslam_offset_x_;
+    pose.y = raw_y + vslam_offset_y_;
+    pose.z = raw_z + vslam_offset_z_;
+    pose.roll  = raw_roll;
+    pose.pitch = raw_pitch;
+    pose.yaw   = raw_yaw;
+
+    // Extract covariance from pose.covariance (6x6, row-major, [x,y,z,rx,ry,rz]).
+    // Diagonal indices: x=0, y=7, z=14, roll=21, pitch=28, yaw=35.
+    const auto& cov = msg->pose.covariance;
+    constexpr double kMinVarPos    = 1e-4;
+    constexpr double kMinVarOrient = 1e-6;
+
+    const double var_x   = cov[0];
+    const double var_y   = cov[7];
+    const double var_z   = cov[14];
+    const double var_r   = cov[21];
+    const double var_p   = cov[28];
+    const double var_yaw = cov[35];
+
+    if (var_x > 0.0 && var_y > 0.0 && var_z > 0.0) {
+      pose.has_position_cov  = true;
+      pose.position_cov(0,0) = std::max(var_x, kMinVarPos);
+      pose.position_cov(1,1) = std::max(var_y, kMinVarPos);
+      pose.position_cov(2,2) = std::max(var_z, kMinVarPos);
+    }
+
+    if (var_r > 0.0 && var_p > 0.0 && var_yaw > 0.0) {
+      pose.has_orientation_cov  = true;
+      pose.orientation_cov(0,0) = std::max(var_r,   kMinVarOrient);
+      pose.orientation_cov(1,1) = std::max(var_p,   kMinVarOrient);
+      pose.orientation_cov(2,2) = std::max(var_yaw, kMinVarOrient);
+    }
+
+    const bool accepted = fc_->update_pose(t, pose);
+
+    if (accepted) {
+      vslam_consecutive_rejects_ = 0;
+    } else {
+      ++vslam_consecutive_rejects_;
+      // After vslam_reinit_n_ consecutive gate rejections, VSLAM has almost
+      // certainly reinitialized to a new map. Re-anchor to the filter's current
+      // position so subsequent measurements are accepted in the new map frame.
+      if (vslam_consecutive_rejects_ >= vslam_reinit_n_) {
+        const auto& s = fc_->get_state();
+        vslam_offset_x_ = s.x[fusioncore::X] - raw_x;
+        vslam_offset_y_ = s.x[fusioncore::Y] - raw_y;
+        vslam_offset_z_ = s.x[fusioncore::Z] - raw_z;
+        vslam_consecutive_rejects_ = 0;
+        RCLCPP_WARN(get_logger(),
+          "VSLAM: %d consecutive rejections — reinitialization detected. "
+          "Re-anchoring map origin. new offset=(%.3f, %.3f, %.3f)",
+          vslam_reinit_n_, vslam_offset_x_, vslam_offset_y_, vslam_offset_z_);
+      }
+    }
+  }
+
+  // ─── Radar Doppler velocity callback ─────────────────────────────────────
+  // Fuses ego-velocity from a 4D imaging radar as an independent measurement.
+  // Velocity is expected in robot body frame: linear.x=forward, linear.y=lateral.
+  // A bridge node handles raw Doppler point cloud -> ego-velocity extraction.
+  // Works indoors and in all weather (rain, fog, dust) where GPS is unreliable.
+  // Angular rate from radar is not reliable; WZ is suppressed via large variance.
+
+  void radar_vel_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
+  {
+    mark_sensor_received("RadarVel");
+    if (!fc_->is_initialized()) return;
+
+    const double t  = rclcpp::Time(msg->header.stamp).seconds();
+    const double vx = msg->twist.twist.linear.x;
+    const double vy = msg->twist.twist.linear.y;
+
+    const auto& cov = msg->twist.covariance;
+    const double var_vx = (cov[0] > 0.0) ? cov[0] : (radar_vel_noise_ * radar_vel_noise_);
+    const double var_vy = (cov[7] > 0.0) ? cov[7] : (radar_vel_noise_ * radar_vel_noise_);
+
+    fc_->update_encoder(t, vx, vy, 0.0, var_vx, var_vy, 1e6);
+  }
+
+  // ─── GPS velocity callback ────────────────────────────────────────────────
+  // Fuses horizontal GPS velocity as an independent measurement.
+  // Message twist is expected in ENU (world) frame: linear.x=east, linear.y=north.
+  // Rotated to body frame using the current filter quaternion before fusing,
+  // so the innovation is consistent with the wheel encoder measurement model.
+  // Angular rate is not available from GPS; WZ is passed with large variance
+  // (1e6) so the Kalman gain for WZ is effectively zero.
+
+  void gnss_vel_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
+  {
+    mark_sensor_received("GPSVel");
+    if (!fc_->is_initialized()) return;
+
+    const double t  = rclcpp::Time(msg->header.stamp).seconds();
+    const double ve = msg->twist.twist.linear.x;   // east
+    const double vn = msg->twist.twist.linear.y;   // north
+    const double vu = msg->twist.twist.linear.z;   // up
+
+    // Rotate ENU -> body:  v_body = R(q)^T * v_world
+    const auto& s = fc_->get_state();
+    double R[3][3];
+    fusioncore::quat_to_rotation_matrix(s.quat_w(), s.quat_x(), s.quat_y(), s.quat_z(), R);
+    const double vx = R[0][0]*ve + R[1][0]*vn + R[2][0]*vu;
+    const double vy = R[0][1]*ve + R[1][1]*vn + R[2][1]*vu;
+
+    const auto& cov = msg->twist.covariance;
+    const double var_vx = (cov[0] > 0.0) ? cov[0] : -1.0;
+    const double var_vy = (cov[7] > 0.0) ? cov[7] : -1.0;
+
+    fc_->update_encoder(t, vx, vy, 0.0, var_vx, var_vy, 1e6);
+  }
+
   // ─── GNSS position callback ────────────────────────────────────────────────
 
   void gnss_callback(const sensor_msgs::msg::NavSatFix::SharedPtr msg, int source_id = 0)
   {
+    if (source_id == 0) mark_sensor_received("GNSS");
+    else                mark_sensor_received("GNSS2");
     if (!fc_->is_initialized()) return;
 
     if (msg->status.status < 0) return;
@@ -1101,6 +1653,7 @@ private:
 
   void gnss_heading_callback(const sensor_msgs::msg::Imu::SharedPtr msg)
   {
+    mark_sensor_received("Heading");
     if (!fc_->is_initialized()) return;
 
     double t = rclcpp::Time(msg->header.stamp).seconds();
@@ -1160,6 +1713,7 @@ private:
 
   void azimuth_callback(const compass_msgs::msg::Azimuth::SharedPtr msg)
   {
+    mark_sensor_received("Heading");
     if (!fc_->is_initialized()) return;
 
     double t = rclcpp::Time(msg->header.stamp).seconds();
@@ -1233,7 +1787,7 @@ private:
 
     odom.twist.twist.linear.x  = s.x[fusioncore::VX];
     odom.twist.twist.linear.y  = s.x[fusioncore::VY];
-    odom.twist.twist.linear.z  = s.x[fusioncore::VZ];
+    odom.twist.twist.linear.z  = force_2d_ ? 0.0 : s.x[fusioncore::VZ];
     odom.twist.twist.angular.x = s.x[fusioncore::WX];
     odom.twist.twist.angular.y = s.x[fusioncore::WY];
     odom.twist.twist.angular.z = s.x[fusioncore::WZ];
@@ -1285,7 +1839,7 @@ private:
     tf.transform.rotation.z = s.x[fusioncore::QZ];
     tf.transform.rotation.w = s.x[fusioncore::QW];
 
-    tf_broadcaster_->sendTransform(tf);
+    if (publish_tf_) tf_broadcaster_->sendTransform(tf);
   }
 
   // ─── Diagnostics ─────────────────────────────────────────────────────────
@@ -1359,6 +1913,14 @@ private:
       health_to_str(status.gnss_health),
       {{"outlier_count",     std::to_string(status.gnss_outliers)},
        {"heading_outliers",  std::to_string(status.hdg_outliers)}}));
+
+    // VSLAM (only shown when configured)
+    if (!vslam_topic_.empty()) {
+      diag_array.status.push_back(make_status("VSLAM",
+        health_to_level(status.vslam_health),
+        health_to_str(status.vslam_health),
+        {{"outlier_count", std::to_string(status.vslam_outliers)}}));
+    }
 
     // Filter
     auto heading_src_str = [](fusioncore::HeadingSource src) -> std::string {
@@ -1502,10 +2064,14 @@ private:
   std::shared_ptr<tf2_ros::TransformListener>    tf_listener_;
 
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr          imu_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr          imu2_sub_;
   rclcpp::Subscription<compass_msgs::msg::Azimuth>::SharedPtr     azimuth_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr          gnss_heading_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        encoder_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        encoder2_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        vslam_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        gnss_vel_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        radar_vel_sub_;
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr    gnss_sub_;
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr                gnss2_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr                       odom_pub_;
@@ -1519,28 +2085,49 @@ private:
   std::string base_frame_;
   std::string odom_frame_;
   double      publish_rate_;
-  bool        force_2d_ = false;
+  bool        force_2d_    = false;
+  bool        publish_tf_  = true;
   std::string heading_topic_;
   std::string gnss2_topic_;
   std::string azimuth_topic_;
   std::string encoder2_topic_;
+  double      enc2_vel_noise_ = 0.05;
+  double      enc2_yaw_noise_ = 0.02;
+  std::string vslam_topic_;
+  std::string vslam_frame_override_;
+  // VSLAM map-to-odom frame offset: applied to every VSLAM measurement.
+  // Set on first measurement; re-computed on reinitialization detection.
+  bool   vslam_origin_set_         = false;
+  double vslam_offset_x_           = 0.0;
+  double vslam_offset_y_           = 0.0;
+  double vslam_offset_z_           = 0.0;
+  int    vslam_consecutive_rejects_ = 0;
+  int    vslam_reinit_n_           = 10;
+  std::string gnss_vel_topic_;
+  std::string radar_vel_topic_;
+  double      radar_vel_noise_ = 0.1;
 
   bool        pending_init_        = false;
 
   // Static bias initialization window
-  double init_window_duration_   = 0.0;
-  bool   init_window_collecting_ = false;
-  bool   init_window_aborted_    = false;
-  double init_window_start_      = 0.0;
-  int    init_win_n_             = 0;
+  double init_window_duration_         = 0.0;
+  bool   init_window_collecting_       = false;
+  bool   init_window_aborted_          = false;
+  double init_window_start_            = 0.0;
+  bool   init_window_start_is_msg_time_ = false;  // true: msg timestamps; false: wall clock
+  int    init_win_n_                   = 0;
   double init_win_wx_ = 0.0, init_win_wy_ = 0.0, init_win_wz_ = 0.0;
   double init_win_ax_ = 0.0, init_win_ay_ = 0.0, init_win_az_ = 0.0;
   double init_win_qw_ = 0.0, init_win_qx_ = 0.0, init_win_qy_ = 0.0, init_win_qz_ = 0.0;
   int    init_win_orient_n_      = 0;
   bool        gnss_ref_set_        = false;
   bool        imu_remove_gravity_  = false;
+  std::string imu_topic_;
   std::string imu_frame_override_;
   std::string imu_frame_resolved_;
+  std::string imu2_topic_;
+  std::string imu2_frame_override_;
+  bool        imu2_remove_gravity_ = false;
   double      last_imu_time_       = 0.0;   // timestamp of most recent IMU message
   fusioncore::sensors::LLAPoint  gnss_ref_lla_;
   fusioncore::sensors::ECEFPoint gnss_ref_ecef_;
@@ -1560,6 +2147,19 @@ private:
   rclcpp::CallbackGroup::SharedPtr sensor_cb_group_;
   rclcpp::CallbackGroup::SharedPtr publish_cb_group_;
   std::mutex fc_mutex_;
+
+  // Sensor wait (#28)
+  bool                     wait_for_all_sensors_ = false;
+  double                   sensor_wait_timeout_  = 10.0;
+  double                   activate_time_        = 0.0;
+  bool                     sensor_wait_done_     = false;
+  std::set<std::string>    sensors_expected_;
+  std::set<std::string>    sensors_received_;
+
+  // Deterministic replay checkpoint (#27)
+  std::string checkpoint_path_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_checkpoint_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr load_checkpoint_srv_;
 
   // PROJ coordinate transform members
   std::string input_gnss_crs_;
