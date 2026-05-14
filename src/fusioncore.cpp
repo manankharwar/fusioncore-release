@@ -47,17 +47,20 @@ void FusionCore::init_adaptive_R() {
   R_encoder_     = sensors::encoder_noise_matrix(config_.encoder);
   R_gnss_        = sensors::GnssPosNoiseMatrix::Identity();  // will be set per-fix
   R_imu_orient_  = sensors::imu_orientation_noise_matrix(sensors::ImuOrientationParams{});
+  R_vslam_       = sensors::vslam_pose_noise_matrix(config_.vslam, sensors::VslamPose{});
 
   // Save floors: adaptive R must never drop below the initially configured sensor noise.
   R_imu_floor_        = R_imu_;
   R_encoder_floor_    = R_encoder_;
   R_gnss_floor_       = R_gnss_;
   R_imu_orient_floor_ = R_imu_orient_;
+  R_vslam_floor_      = R_vslam_;
 
   imu_innovations_.max_size         = config_.adaptive_window;
   encoder_innovations_.max_size     = config_.adaptive_window;
   gnss_innovations_.max_size        = config_.adaptive_window;
   imu_orient_innovations_.max_size  = config_.adaptive_window;
+  vslam_innovations_.max_size       = config_.adaptive_window;
 
   adaptive_initialized_ = true;
 }
@@ -92,7 +95,11 @@ void FusionCore::adapt_R(
 
 FusionCore::FusionCore(const FusionCoreConfig& config)
   : config_(config), ukf_(config.ukf)
-{}
+{
+  if (config.motion_model) {
+    ukf_.set_motion_model(config.motion_model);
+  }
+}
 
 void FusionCore::init(const State& initial_state, double timestamp_seconds) {
   ukf_.init(initial_state);
@@ -130,6 +137,7 @@ void FusionCore::reset() {
   last_imu_time_     = -1.0;
   last_encoder_time_ = -1.0;
   last_gnss_time_    = -1.0;
+  last_vslam_time_   = -1.0;
   update_count_      = 0;
   heading_validated_ = false;
   heading_source_    = HeadingSource::NONE;
@@ -659,20 +667,38 @@ bool FusionCore::apply_gnss_update(
     ukf_.predict_measurement<sensors::GNSS_POS_DIM>(z, h_gnss, R, innovation_pre, S);
     if (is_outlier<sensors::GNSS_POS_DIM>(innovation_pre, S, config_.outlier_threshold_gnss)) {
       ++gnss_outliers_;
-      // Inertial coast mode: after N consecutive rejections, inflate Q_position
-      // so P grows and the gate naturally relaxes when GPS recovers.
       if (config_.gnss_coast_n > 0) {
         ++gnss_consecutive_rejects_;
-        if (gnss_consecutive_rejects_ >= config_.gnss_coast_n && !gnss_in_coast_) {
-          gnss_in_coast_ = true;
-          ukf_.set_position_noise_scale(config_.gnss_coast_q_factor);
+        if (gnss_consecutive_rejects_ >= config_.gnss_coast_n) {
+          if (!gnss_in_coast_) {
+            gnss_in_coast_ = true;
+            ukf_.set_position_noise_scale(config_.gnss_coast_q_factor);
+          }
+          // Degraded mode: inflate R and retry the gate. Fixes that pass are
+          // accepted with a reduced Kalman gain rather than hard-rejected.
+          // This breaks the cascade-rejection loop under sustained GPS degradation.
+          if (config_.gnss_degraded_noise_multiplier > 1.0) {
+            sensors::GnssPosNoiseMatrix R_deg = R * config_.gnss_degraded_noise_multiplier;
+            sensors::GnssPosMeasurement innov_deg;
+            sensors::GnssPosNoiseMatrix S_deg;
+            ukf_.predict_measurement<sensors::GNSS_POS_DIM>(z, h_gnss, R_deg, innov_deg, S_deg);
+            if (!is_outlier<sensors::GNSS_POS_DIM>(innov_deg, S_deg, config_.outlier_threshold_gnss)) {
+              Eigen::Matrix<double, sensors::GNSS_POS_DIM, 1> innovation =
+                ukf_.update<sensors::GNSS_POS_DIM>(z, h_gnss, R_deg);
+              adapt_R<sensors::GNSS_POS_DIM>(R_gnss_, R_gnss_floor_, gnss_innovations_, innovation, config_.adaptive_gnss);
+              gnss_in_coast_ = false;
+              ukf_.set_position_noise_scale(1.0);
+              gnss_consecutive_rejects_ = 0;
+              return true;
+            }
+          }
         }
       }
       return false;
     }
   }
 
-  // GPS accepted: exit coast mode and reset counter
+  // GPS accepted normally: exit coast mode and reset counter
   if (gnss_in_coast_) {
     gnss_in_coast_ = false;
     ukf_.set_position_noise_scale(1.0);
@@ -768,13 +794,107 @@ FusionCoreStatus FusionCore::get_status() const {
   status.heading_source    = heading_source_;
   status.distance_traveled = distance_traveled_;
 
+  status.vslam_health =
+    last_vslam_time_ < 0.0 ? SensorHealth::NOT_INIT :
+    (last_timestamp_ - last_vslam_time_) > stale ? SensorHealth::STALE :
+    SensorHealth::OK;
+
   // Outlier rejection counters
-  status.gnss_outliers = gnss_outliers_;
-  status.imu_outliers  = imu_outliers_;
-  status.enc_outliers  = enc_outliers_;
-  status.hdg_outliers  = hdg_outliers_;
+  status.gnss_outliers  = gnss_outliers_;
+  status.imu_outliers   = imu_outliers_;
+  status.enc_outliers   = enc_outliers_;
+  status.hdg_outliers   = hdg_outliers_;
+  status.vslam_outliers = vslam_outliers_;
 
   return status;
+}
+
+bool FusionCore::update_pose(
+  double timestamp_seconds,
+  const sensors::VslamPose& pose)
+{
+  if (!initialized_)
+    throw std::runtime_error("FusionCore: update_pose() called before init()");
+
+  bool is_delayed = (last_timestamp_ - timestamp_seconds) > config_.min_dt;
+
+  if (is_delayed) {
+    bool fused = false;
+    bool applied = apply_delayed_measurement(timestamp_seconds, [&]() {
+      predict_to(timestamp_seconds);
+
+      sensors::VslamPoseMeasurement z;
+      z[0] = pose.x; z[1] = pose.y; z[2] = pose.z;
+      z[3] = pose.roll; z[4] = pose.pitch; z[5] = pose.yaw;
+
+      sensors::VslamPoseNoiseMatrix R = sensors::vslam_pose_noise_matrix(config_.vslam, pose);
+
+      // bit 5 = yaw (index 5 in the measurement vector): wrap across ±π
+      constexpr unsigned int VSLAM_ANGLE_DIMS = 0b100000;
+
+      if (config_.outlier_rejection) {
+        sensors::VslamPoseMeasurement innov_pre;
+        sensors::VslamPoseNoiseMatrix S;
+        ukf_.predict_measurement<sensors::VSLAM_POSE_DIM>(
+          z, sensors::vslam_pose_measurement_function, R, innov_pre, S, VSLAM_ANGLE_DIMS);
+        if (is_outlier<sensors::VSLAM_POSE_DIM>(innov_pre, S, config_.outlier_threshold_vslam)) {
+          ++vslam_outliers_;
+          return;
+        }
+      }
+
+      auto innovation = ukf_.update<sensors::VSLAM_POSE_DIM>(
+        z, sensors::vslam_pose_measurement_function, R, VSLAM_ANGLE_DIMS);
+      adapt_R<sensors::VSLAM_POSE_DIM>(R_vslam_, R_vslam_floor_, vslam_innovations_, innovation, false);
+      fused = true;
+    });
+    if (!applied || !fused) return false;
+    update_distance_traveled(pose.x, pose.y);
+    last_vslam_time_ = timestamp_seconds;
+    ++update_count_;
+    return true;
+  }
+
+  predict_to(timestamp_seconds);
+
+  sensors::VslamPoseMeasurement z;
+  z[0] = pose.x; z[1] = pose.y; z[2] = pose.z;
+  z[3] = pose.roll; z[4] = pose.pitch; z[5] = pose.yaw;
+
+  sensors::VslamPoseNoiseMatrix R = sensors::vslam_pose_noise_matrix(config_.vslam, pose);
+
+  // bit 5 = yaw (index 5): wrap across ±π
+  constexpr unsigned int VSLAM_ANGLE_DIMS = 0b100000;
+
+  if (config_.outlier_rejection) {
+    sensors::VslamPoseMeasurement innov_pre;
+    sensors::VslamPoseNoiseMatrix S;
+    ukf_.predict_measurement<sensors::VSLAM_POSE_DIM>(
+      z, sensors::vslam_pose_measurement_function, R, innov_pre, S, VSLAM_ANGLE_DIMS);
+    if (is_outlier<sensors::VSLAM_POSE_DIM>(innov_pre, S, config_.outlier_threshold_vslam)) {
+      ++vslam_outliers_;
+      return false;
+    }
+  }
+
+  auto innovation = ukf_.update<sensors::VSLAM_POSE_DIM>(
+    z, sensors::vslam_pose_measurement_function, R, VSLAM_ANGLE_DIMS);
+  adapt_R<sensors::VSLAM_POSE_DIM>(R_vslam_, R_vslam_floor_, vslam_innovations_, innovation, false);
+
+  update_distance_traveled(pose.x, pose.y);
+  last_vslam_time_ = timestamp_seconds;
+  ++update_count_;
+
+  // Validate heading from VSLAM travel (same path as GPS track)
+  if (!heading_validated_ &&
+      heading_source_ == HeadingSource::NONE) {
+    if (distance_traveled_ >= config_.heading_observable_distance) {
+      heading_validated_ = true;
+      heading_source_    = HeadingSource::GPS_TRACK;
+    }
+  }
+
+  return true;
 }
 
 } // namespace fusioncore
