@@ -24,11 +24,18 @@ ros2 launch fusioncore_ros fusioncore.launch.py \
 
 Replace `/kiss/odometry` with whatever your ICP pipeline publishes:
 
-| ICP pipeline | Default topic |
-|---|---|
-| KISS-ICP | `/kiss/odometry` |
-| rtabmap `icp_odometry` | `/icp_odom` |
-| cartographer | `/tracked_pose` (pose only: needs twist wrapper) |
+| ICP pipeline | Default topic | Type |
+|---|---|---|
+| KISS-ICP | `/kiss/odometry` | `nav_msgs/Odometry` |
+| rtabmap `icp_odometry` | `/icp_odom` | `nav_msgs/Odometry` |
+| rf2o_laser_odometry | `/odom` | `nav_msgs/Odometry` |
+| cartographer | `/tracked_pose` | `PoseStamped` — needs twist wrapper |
+| slam_toolbox | `/pose` | `PoseWithCovarianceStamped` — needs twist wrapper |
+
+> **FusionCore does not accept `sensor_msgs/LaserScan` or `PointCloud2` directly.**
+> A scan-matching node must convert your LiDAR data to `nav_msgs/Odometry` first.
+> Nodes that publish pose-only (cartographer, slam_toolbox) need a wrapper that
+> differentiates the pose to produce a velocity in the twist field.
 
 FusionCore treats LiDAR ICP odometry exactly like wheel odometry: same outlier gate, same adaptive noise, same ZUPT logic. The only difference is the noise values: ICP is more accurate than wheels so `icp_indoor.yaml` uses tighter defaults (`encoder.vel_noise: 0.02` instead of `0.05`).
 
@@ -44,6 +51,43 @@ encoder2.topic: "/kiss/odometry"
 ```
 
 Then launch without the remap: FusionCore subscribes to `/odom/wheels` natively and picks up ICP as a second velocity source.
+
+---
+
+## Using RTABMAP alongside FusionCore (Madgwick separation)
+
+RTABMAP's `icp_odometry` and the `rtabmap_slam` node both expect IMU data on `/imu/data`. FusionCore also subscribes to `/imu/data`: but it needs **raw** gyro and accelerometer data, not a Madgwick-filtered orientation.
+
+If you run `imu_filter_madgwick` in your stack, do **not** remap FusionCore's IMU input to the Madgwick output. The Madgwick filter bakes in a coordinate frame rotation based on its world-frame orientation estimate. When FusionCore receives that, it tries to fuse an already-rotated orientation as if it were raw rates: the result is the robot appearing to spin or roll when it isn't.
+
+**Correct setup:**
+
+```
+/imu  (raw from driver)
+  ├── → FusionCore    (via -r /imu/data:=/imu)
+  └── → imu_filter_madgwick  → /imu/data  → RTABMAP + icp_odometry
+```
+
+In your launch file:
+
+```python
+# FusionCore reads raw IMU directly
+fc = LifecycleNode(
+    ...
+    remappings=[
+        ("/imu/data", "/imu"),     # raw, not Madgwick output
+    ]
+)
+
+# Madgwick runs separately for RTABMAP and ICP
+Node(
+    package='imu_filter_madgwick', executable='imu_filter_madgwick_node',
+    parameters=[{'use_mag': False, 'world_frame': 'enu', 'publish_tf': False}],
+    remappings=[('imu/data_raw', '/imu')],   # reads same raw /imu
+),
+```
+
+FusionCore handles orientation estimation internally from raw gyro + accel. Madgwick is only needed to give RTABMAP and ICP odometry the filtered `/imu/data` they expect.
 
 ---
 
