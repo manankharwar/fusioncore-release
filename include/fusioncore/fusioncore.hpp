@@ -31,6 +31,17 @@ struct FusionCoreConfig {
   // geometrically observable from GPS track alone.
   double heading_observable_distance = 5.0;
 
+  // GPS track heading fusion: fuses the GPS displacement bearing as a yaw
+  // pseudo-measurement whenever the robot has moved at least min_dist meters
+  // since the last heading fusion. This is the same mechanism navsat_transform
+  // uses internally and directly corrects heading from GPS geometry without
+  // relying on gyro bias estimation.
+  // max_sigma: skip fusion if position_noise / displacement > this (rad).
+  // 0.4 rad (23 deg) is a reasonable ceiling; tighter GPS gives automatic improvement.
+  bool   gps_track_heading_enabled  = true;
+  double gps_track_heading_min_dist = 5.0;   // meters
+  double gps_track_heading_max_sigma = 0.4;  // radians
+
   // Delay compensation: state snapshot buffer
   // Mahalanobis outlier rejection
   // Rejects measurements that are statistically implausible.
@@ -84,6 +95,13 @@ struct FusionCoreConfig {
   //         Lever arm will not activate from IMU orientation alone.
   bool imu_has_magnetometer = false;
 
+  // Position-level ground constraint: fuses Z=0 as a pseudo-measurement each
+  // encoder callback. Tighter than GPS altitude noise (5m std dev on NCLT),
+  // so it dominates and keeps the filter at ground level on flat terrain.
+  // 0.0 = disabled (default: GPS altitude drives Z normally).
+  // ~0.3m sigma = flat terrain mode (campus, parking lot, warehouse floor).
+  double ground_z_position_sigma = 0.0;
+
   // Inertial coast mode: after this many consecutive GNSS rejections, inflate
   // Q_position so P grows and the Mahalanobis gate naturally relaxes.
   // This prevents cascade failure when the filter drifts during a GPS gap
@@ -91,14 +109,51 @@ struct FusionCoreConfig {
   // 0 = disabled; typical value: 5
   int    gnss_coast_n        = 5;
   // Multiplier applied to q_position each predict step while in coast mode.
-  // 20.0 ≈ 4.5× position sigma growth per second at 100Hz IMU.
+  // 20.0 = 4.5x position sigma growth per second at 100Hz IMU.
   double gnss_coast_q_factor = 20.0;
-  // After gnss_coast_n consecutive rejections, inflate R by this factor and
-  // retry the gate. Fixes that pass the relaxed gate are accepted with a
-  // down-weighted Kalman gain rather than hard-rejected.
-  // 3.0 = loosen the gate by ~1.7x in sigma units; keeps spike rejection intact.
-  // 0.0 or 1.0 = disabled (no R inflation, only Q inflation from coast mode).
-  double gnss_degraded_noise_multiplier = 3.0;
+  // Multiplier applied to q_gyro_bias while in coast mode.
+  // Loosens the filter's confidence in its gyro bias estimate so that encoder WZ
+  // can drive fast bias correction during GPS outages. Without this, a non-zero
+  // gyro bias (present on every real MEMS IMU) accumulates into heading at ~bias*t
+  // with no correction, producing tens of degrees of heading error per minute.
+  // 100.0 is a good default for campus-scale GPS outages (30-500s).
+  double gnss_coast_q_bias_factor = 100.0;
+
+  // Multiplier applied to R_imu[WZ,WZ] during GPS coast mode.
+  // Reduces the IMU's influence on heading rate so the encoder WZ (which has
+  // lower systematic bias than a MEMS gyro) dominates heading integration.
+  // Without GPS, gyro bias corrupts heading at ~bias*time with no correction.
+  // Scale = 100: encoder provides ~70% of WZ information (vs 2% normally).
+  // Scale = 1000: encoder provides ~96% (essentially RL behavior for heading).
+  // 1.0 = disabled (default). Suggested: 500.0 for deployments with long GPS outages.
+  double gnss_coast_imu_wz_scale = 1.0;
+  // Also enter coast mode when GPS has been absent for this many seconds.
+  // Handles GPS outages where the receiver stops publishing entirely (mode=2,
+  // power loss, tunnel) rather than publishing fixes that fail the chi2 gate.
+  // 0.0 = disabled; typical value: 30.0
+  double gnss_coast_timeout_s = 0.0;
+
+  // Enter position-injection recovery mode only after a GPS absence longer than
+  // this many seconds. Recovery mode bypasses the chi2 gate for the first
+  // returning GPS fix, which is needed for very long blackouts (>100s) where
+  // dead-reckoning drift may exceed the chi2 acceptance range. For short
+  // blackouts (30-90s), the chi2 gate handles recovery correctly and recovery
+  // mode is counter-productive: it allows massive GPS outliers (bad multipath
+  // at the blackout boundary) to be injected unconditionally.
+  // 0.0 = enter recovery mode at the same time as coast mode (original behavior).
+  // Typical: 120.0 (2 minutes). Must be >= gnss_coast_timeout_s.
+  double gnss_recovery_timeout_s = 0.0;
+
+  // After this many consecutive chi2 rejections, inflate P[x,x] and P[y,y]
+  // directly so the next GPS fix passes the gate and corrects via a proper
+  // Bayesian update. This breaks the cascade where GPS is present but the
+  // filter has drifted far enough that all incoming fixes fail chi2.
+  // Fires exactly once per cascade (when counter first reaches this value).
+  // Must be > gnss_coast_n. 0 = disabled; typical value: 15.
+  int    gnss_recovery_rejection_n = 0;
+  // XY sigma for P inflation (meters). 50m covers any realistic drift from
+  // a chi2 cascade, allowing GPS to pull the filter back from up to ~100m off.
+  double gnss_p_inflate_sigma = 50.0;
 };
 
 // How heading was validated: tracked per filter run
@@ -243,24 +298,22 @@ private:
     bool ready() const { return (int)innovations.size() >= max_size / 2; }
 
     // Estimate covariance from innovation window.
-    // Uses the sample covariance (mean-subtracted), not the autocorrelation.
-    // In a well-tuned filter innovations are zero-mean, but during startup
-    // or model mismatch the mean can be nonzero: subtracting it prevents
-    // R from being inflated by a squared bias term.
+    // Includes the bias term (mean^2) so systematic offsets (e.g. GPS multipath
+    // pushing fixes consistently in one direction) inflate R, not just random scatter.
     ZMatrix estimate_covariance() const {
-      // Compute sample mean
       Eigen::Matrix<double, z_dim, 1> mean = Eigen::Matrix<double, z_dim, 1>::Zero();
       for (const auto& nu : innovations)
         mean += nu;
       mean /= (double)innovations.size();
 
-      // Compute mean-subtracted sample covariance
       ZMatrix C = ZMatrix::Zero();
       for (const auto& nu : innovations) {
         Eigen::Matrix<double, z_dim, 1> d = nu - mean;
         C += d * d.transpose();
       }
-      return C / (double)innovations.size();
+      C /= (double)innovations.size();
+      C += mean * mean.transpose();  // systematic bias term
+      return C;
     }
   };
 
@@ -299,6 +352,12 @@ private:
   // Inertial coast mode tracking
   int  gnss_consecutive_rejects_ = 0;
   bool gnss_in_coast_            = false;
+  // Recovery mode: after a timeout-triggered coast, accept the first returning
+  // GPS fix unconditionally (bypass chi2 gate). After 7+ minutes blind, dead
+  // reckoning error can be hundreds of meters, far outside the chi2 gate.
+  // Without this, coast mode inflates P but can't grow sigma fast enough to
+  // accept the recovery fix, causing permanent GPS rejection.
+  bool gnss_in_recovery_         = false;
 
   // Mahalanobis distance test
   template <int z_dim>
@@ -350,6 +409,21 @@ private:
   double last_gnss_y_     = 0.0;
   bool   gnss_pos_set_    = false;
   double distance_traveled_ = 0.0;
+
+  // Reference position for GPS track heading fusion.
+  // Updated only when a heading fusion fires, so displacement accumulates
+  // across multiple GPS fixes until the baseline is large enough to be reliable.
+  double last_hdg_fix_x_  = 0.0;
+  double last_hdg_fix_y_  = 0.0;
+  bool   hdg_fix_set_     = false;
+
+  // True after the first GPS track heading fusion has successfully fired.
+  // The chi2 gate for subsequent fusions is only applied once this is true.
+  // Without this guard, update_distance_traveled() sets heading_validated_=true
+  // at 5m (before the 7.5m baseline needed for a reliable bearing), causing
+  // the chi2 gate to reject the very first heading fusion when the initial
+  // heading error exceeds ~75 degrees.
+  bool   gps_track_hdg_fused_ = false;
 
   void predict_to(double timestamp_seconds);
   bool apply_gnss_update(double timestamp_seconds, const sensors::GnssFix& fix);
