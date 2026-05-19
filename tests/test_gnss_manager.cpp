@@ -178,20 +178,17 @@ TEST(GNSSManagerTest, StefanFullConfigurationWithGNSSCorrection) {
   EXPECT_EQ(status.gnss_health,    SensorHealth::OK);
 }
 
-// ─── Test 7: Degraded R-inflation breaks cascade rejection loop ───────────────
-// Scenario: N consecutive GPS spikes (rejected by tight Mahalanobis gate) push
-// the filter into coast mode. The next fix is moderately off — too far for the
-// tight gate, but within the relaxed gate (R * gnss_degraded_noise_multiplier).
-// It should be ACCEPTED and position should move toward the degraded fix.
-// This directly validates the fix for issue #38.
+// Test 7: P inflation breaks cascade rejection loop (gnss_recovery_rejection_n)
+// Scenario: N consecutive GPS spikes inflate P[x,x]/P[y,y]. The next valid fix
+// has a large S (HPH^T+R grows with P), so chi2 drops and the fix is accepted.
 
-TEST(GNSSManagerTest, DegradedRInflationBreaksCascadeLoop) {
+TEST(GNSSManagerTest, PInflationBreaksCascadeLoop) {
   FusionCoreConfig config;
-  // Use coast mode with n=3 to enter degraded mode quickly
-  config.gnss_coast_n                  = 3;
-  config.gnss_degraded_noise_multiplier = 100.0;  // wide enough to guarantee acceptance
-  config.outlier_rejection             = true;
-  config.adaptive_gnss                 = false;   // keep R fixed for predictability
+  config.gnss_coast_n              = 3;
+  config.gnss_recovery_rejection_n = 5;   // inflate after 5 rejections
+  config.gnss_p_inflate_sigma      = 200.0;  // large enough to accept a 50m fix
+  config.outlier_rejection         = true;
+  config.adaptive_gnss             = false;
 
   FusionCore fc(config);
 
@@ -200,7 +197,6 @@ TEST(GNSSManagerTest, DegradedRInflationBreaksCascadeLoop) {
   initial.P = StateMatrix::Identity() * 0.1;
   fc.init(initial, 0.0);
 
-  // Phase 1: inject 3 GPS spikes (500m away). All must be rejected by tight gate.
   GnssFix spike;
   spike.fix_type   = GnssFixType::GPS_FIX;
   spike.satellites = 8;
@@ -210,33 +206,25 @@ TEST(GNSSManagerTest, DegradedRInflationBreaksCascadeLoop) {
   spike.y          = 0.0;
   spike.z          = 0.0;
 
-  EXPECT_FALSE(fc.update_gnss(0.1, spike));
-  EXPECT_FALSE(fc.update_gnss(0.2, spike));
-  EXPECT_FALSE(fc.update_gnss(0.3, spike));
+  for (int i = 0; i < 5; ++i)
+    EXPECT_FALSE(fc.update_gnss(0.1 * (i + 1), spike));
 
-  // Position must not have moved (all rejected)
   EXPECT_NEAR(fc.get_state().x[X], 0.0, 0.01);
-  EXPECT_EQ(fc.get_status().gnss_outliers, 3);
 
-  // Phase 2: inject a fix 8m away — fails the tight gate (d² ≈ 40 >> 16.27)
-  // but passes the relaxed gate (d² ≈ 0.44 << 16.27 with 100x R).
-  GnssFix degraded_fix;
-  degraded_fix.fix_type   = GnssFixType::GPS_FIX;
-  degraded_fix.satellites = 8;
-  degraded_fix.hdop       = 1.2;
-  degraded_fix.vdop       = 1.8;
-  degraded_fix.x          = 8.0;
-  degraded_fix.y          = 0.0;
-  degraded_fix.z          = 0.0;
+  // After P inflation fires on the 5th rejection, the next valid fix should pass.
+  GnssFix valid_fix;
+  valid_fix.fix_type   = GnssFixType::GPS_FIX;
+  valid_fix.satellites = 8;
+  valid_fix.hdop       = 1.2;
+  valid_fix.vdop       = 1.8;
+  valid_fix.x          = 50.0;
+  valid_fix.y          = 0.0;
+  valid_fix.z          = 0.0;
 
-  bool accepted = fc.update_gnss(0.4, degraded_fix);
-  EXPECT_TRUE(accepted) << "Degraded fix must pass the R-inflated gate after coast mode";
-
-  // Position must have moved toward the degraded fix
-  EXPECT_GT(fc.get_state().x[X], 0.0)
-    << "Position should move toward accepted degraded fix";
-  EXPECT_LT(fc.get_state().x[X], 8.0)
-    << "Position must not overshoot past degraded fix";
+  bool accepted = fc.update_gnss(0.6, valid_fix);
+  EXPECT_TRUE(accepted) << "Fix should pass chi2 after P inflation";
+  EXPECT_GT(fc.get_state().x[X], 0.0) << "Position should move toward the fix";
+  EXPECT_LT(fc.get_state().x[X], 50.0) << "Position should not overshoot";
 }
 
 int main(int argc, char** argv) {
