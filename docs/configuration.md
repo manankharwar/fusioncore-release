@@ -115,7 +115,7 @@ fusioncore:
     # Accepts nav_msgs/Odometry with velocity in robot body frame:
     #   linear.x = forward speed (m/s), linear.y = lateral speed (m/s)
     # A bridge node extracts ego-velocity from raw Doppler point cloud and publishes here.
-    # Works indoors and in all weather -- rain, fog, dust, darkness.
+    # Works indoors and in all weather: rain, fog, dust, darkness.
     # radar.vel_noise is used when the message covariance is zero or negative.
     radar.velocity_topic: ""
     radar.vel_noise: 0.1        # m/s fallback noise when message has no covariance
@@ -123,6 +123,60 @@ fusioncore:
     # Heading input: pick one or both
     gnss.heading_topic: ""      # sensor_msgs/Imu (dual antenna heading)
     gnss.azimuth_topic: ""      # compass_msgs/Azimuth (preferred REP-145 standard)
+
+    # ── GPS coast mode ────────────────────────────────────────────────────────
+    # During GPS blackouts, inflates process noise so P grows and the chi2 gate
+    # relaxes by the time GPS resumes. Prevents the filter from rejecting its
+    # own recovery fixes because dead-reckoning drift made innovations look like
+    # outliers. See How It Works for the full explanation.
+
+    gnss.coast_n: 3
+    # Consecutive chi2 GPS rejections before entering coast mode. 0 = disabled.
+
+    gnss.coast_q_factor: 10.0
+    # Q_position multiplier in coast mode. Controls how fast position uncertainty
+    # grows during the blackout. 10.0: after 228s, sigma_xy=48m (rejects 840m
+    # outliers, accepts 193m drift). After 461s, sigma_xy=68m (accepts 274m drift).
+
+    gnss.coast_timeout_s: 30.0
+    # Also enter coast if GPS is silent this long (seconds). Handles outages
+    # where the receiver stops publishing entirely. 0.0 = timeout trigger disabled.
+
+    gnss.coast_q_bias_factor: 100.0
+    # Q_gyro_bias multiplier in coast mode. Loosens bias confidence so encoder
+    # WZ can drive fast heading bias correction during the blackout. 100.0 typical.
+
+    gnss.coast_imu_wz_scale: 500.0
+    # R_imu[WZ,WZ] multiplier in coast mode. Makes IMU heading rate less trusted
+    # so encoder WZ dominates. 1.0 = disabled. 500.0 typical for long blackouts.
+
+    gnss.recovery_rejection_n: 0
+    # After this many consecutive rejections, inflate P[x,x] and P[y,y] directly.
+    # Fires once per cascade. Must be > gnss.coast_n. 0 = disabled. Typical: 15.
+
+    gnss.p_inflate_sigma: 50.0
+    # XY sigma used for the P inflation above (meters). Only used when
+    # gnss.recovery_rejection_n > 0.
+
+    gnss.recovery_timeout_s: 0.0
+    # GPS absence (seconds) before entering position-injection recovery mode, which
+    # bypasses chi2 for the first returning fix. Useful only when blackouts are very
+    # long (>200s) AND GPS outliers are not a concern at that location.
+    # 0.0 = disabled (chi2 always active, recommended). Must be >= coast_timeout_s.
+
+    # ── GPS track heading fusion ──────────────────────────────────────────────
+    gnss.track_heading_enabled: true
+    # Fuses GPS displacement bearing as a yaw pseudo-measurement whenever the
+    # robot has moved gnss.track_heading_min_dist meters since the last fusion.
+    # This is the primary mechanism for estimating encoder WZ bias without a
+    # dual-antenna GPS. Disable only with an independent heading source.
+
+    gnss.track_heading_min_dist: 5.0
+    # Minimum GPS displacement (m) between heading fusions.
+
+    gnss.track_heading_max_sigma: 0.4
+    # Maximum heading uncertainty to allow a fusion (radians). Computed as
+    # gps_noise / displacement. 0.4 rad = 23 degrees.
 
     # ── Outlier rejection ─────────────────────────────────────────────────────
     outlier_rejection: true
@@ -176,13 +230,23 @@ fusioncore:
     adaptive.alpha: 0.01      # EMA learning rate. 0.01 = slow, stable.
 
     # ── UKF process noise ─────────────────────────────────────────────────────
+    # These are per-predict-step noise values (not spectral densities).
+    # At 100Hz IMU, the filter predicts 100 times per second. Each step adds
+    # Q to P, so effective noise rate = q_* * 100 per second.
+
     ukf.q_position: 0.01
-    ukf.q_orientation: 1.0e-9   # quaternion regularization ONLY: do not increase
+    ukf.q_orientation: 1.0e-9   # quaternion regularization ONLY: do not increase.
+                                 # Orientation uncertainty propagates from q_angular_vel
+                                 # through the kinematics. Large values here corrupt
+                                 # quaternion norm and cause yaw/Z drift.
     ukf.q_velocity: 0.1
     ukf.q_angular_vel: 0.1
     ukf.q_acceleration: 1.0
-    ukf.q_gyro_bias: 1.0e-5
+    ukf.q_gyro_bias: 1.0e-5     # biases change slowly (MEMS thermal drift)
     ukf.q_accel_bias: 1.0e-5
+    ukf.q_encoder_wz_bias: 1.0e-7  # encoder WZ bias is mechanical: very stable.
+                                    # Smaller than gyro bias because it changes only
+                                    # with physical wear, not thermal effects.
 
     # ── Startup ───────────────────────────────────────────────────────────────
     init.stationary_window: 0.0
@@ -221,10 +285,24 @@ fusioncore:
     # ── Deterministic replay ──────────────────────────────────────────────────
     replay.checkpoint_path: "/tmp/fusioncore_checkpoint.txt"
     # File used by ~/save_checkpoint and ~/load_checkpoint services.
-    # save_checkpoint: writes the full 22-state + 22x22 covariance to this file.
+    # save_checkpoint: writes the full 23-state + 23x23 covariance to this file.
     # load_checkpoint: restores that state (restarts filter from that point).
     # Workflow: replay a bag to a known-good point → save → tweak params →
     #   load (instant, no re-replay) → observe the problem window.
+
+    # ── Ground constraint ─────────────────────────────────────────────────────
+    # FusionCore always fuses VZ=0 and AZ=0 on every encoder callback.
+    # These are unconditional for wheeled ground robots and cannot be disabled.
+    #
+    # The optional Z position constraint targets a different problem: GPS
+    # altitude noise (typically 3-5m std dev) causing the filter's Z position
+    # to oscillate on flat terrain. When enabled, it fuses Z=0 as a position
+    # pseudo-measurement tighter than GPS altitude noise, keeping the filter
+    # anchored to the ground.
+    #
+    # 0.0 = disabled (default, correct for 3D outdoor operation or unknown terrain)
+    # 0.3 = flat terrain mode: campus paths, parking lots, warehouse floors
+    ground_constraint.z_position_sigma: 0.0
 
     # ── ZUPT ──────────────────────────────────────────────────────────────────
     zupt.enabled: true
@@ -265,7 +343,7 @@ Do not use `DifferentialDrive` or `Ackermann` for:
 
 ## Wait for all sensors: replacing sleep() in launch files
 
-A common pattern in ROS launch files is `sleep(3)` before starting the navigation stack to give sensors time to come online. This is fragile -- on a slow machine the sensors might need 5 seconds, and on a fast one you waste 3 seconds on every launch.
+A common pattern in ROS launch files is `sleep(3)` before starting the navigation stack to give sensors time to come online. This is fragile: on a slow machine the sensors might need 5 seconds, and on a fast one you waste 3 seconds on every launch.
 
 `init.wait_for_all_sensors: true` replaces this entirely. FusionCore holds initialization until it has seen at least one message from every sensor you configured. Then it starts. No sleep needed.
 
@@ -286,7 +364,7 @@ This is especially useful at competition startup, on-site robot power-on, or any
 
 ## Deterministic replay: debugging without hardware
 
-See [How It Works -- Deterministic replay](how-it-works.md#deterministic-replay-and-state-checkpoints) for the full workflow. Quick reference:
+See [How It Works: Deterministic replay](how-it-works.md#deterministic-replay-and-state-checkpoints) for the full workflow. Quick reference:
 
 ```bash
 # Save filter state at any point during bag replay
