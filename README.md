@@ -1,7 +1,7 @@
 # FusionCore
 
 [![CI](https://github.com/manankharwar/fusioncore/actions/workflows/ci.yml/badge.svg)](https://github.com/manankharwar/fusioncore/actions/workflows/ci.yml)
-[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19834991-blue)](https://doi.org/10.5281/zenodo.19834991)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20091053-blue)](https://doi.org/10.5281/zenodo.20091053)
 [![Docs](https://img.shields.io/badge/docs-manankharwar.github.io%2Ffusioncore-blue)](https://manankharwar.github.io/fusioncore/)
 [![Paper](https://img.shields.io/badge/paper-arXiv%20preprint-b31b1b)](paper/fusioncore_arxiv.pdf)
 [![Newsletter](https://img.shields.io/badge/newsletter-subscribe-orange)](https://manankharwar.substack.com)
@@ -9,7 +9,7 @@
 **ROS 2 UKF sensor fusion for robots that run in the real world. IMU + wheel encoders + GPS at 100 Hz. Handles bad calibration, timestamp jitter, delayed GPS, wheel slip, and ARM hardware out of the box. Apache 2.0.**
 
 <p align="center">
-  <img width="900" height="500" alt="FusionCore running on a real robot" src="https://github.com/user-attachments/assets/e1e07cfb-74e0-48b9-9bfd-32b68ee5a6ef"/>
+  <img width="800" height="384" alt="FusionCore running on a real robot" src="https://github.com/user-attachments/assets/9ef42175-6525-4e72-b8d0-a35b0cc5a09d"/>
 </p>
 
 ---
@@ -93,22 +93,36 @@ Most sensor fusion tutorials assume clean data. Real robots don't have clean dat
 
 ## Benchmark
 
-FusionCore vs robot_localization on the [NCLT dataset](http://robots.engin.umich.edu/nclt/): same IMU + wheel odometry + GPS, no manual tuning. Six 30-minute sequences. RL-EKF run with chi-squared-equivalent thresholds at 99.9% confidence.
+FusionCore vs robot_localization on the [NCLT dataset](http://robots.engin.umich.edu/nclt/): same IMU + wheel odometry + GPS, no manual tuning. Twelve full-length sequences across all seasons. RL-EKF run with chi-squared-equivalent thresholds at 99.9% confidence.
 
-| Sequence | FC ATE RMSE | RL-EKF ATE RMSE | RL-UKF |
-|---|---|---|---|
-| 2012-01-08 | **5.6 m** | 13.0 m | NaN divergence at t=31 s |
-| 2012-02-04 | **9.7 m** | 19.1 m | NaN divergence at t=22 s |
-| 2012-03-31 | **4.2 m** | 54.3 m | NaN divergence at t=18 s |
-| 2012-08-20 | **7.5 m** | 24.1 m | NaN divergence |
-| 2012-11-04 | 28.6 m | **9.6 m** | NaN divergence |
-| 2013-02-23 | **4.1 m** | 11.0 m | NaN divergence |
+| Sequence | Season | Duration | FC ATE RMSE | RL-EKF ATE RMSE | Winner |
+|---|---|---|---|---|---|
+| 2012-01-08 | Winter | 92 min | **18.6 m** | 41.2 m | FC +55% |
+| 2012-02-04 | Winter | 77 min | **49.7 m** | 265.5 m | FC +81% |
+| 2012-03-31 | Spring | 87 min | **22.0 m** | 156.5 m | FC +86% |
+| 2012-05-11 | Spring | 84 min | **9.7 m** | 11.5 m | FC +16% |
+| 2012-06-15 | Summer | 55 min | 49.2 m | **18.2 m** | RL +63% |
+| 2012-08-20 | Summer | 83 min | 98.3 m | **10.6 m** | RL +89% |
+| 2012-09-28 | Fall | 77 min | **10.8 m** | 55.7 m | FC +81% |
+| 2012-10-28 | Fall | 85 min | **29.9 m** | 60.0 m | FC +50% |
+| 2012-11-04 | Fall | 79 min | **60.1 m** | 122.0 m | FC +51% |
+| 2012-12-01 | Winter | 75 min | **21.0 m** | 90.7 m | FC +77% |
+| 2013-02-23 | Winter | 78 min | **59.4 m** | 82.2 m | FC +28% |
+| 2013-04-05 | Spring | 68 min | **12.1 m** | 268.9 m | FC +96% |
 
-RL-UKF diverges with NaN on all six sequences. RL-EKF completes all six but with 2–10x higher ATE. FusionCore loses on the 2012-11-04 sequence: root cause under investigation.
+RL-UKF diverges with NaN on all twelve sequences. FusionCore wins 10/12 sequences. RL-EKF's losses trace to a single root cause: the GPS driver reports 3m sigma, but measured against RTK ground truth, actual p95 noise is 9.7-53.1m depending on the day. RL's gate is calibrated to the stated 3m and rejects valid fixes on bad-GPS days. FusionCore's adaptive noise estimation (`adaptive.gnss: true`) keeps chi2 statistics calibrated in real time.
+
+The two FC losses are driven by a GPS data quality issue on 2012-08-20 (105 corrupt mode-3 fixes in a 24-second window at a blackout boundary) and accumulated heading error during a 462-second GPS blackout on 2012-06-15. See [benchmarks/README.md](benchmarks/README.md) for full per-sequence analysis including root causes and path-to-fix.
 
 <p align="center">
-  <img src="docs/assets/fig2_traj_grid.png" alt="Trajectory overlay: all 6 sequences, SE3-aligned to RTK GPS ground truth" width="650">
+  <img src="docs/assets/fig2_traj_grid.png" alt="Trajectory overlay: all 9 sequences, SE3-aligned to RTK GPS ground truth" width="650">
 </p>
+
+---
+
+## Used by
+
+FusionCore is being tested or deployed on real hardware by members of the community. If you are using it on your robot, open an issue or leave a comment in [Discussions](https://github.com/manankharwar/fusioncore/discussions) and I will add you here.
 
 ---
 
@@ -118,7 +132,7 @@ If any of these have bitten you, FusionCore was built with them in mind:
 
 | robot_localization issue | What FusionCore does instead |
 |---|---|
-| UKF diverges with NaN on GPS-heavy sequences ([#780](https://github.com/cra-ros-pkg/robot_localization/issues/780), [#777](https://github.com/cra-ros-pkg/robot_localization/issues/777)) | Chi-squared gate on every sensor; covariance bounded at each step. All six NCLT sequences finish without NaN. |
+| UKF diverges with NaN on GPS-heavy sequences ([#780](https://github.com/cra-ros-pkg/robot_localization/issues/780), [#777](https://github.com/cra-ros-pkg/robot_localization/issues/777)) | Chi-squared gate on every sensor; covariance bounded at each step. All nine NCLT sequences finish without NaN. |
 | navsat_transform crashes at UTM zone boundaries ([#951](https://github.com/cra-ros-pkg/robot_localization/issues/951), [#904](https://github.com/cra-ros-pkg/robot_localization/issues/904)) | GPS fused directly in ECEF. No UTM projection, no zone boundary. |
 | No non-holonomic constraint for wheeled robots ([#744](https://github.com/cra-ros-pkg/robot_localization/issues/744)) | Built-in NHC: lateral and vertical velocity zeroed as a virtual measurement on every encoder update. |
 | Delayed sensor messages cause missed updates ([#911](https://github.com/cra-ros-pkg/robot_localization/issues/911)) | Rolling IMU buffer with retrodiction. Late GPS fixes replay missed IMU steps automatically (up to 500 ms). |
@@ -157,9 +171,9 @@ Apache 2.0.
   title     = {FusionCore: ROS 2 UKF Sensor Fusion},
   year      = {2026},
   publisher = {Zenodo},
-  version   = {0.2.0},
-  doi       = {10.5281/zenodo.19834991},
-  url       = {https://doi.org/10.5281/zenodo.19834991}
+  version   = {0.2.3},
+  doi       = {10.5281/zenodo.20091053},
+  url       = {https://doi.org/10.5281/zenodo.20091053}
 }
 ```
 
