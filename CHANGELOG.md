@@ -6,6 +6,40 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.2.4]: 2026-05-19
+
+### Changed
+- `package.xml` (both packages): maintainer name corrected to Manan Kharwar, maintainer email updated
+- `package.xml` (both packages): added `<url>` tags for website, repository, bugtracker, and documentation so index.ros.org renders clickable links
+
+---
+
+## [0.2.3]: 2026-05-10
+
+### Added
+- **VSLAM pose fusion**: accepts `nav_msgs/Odometry` from ORB-SLAM3, MOLA, slam_toolbox, or any VIO/LIO source via `vslam.topic`. Enables visual-inertial fusion without GPS.
+- **Dual IMU support**: second IMU input via `imu2.topic` with independent noise and outlier parameters.
+- **GPS velocity fusion**: fuses Doppler-derived velocity from a GNSS receiver via `gnss.velocity_topic`.
+- **Radar Doppler velocity fusion**: fuses radar radial velocity via `radar.velocity_topic`.
+- **Pluggable motion models**: select differential drive, Ackermann, or omnidirectional via `motion_model` parameter.
+- **Sensor wait**: filter holds initialization until all declared sensors have published at least once.
+- **Deterministic replay**: `use_sim_time`-aware replay for reproducible benchmark runs.
+- **Docker container and `quick_test.sh`**: one-command environment for testing without a full ROS install.
+- **`imu.topic` parameter**: override the IMU subscription topic at runtime without launch file changes.
+- **Adaptive R-inflation**: breaks cascading outlier rejection loops when GPS quality degrades gradually.
+- **`publish.tf` toggle**: suppress TF broadcast independently of odometry publishing for multi-robot setups.
+- Ackermann vehicle configuration and documentation.
+- GPS velocity and wheel slip detection documentation.
+
+### Fixed
+- VSLAM frame alignment and reinitialization recovery after GPS-denied stretches.
+- `encoder2` noise parameters and config accuracy.
+- `nav2_params` global_frame corrected from `map` to `odom` for GPS-only navigation.
+- Dockerfile apt list errors on fresh builds.
+- `quick_test.sh` four-check validation on clean setup.
+
+---
+
 ## [0.2.2]: 2026-05-05
 
 ### Fixed
