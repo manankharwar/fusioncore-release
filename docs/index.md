@@ -3,7 +3,8 @@
 **ROS 2 UKF sensor fusion for robots that run in the real world. IMU + wheel encoders + GPS at 100 Hz. Handles bad calibration, timestamp jitter, delayed GPS, wheel slip, and ARM hardware out of the box. Apache 2.0.**
 
 [![CI](https://github.com/manankharwar/fusioncore/actions/workflows/ci.yml/badge.svg)](https://github.com/manankharwar/fusioncore/actions/workflows/ci.yml)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19834991.svg)](https://doi.org/10.5281/zenodo.19834991)
+[![arXiv](https://img.shields.io/badge/arXiv-2605.25239-b31b1b)](https://arxiv.org/abs/2605.25239)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20091053.svg)](https://doi.org/10.5281/zenodo.20091053)
 
 ---
 
@@ -121,12 +122,50 @@ RL-UKF diverged with NaN on all twelve sequences (known numerical instability un
 ---
 
 
+## Used on real hardware
+
+Real engineers, real robots, real sensor data. Not demos.
+
+> "The system was stable on real robot data and was relatively easy to configure. I was able to get reasonable behavior without spending excessive time on parameter tuning. The overall experience felt more deployment-oriented than research-demo-oriented."
+>
+> **Michał Bednarek** ([@mbed92](https://github.com/mbed92)), Robotics PhD
+> Factory differential-drive robot, ROS 2 Humble: Cartographer (point-cloud localization, no preloaded map) + wheel odometry + IMU
+
+<br>
+
+> "Having a go at using FusionCore in an agricultural field robot. Hopefully will have a robot moving in a month or two."
+>
+> **Sam** ([@samuk](https://github.com/samuk)), [Agroecology Lab](https://github.com/Agroecology-Lab/feldfreund_devkit_ros)
+> Outdoor agricultural robot, integration in progress
+
+> **Russ Hall**, Andino robot (Raspberry Pi)
+> OAK-D (stereo depth + IMU) + Velodyne VLP-16 + rtabmap: indoor SLAM mapping
+
+Running FusionCore on your robot? Drop a note in [Discussions #22](https://github.com/manankharwar/fusioncore/discussions/22) and I will add you here.
+
+---
+
+## In the ecosystem
+
+**rtabmap_ros (merged):** FusionCore is included as a named demo in the official [rtabmap_ros](https://github.com/introlab/rtabmap_ros) repository, maintained by @matlabbe. The demo ("Turtlebot3 Nav2, 2D LiDAR SLAM with FusionCore") shows FusionCore and icp_odometry running in a feedback loop: FusionCore's stable odom frame seeds scan matching via `guess_frame_id`, and the ICP result feeds back into FusionCore as a second velocity source. [View the demo](https://github.com/introlab/rtabmap_ros/tree/ros2/rtabmap_demos)
+
+**Stereolabs community:** FusionCore + ZED integration guide posted on the Stereolabs developer forum, acknowledged by Stereolabs support. Under active evaluation by [@privvyledge](https://github.com/privvyledge) comparing FusionCore against Wolf, TIER IV EagleEye, and robot_localization on two platforms: an F1/10 scale car (indoor, VESC + RealSense D435i) and a full-size autonomous van (GPS + ZED 2i + 360 LiDAR).
+
+---
+
 ## Where to go next
 
 - **New user** → [Getting Started](getting-started.md)
 - **Configuring your robot** → [Configuration](configuration.md)
 - **Pick a config for your hardware** → [Hardware Configs](hardware/index.md)
 - **Using with Nav2** → [Nav2 Integration](nav2.md)
+- **FusionCore vs robot_localization** → [Technical Comparison](vs-robot-localization.md)
 - **Coming from robot_localization** → [Migration Guide](migration_from_robot_localization.md)
 - **Simulation / testing without hardware** → [Simulation](simulation.md)
 - **How the filter actually works** → [How It Works](how-it-works.md)
+
+---
+
+## Running FusionCore on real hardware?
+
+If localization is blocking your robot and you want help getting it working, open a [GitHub Discussion](https://github.com/manankharwar/fusioncore/discussions/22) or email [manan.kharwar@outlook.com](mailto:manan.kharwar@outlook.com) directly. Fixed scope, fixed price, guaranteed result.

@@ -42,6 +42,25 @@ struct FusionCoreConfig {
   double gps_track_heading_min_dist = 5.0;   // meters
   double gps_track_heading_max_sigma = 0.4;  // radians
 
+  // Motion quality thresholds for GPS track heading observability.
+  // A GPS displacement step only counts toward heading_observable_distance when:
+  //   - robot speed >= min_speed (filters GPS jitter and standstill noise)
+  //   - yaw rate <= max_yaw_rate (during fast turns the bearing changes too quickly
+  //     to give a reliable heading measurement)
+  // Increase min_speed on high-vibration platforms. Decrease max_yaw_rate if heading
+  // is being incorrectly validated during tight turns (parking lot maneuvers).
+  double gps_track_heading_min_speed    = 0.2;   // m/s
+  double gps_track_heading_max_yaw_rate = 0.3;   // rad/s (~17 deg/s)
+
+  // Lever arm correction is only applied when heading uncertainty is below this threshold.
+  // When heading_sigma exceeds this value (e.g. during prolonged turns with no GPS track
+  // heading fusions firing), rotating the lever arm by an uncertain heading adds more
+  // position error than it removes. Lever arm silently deactivates until heading tightens.
+  // Rule of thumb: lever_arm_length_m * sin(threshold_rad) should be < GPS noise sigma.
+  // Default 20 deg: disables lever arm during tight-turn sections where heading degrades,
+  // leaves it active during straight/gentle-curve driving where it genuinely helps.
+  double gnss_lever_arm_max_heading_sigma_deg = 20.0;
+
   // Delay compensation: state snapshot buffer
   // Mahalanobis outlier rejection
   // Rejects measurements that are statistically implausible.
@@ -59,6 +78,11 @@ struct FusionCoreConfig {
   bool adaptive_imu     = true;
   bool adaptive_encoder = true;
   bool adaptive_gnss    = true;
+
+  // Whether to enable adaptive R for ground constraint pseudo-measurements (VZ=0, AZ=0).
+  // When true, VZ and AZ noise automatically inflates on rough terrain as innovations grow,
+  // then relaxes back when terrain is smooth. No config changes needed across environments.
+  bool adaptive_ground_constraint = true;
 
   // Sliding window size for innovation tracking (number of updates)
   int adaptive_window = 50;
@@ -94,6 +118,28 @@ struct FusionCoreConfig {
   //         Orientation update validates roll/pitch ONLY, not heading.
   //         Lever arm will not activate from IMU orientation alone.
   bool imu_has_magnetometer = false;
+
+  // Non-holonomic constraint: lateral velocity (VY) tightness.
+  // For differential drive robots, VY should be zero (robot can't move sideways).
+  // This is the sigma on that assertion (m/s): lower = harder constraint.
+  // Default 0.05 m/s matches encoder.vel_noise (previous hardcoded behavior).
+  // Increase to 10.0+ to effectively disable for mecanum/omnidirectional robots.
+  // Increase to 0.3-1.0 for Ackermann robots on slippery surfaces with lateral slip.
+  double encoder_nhc_vy_sigma = 0.05;
+
+  // Non-holonomic constraint: body-frame vertical velocity (VZ) tightness.
+  // For ground robots, VZ should be zero during steady locomotion.
+  // Default 0.1 m/s: fine for flat ground and mild terrain.
+  // Increase to 0.3-1.0 for robots traversing obstacles, curbs, or rough terrain
+  // where the chassis genuinely has transient vertical motion during transitions.
+  double ground_constraint_vz_sigma = 0.1;
+
+  // Non-holonomic constraint: body-frame vertical acceleration (AZ) tightness.
+  // Constraining AZ prevents gravity-constant mismatch (WGS84 vs local g) from
+  // leaking into AZ and integrating into VZ drift via the motion model.
+  // Default 0.5 m/s²: loose enough for bumps and ramps, tight enough to stop drift.
+  // Increase to 2.0+ for aggressive terrain where vertical accelerations are real.
+  double ground_constraint_az_sigma = 0.5;
 
   // Position-level ground constraint: fuses Z=0 as a pseudo-measurement each
   // encoder callback. Tighter than GPS altitude noise (5m std dev on NCLT),
@@ -164,6 +210,38 @@ enum class HeadingSource {
   GPS_TRACK      = 3,  // robot moved enough for heading to be geometric
 };
 
+// Why a GNSS fix was rejected (or ACCEPTED if it passed)
+enum class GnssRejectionReason {
+  NOT_PROCESSED   = 0,  // update_gnss not yet called
+  ACCEPTED        = 1,
+  FIX_TYPE_LOW    = 2,  // fix_type < min_fix_type
+  HDOP_HIGH       = 3,  // hdop > max_hdop
+  VDOP_HIGH       = 4,  // vdop > max_vdop
+  MIN_SATS        = 5,  // satellites < min_satellites
+  CHI2_FAILED     = 6,  // Mahalanobis distance > threshold
+  DELAY_TOO_LARGE = 7,  // measurement older than max_measurement_delay
+};
+
+// Per-fix observability data: populated by update_gnss() on every call.
+// Retrieve via get_gnss_debug() after update_gnss() returns.
+struct GnssFixDebug {
+  bool               accepted           = false;
+  GnssRejectionReason reason            = GnssRejectionReason::NOT_PROCESSED;
+  double             mahalanobis_sq     = -1.0;  // -1 = not computed (quality gate failed first)
+  double             chi2_threshold     = 0.0;
+  double             hdop               = 0.0;
+  double             vdop               = 0.0;
+  int                satellites         = 0;
+  int                fix_type           = 0;
+  bool               in_coast_mode      = false;
+  int                consecutive_rejects = 0;
+  double             position_sigma_x   = 0.0;
+  double             position_sigma_y   = 0.0;
+  // Lever arm observability
+  bool               lever_arm_used     = false;  // was lever arm correction applied for this fix
+  double             heading_sigma_deg  = 0.0;    // heading 1-sigma at time of this fix (degrees)
+};
+
 enum class SensorHealth {
   OK,
   STALE,
@@ -178,10 +256,10 @@ struct FusionCoreStatus {
   double       position_uncertainty = 0.0;
   int          update_count         = 0;
 
-  // Heading observability: the real fix for peci1's concern
+  // Heading observability
   bool          heading_validated   = false;
   HeadingSource heading_source      = HeadingSource::NONE;
-  double        distance_traveled   = 0.0;  // meters since init
+  double        distance_traveled   = 0.0;
 
   // Outlier rejection counters: cumulative since init()
   int gnss_outliers  = 0;
@@ -191,6 +269,21 @@ struct FusionCoreStatus {
   int vslam_outliers = 0;
 
   SensorHealth vslam_health = SensorHealth::NOT_INIT;
+
+  // Innovation norms: magnitude of the last accepted measurement residual.
+  // Zero until the first accepted update from that sensor.
+  double gnss_innovation_norm    = 0.0;
+  double imu_innovation_norm     = 0.0;
+  double encoder_innovation_norm = 0.0;
+
+  // Position 1-sigma uncertainty from the filter covariance (meters).
+  double position_sigma_x = 0.0;
+  double position_sigma_y = 0.0;
+  double position_sigma_z = 0.0;
+
+  // GPS coast mode state
+  bool gnss_in_coast           = false;
+  int  gnss_consecutive_rejects = 0;
 };
 
 class FusionCore {
@@ -258,8 +351,9 @@ public:
     const sensors::GnssHeading& heading
   );
 
-  const State&       get_state()  const;
-  FusionCoreStatus   get_status() const;
+  const State&       get_state()      const;
+  FusionCoreStatus   get_status()     const;
+  const GnssFixDebug& get_gnss_debug() const { return gnss_debug_; }
   void               reset();
   bool               is_initialized()    const { return initialized_; }
   bool               is_heading_valid()  const { return heading_validated_; }
@@ -322,6 +416,8 @@ private:
   InnovationWindow<sensors::GNSS_POS_DIM>         gnss_innovations_;
   InnovationWindow<sensors::IMU_ORIENTATION_DIM>  imu_orient_innovations_;
   InnovationWindow<sensors::VSLAM_POSE_DIM>       vslam_innovations_;
+  InnovationWindow<1>                             vz_innovations_;
+  InnovationWindow<1>                             az_innovations_;
 
   // Current adaptive R estimates: start at config values, drift toward truth
   sensors::ImuNoiseMatrix             R_imu_;
@@ -329,9 +425,11 @@ private:
   sensors::GnssPosNoiseMatrix         R_gnss_;
   sensors::ImuOrientationNoiseMatrix  R_imu_orient_;
   sensors::VslamPoseNoiseMatrix       R_vslam_;
+  Eigen::Matrix<double, 1, 1>         R_vz_;   // body-frame vertical velocity constraint
+  Eigen::Matrix<double, 1, 1>         R_az_;   // body-frame vertical accel constraint
 
   // Minimum R floors: adaptive R must never drop below the initially configured value.
-  // A constant innovation bias (e.g. sim gravity ≠ WGS84 gravity) has zero variance
+  // A constant innovation bias (e.g. sim gravity != WGS84 gravity) has zero variance
   // after mean-subtraction and would otherwise drive R toward 1e-9, causing
   // K[position, accel] to explode and Z to drift at m/s rates.
   sensors::ImuNoiseMatrix             R_imu_floor_;
@@ -339,6 +437,8 @@ private:
   sensors::GnssPosNoiseMatrix         R_gnss_floor_;
   sensors::ImuOrientationNoiseMatrix  R_imu_orient_floor_;
   sensors::VslamPoseNoiseMatrix       R_vslam_floor_;
+  Eigen::Matrix<double, 1, 1>         R_vz_floor_;
+  Eigen::Matrix<double, 1, 1>         R_az_floor_;
 
   bool adaptive_initialized_ = false;
 
@@ -348,6 +448,14 @@ private:
   int enc_outliers_    = 0;
   int hdg_outliers_    = 0;
   int vslam_outliers_  = 0;
+
+  // Per-fix observability: updated on every update_gnss() call
+  GnssFixDebug gnss_debug_;
+
+  // Last accepted innovation norms per sensor: updated on each accepted update
+  double last_gnss_innovation_norm_    = 0.0;
+  double last_imu_innovation_norm_     = 0.0;
+  double last_encoder_innovation_norm_ = 0.0;
 
   // Inertial coast mode tracking
   int  gnss_consecutive_rejects_ = 0;
@@ -424,6 +532,9 @@ private:
   // the chi2 gate to reject the very first heading fusion when the initial
   // heading error exceeds ~75 degrees.
   bool   gps_track_hdg_fused_ = false;
+
+  // Returns heading 1-sigma in radians computed from P via quaternion-to-yaw Jacobian.
+  double compute_heading_sigma_rad() const;
 
   void predict_to(double timestamp_seconds);
   bool apply_gnss_update(double timestamp_seconds, const sensors::GnssFix& fix);
