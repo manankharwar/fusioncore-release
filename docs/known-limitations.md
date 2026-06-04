@@ -40,9 +40,17 @@ FusionCore resolves this by treating `B_EWZ` as known from the GPS calibration p
 
 ## Non-holonomic constraint assumes flat ground
 
-The NHC (non-holonomic constraint) zeros the lateral and vertical body-frame velocity as a virtual measurement. This assumes the robot is on flat ground. On significant slopes or when traversing obstacles, the vertical velocity constraint produces an incorrect measurement that the filter must reject or accommodate.
+The NHC (non-holonomic constraint) zeros the lateral and vertical body-frame velocity as virtual measurements. On significant slopes or when traversing obstacles, the vertical velocity constraint briefly produces a non-zero innovation (the robot genuinely has body-frame VZ during a curb transition or a bump).
 
-**Workaround:** Reduce `encoder.nhc_noise_vy` and `encoder.nhc_noise_vz` to loosen the constraint (higher values = weaker constraint = less penalty for non-zero lateral/vertical velocity). On robots that regularly traverse steep terrain, set these to very large values to effectively disable the constraint.
+**This is handled automatically.** The VZ=0 and AZ=0 constraint noise adapts from the innovation sequence (controlled by `adaptive.ground_constraint: true`, enabled by default). When the robot hits rough terrain, large VZ or AZ innovations inflate the constraint noise within one sliding window (~1 second at encoder rate), loosening the assertion to match actual terrain behavior. When back on smooth ground, the noise relaxes back down to the configured floor values (`ground_constraint.vz_sigma` and `ground_constraint.az_sigma`). No config changes are needed when moving between terrain types.
+
+The floor values control the minimum tightness on smooth ground:
+- `ground_constraint.vz_sigma: 0.1` (default, flat floors and mild terrain)
+- `ground_constraint.az_sigma: 0.5` (default, flat floors and mild terrain)
+
+Increase these floors only if you want looser constraints even on smooth surfaces (rarely needed).
+
+For lateral velocity: `adaptive.encoder: true` (enabled by default) adapts the VY encoder noise from innovations. For mecanum and omnidirectional robots that genuinely move laterally, set `encoder.nhc_vy_sigma: 10.0` or higher to effectively disable the lateral NHC constraint regardless of terrain.
 
 ---
 
@@ -66,6 +74,6 @@ FusionCore's adaptive noise covariance updates within a session from the innovat
 
 When fusing VSLAM pose (`vslam.topic`), FusionCore anchors the offset between the VSLAM map frame and the filter's odometry frame on first message. If the VSLAM system re-localizes to a different part of its map (loop closure, kidnapping recovery), the map origin shifts and the anchored offset becomes stale.
 
-The reinitialization detector (`vslam.reinit_n`, `vslam.reinit_jump_m`) catches large instantaneous jumps. It does not catch slow drift due to map deformation.
+The reinitialization detector (`vslam.reinit_n`) catches large instantaneous jumps: after `vslam.reinit_n` consecutive chi2 rejections (default 10, approximately 2 seconds at 5 Hz), FusionCore re-anchors the map origin to the current filter position and resumes fusion. It does not catch slow drift due to map deformation.
 
 **Workaround:** Trigger a filter reset (`ros2 service call /fusioncore/reset`) after VSLAM re-localization completes.
