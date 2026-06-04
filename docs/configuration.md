@@ -35,10 +35,20 @@ fusioncore:
     #   ~0.0 m/s² → set true (driver already removed it)
     # NOTE: opposite of robot_localization's imu0_remove_gravitational_acceleration.
 
-    imu.frame_id: ""  # override IMU TF frame. Leave empty to use msg header.frame_id.
-                      # Set when your simulator or IMU driver stamps messages with a
-                      # non-standard frame name (e.g. Gazebo Harmonic TurtleBot3 publishes
-                      # "waffle/imu_link/tb3_imu"). Set to your URDF frame name instead.
+    imu.frame_id: ""  # override IMU TF frame. Leave empty (default) to use msg->header.frame_id.
+                      #
+                      # When to set this:
+                      #   Gazebo Harmonic TurtleBot3 publishes "waffle/imu_link/tb3_imu" instead
+                      #   of "imu_link". FusionCore can't find that frame in the TF tree.
+                      #   Fix: set imu.frame_id to your URDF frame name (e.g. "imu_link").
+                      #
+                      # WARNING: do NOT set this to "base_link".
+                      #   When imu.frame_id equals base_frame, FusionCore skips the TF lookup
+                      #   entirely and treats IMU measurements as already in base_link frame.
+                      #   If your IMU is mounted at any angle relative to base_link, its
+                      #   measurements will be fused with the wrong rotation, silently
+                      #   corrupting the orientation estimate. Leave empty unless your driver
+                      #   publishes with no frame_id at all.
 
     # Optional second IMU. When non-empty, FusionCore subscribes to this topic
     # and fuses each message as an independent measurement of the same state.
@@ -81,9 +91,16 @@ fusioncore:
     gnss.max_hdop: 4.0          # reject fixes with HDOP worse than this
     gnss.min_satellites: 4
     gnss.min_fix_type: 1        # 1=GPS, 2=DGPS, 3=RTK_FLOAT, 4=RTK_FIXED
-                                # NOTE: sensor_msgs/NavSatFix status=2 → RTK_FIXED only.
-                                # RTK_FLOAT (3) is unreachable via NavSatFix.
-                                # Use 2 or 4 as meaningful thresholds.
+                                # NavSatFix: status=2 maps to RTK_FIXED. RTK_FLOAT (3)
+                                # is unreachable via NavSatFix; use gnss.use_gps_fix
+                                # below if your receiver publishes gps_msgs/GPSFix.
+
+    gnss.use_gps_fix: false     # Set true when your driver publishes gps_msgs/GPSFix
+                                # on /gnss/fix instead of sensor_msgs/NavSatFix.
+                                # GPSFix unlocks RTK_FLOAT status, uses receiver-native
+                                # hdop/vdop values, satellites_used, and err_horz/err_vert
+                                # as a fallback covariance. Default false: NavSatFix works
+                                # with all receivers. See GPS Receiver Setup below.
 
     # Antenna lever arm: offset from base_link to GPS antenna in body frame
     # x=forward, y=left, z=up (meters). Leave 0.0 if antenna is above base_link.
@@ -178,6 +195,25 @@ fusioncore:
     # Maximum heading uncertainty to allow a fusion (radians). Computed as
     # gps_noise / displacement. 0.4 rad = 23 degrees.
 
+    gnss.track_heading_min_speed: 0.2
+    # Minimum robot speed (m/s) for GPS displacement steps to count toward
+    # heading observability. Below this: could be GPS jitter, not real motion.
+    # Increase on high-vibration platforms (construction equipment, tracked robots).
+
+    gnss.track_heading_max_yaw_rate: 0.3
+    # Maximum yaw rate (rad/s) for displacement steps to count. During fast turns
+    # the bearing changes too quickly for a reliable heading measurement.
+    # Decrease for robots that make tight turns at slow speed.
+
+    # ── Lever arm heading gating ──────────────────────────────────────────────
+    gnss.lever_arm_max_heading_sigma_deg: 20.0
+    # Lever arm correction is only applied when heading uncertainty is below this.
+    # When heading degrades (e.g. during prolonged turns), rotating the lever arm
+    # by an uncertain heading adds more position error than it removes.
+    # Default 20 deg disables lever arm during tight-turn sections while leaving
+    # it active during straight/gentle-curve driving where it genuinely helps.
+    # Rule of thumb: lever_arm_m * sin(threshold_rad) should be < GPS noise sigma.
+
     # ── Outlier rejection ─────────────────────────────────────────────────────
     outlier_rejection: true
     outlier_threshold_gnss: 16.27   # chi2(3, 0.999): 3D GPS position
@@ -191,36 +227,6 @@ fusioncore:
     # this gate rejects those jumps automatically when covariance is calibrated.
     # Do NOT lower these below chi2 critical values. At 7.0 normal GPS noise
     # trips the gate and every fix gets rejected.
-
-    # ── VSLAM (visual SLAM pose input) ───────────────────────────────────────
-    # FusionCore accepts 6-DOF pose from any VSLAM system that publishes
-    # nav_msgs/Odometry (ORB-SLAM3, RTAB-Map, Kimera, OpenVINS, etc.).
-    # Only pose.pose and pose.covariance are used; twist is ignored.
-    # See docs/hardware/vslam-imu.md for setup details.
-    vslam.topic: ""              # e.g. "/vslam/odometry" or "/orbslam3/camera/odometry"
-                                 # Leave empty to disable VSLAM input.
-    vslam.position_noise: 0.1   # m: fallback when message covariance is zero
-    vslam.orientation_noise: 0.02  # rad: fallback when message covariance is zero
-    vslam.frame_id: ""           # override VSLAM TF frame. Leave empty to use msg header.
-    vslam.reinit_n: 10           # consecutive gate rejections before re-anchoring map origin
-    # FusionCore tracks the offset between the VSLAM map frame and the filter's odom
-    # frame. When VSLAM reinitializes after tracking loss, its pose jumps to a new
-    # map origin. The chi-squared gate rejects these jumps. After vslam.reinit_n
-    # consecutive rejections, FusionCore assumes reinitialization occurred and
-    # re-anchors the map origin to the filter's current position, restoring fusion.
-
-    # ── GPS coast mode (cascade rejection recovery) ───────────────────────────
-    gnss.coast_n: 5              # consecutive rejections before entering coast mode
-    gnss.coast_q_factor: 20.0   # process noise multiplier while coasting (inflates P)
-    gnss.degraded_noise_multiplier: 3.0
-    # After gnss.coast_n consecutive GPS outliers, the filter enters coast mode.
-    # In coast mode: (1) P is inflated by coast_q_factor each step so the filter
-    # stays open to correction, (2) the next fix is tested against a gate inflated
-    # by degraded_noise_multiplier, giving it a wider acceptance window.
-    # This breaks the cascade rejection loop where a stationary or slowly-drifting
-    # filter keeps rejecting valid fixes because its covariance is too tight.
-    # Increase coast_n if you want more patience before relaxing; increase
-    # degraded_noise_multiplier if large GPS jumps should still be accepted.
 
     # ── Adaptive noise ────────────────────────────────────────────────────────
     adaptive.imu: true
@@ -290,34 +296,6 @@ fusioncore:
     # Workflow: replay a bag to a known-good point → save → tweak params →
     #   load (instant, no re-replay) → observe the problem window.
 
-    # ── Ground constraint ─────────────────────────────────────────────────────
-    # FusionCore always fuses VZ=0 and AZ=0 on every encoder callback.
-    # These are unconditional for wheeled ground robots and cannot be disabled.
-    #
-    # The optional Z position constraint targets a different problem: GPS
-    # altitude noise (typically 3-5m std dev) causing the filter's Z position
-    # to oscillate on flat terrain. When enabled, it fuses Z=0 as a position
-    # pseudo-measurement tighter than GPS altitude noise, keeping the filter
-    # anchored to the ground.
-    #
-    # 0.0 = disabled (default, correct for 3D outdoor operation or unknown terrain)
-    # 0.3 = flat terrain mode: campus paths, parking lots, warehouse floors
-    ground_constraint.z_position_sigma: 0.0
-
-    # ── ZUPT ──────────────────────────────────────────────────────────────────
-    zupt.enabled: true
-    zupt.velocity_threshold: 0.05   # m/s: encoder speed below this → stationary
-    zupt.angular_threshold: 0.05    # rad/s: angular rate below this → not rotating
-    zupt.noise_sigma: 0.01          # m/s: tighter = stronger zero-velocity correction
-
-    # ── GPS coordinate system ─────────────────────────────────────────────────
-    input.gnss_crs: "EPSG:4326"              # WGS84 lat/lon (standard GPS)
-    output.crs: "EPSG:4978"                  # ECEF XYZ (globally valid default)
-    output.convert_to_enu_at_reference: true # required when output.crs is ECEF
-    reference.use_first_fix: true            # map origin = first GPS fix
-    reference.x: 0.0                         # fixed origin (when use_first_fix: false)
-    reference.y: 0.0
-    reference.z: 0.0
 ```
 
 ---
@@ -394,6 +372,54 @@ output.crs: "EPSG:32617"
 output.convert_to_enu_at_reference: false
 reference.use_first_fix: true
 ```
+
+---
+
+## GPS receiver setup: NavSatFix vs GPSFix
+
+FusionCore supports two GPS message types on `/gnss/fix`. The default is `sensor_msgs/NavSatFix` because every ROS GPS driver publishes it. Set `gnss.use_gps_fix: true` to switch to `gps_msgs/GPSFix` if your driver supports it.
+
+| | `sensor_msgs/NavSatFix` | `gps_msgs/GPSFix` |
+|---|---|---|
+| Driver support | Universal | nmea_navsat_driver, ublox_dgnss, others |
+| RTK_FLOAT status | Not expressible | Yes (status 20) |
+| Separate HDOP / VDOP | No | Yes |
+| Satellites used | No | Yes |
+| 95% CI error bounds | No | err_horz / err_vert |
+| Covariance matrix | Yes | Yes |
+
+### When to use NavSatFix (default)
+
+NavSatFix works with all receivers. For most setups, leave `gnss.use_gps_fix: false`.
+
+The only thing you cannot get via NavSatFix is RTK_FLOAT. If you are using autonomous GPS (CEP 1-3m) or RTK fixed, NavSatFix is all you need.
+
+### When to use GPSFix
+
+Switch to `gnss.use_gps_fix: true` when:
+
+- Your receiver can output RTK_FLOAT and you want to fuse those fixes (better than autonomous, worse than RTK fixed). Set `gnss.min_fix_type: 3` to require it or allow it.
+- Your driver publishes receiver-native HDOP/VDOP rather than a covariance matrix, and you want those values used directly in the noise model.
+- Your driver sets `err_horz`/`err_vert` (95% CI bounds) and you prefer that over a synthetic covariance.
+
+```yaml
+fusioncore:
+  ros__parameters:
+    gnss.use_gps_fix: true
+    gnss.min_fix_type: 3      # require RTK_FLOAT or better (3=FLOAT, 4=FIXED)
+    gnss.base_noise_xy: 0.5   # metres: baseline at HDOP=1 for RTK_FLOAT
+    gnss.base_noise_z: 1.0
+```
+
+### Covariance priority (GPSFix)
+
+When `gnss.use_gps_fix: true`, FusionCore picks the best available covariance source in this order:
+
+1. `position_covariance_type == 3` (full 3x3): used directly, including off-diagonal terms.
+2. `position_covariance_type >= 1` (diagonal): diagonal elements used, hdop/vdop derived from them.
+3. `err_horz > 0` and `err_vert > 0`: 95% CI bounds converted to 1-sigma variance (divide by 1.96), used as a diagonal covariance.
+4. `hdop > 0` and `vdop > 0`: receiver-native DOP values used directly in the noise model (`sigma_xy = base_noise_xy * hdop`).
+5. Defaults (`hdop=1.5, vdop=2.0`).
 
 ---
 

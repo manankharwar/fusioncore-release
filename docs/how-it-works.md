@@ -14,7 +14,7 @@ Each robustness claim below has a corresponding test with a hard pass threshold.
 | Position stable while stationary | [Gazebo integration test 1](simulation.md#automated-integration-tests): 10 s IMU-only with GPS active | Drift < 2 m (typically < 0.1 m) |
 | GPS correction after motion | [Gazebo integration test 3](simulation.md#automated-integration-tests): drive then stop, measure stability with GPS active | Drift < 2 m in 3 s |
 | Dead reckoning stays coherent | [Gazebo integration test 4](simulation.md#automated-integration-tests): full circle return error | < 3 m (typically < 0.5 m) |
-| Accuracy on real outdoor data | [NCLT benchmark](https://manankharwar.github.io/fusioncore/): 9 full-length sequences, IMU + wheels + GPS | ATE 10–60 m (7/9 FC wins over RL-EKF) |
+| Accuracy on real outdoor data | [NCLT benchmark](https://manankharwar.github.io/fusioncore/): 12 full-length sequences, IMU + wheels + GPS | ATE 10–60 m (10/12 FC wins over RL-EKF) |
 | Spike visible in real data | [Zero-dependency demo](index.md#see-it-before-you-install): pre-baked NCLT spike test | FC +1 m vs RL-EKF +50 m on 707 m fake fix |
 
 The Gazebo tests run against the live simulation (`python3 integration_test.py`) and are reproducible on any machine with Gazebo Harmonic installed. The NCLT benchmark runs against real rosbag data. Both are described with reproduction steps.
@@ -190,8 +190,10 @@ gnss.min_fix_type: 4   # require RTK_FIXED: reject basic GPS entirely
 
 Rejection log:
 ```
-[WARN] GNSS fix rejected (fix_type=1, min=4, hdop=1.20, quality check or Mahalanobis gate)
+[WARN] GNSS fix rejected: FIX_TYPE_LOW (hdop=1.20, d2=-1.0, threshold=16.27)
 ```
+
+The structured reason and Mahalanobis distance are also available on `/fusion/debug/gnss_status` for every fix.
 
 !!! warning "NavSatFix RTK_FLOAT"
     `sensor_msgs/NavSatFix` has no STATUS_RTK_FLOAT. Status 2 maps to RTK_FIXED. Setting `min_fix_type: 3` will silently starve the filter. Use 2 or 4 as meaningful thresholds.
@@ -297,20 +299,25 @@ Coast mode solves this by inflating `Q_position` by `gnss.coast_q_factor` during
 
 **2. Let encoder WZ correct heading bias faster**
 
-During GPS absence, heading errors accumulate at `gyro_bias * time` with no GPS heading cross-covariance to correct them. Coast mode inflates `Q_gyro_bias` by `gnss.coast_q_bias_factor` (default 100x) to loosen the filter's confidence in its current bias estimate. Simultaneously, `R_imu[WZ,WZ]` is inflated by `gnss.coast_imu_wz_scale` (default 500x) to down-weight the IMU heading rate and let encoder WZ dominate heading integration. Together these allow the filter to rapidly re-estimate gyro bias from encoder WZ readings during the blackout, rather than letting a stale bias estimate silently corrupt heading.
+During GPS absence, heading errors accumulate at `gyro_bias * time` with no GPS heading cross-covariance to correct them. Coast mode inflates `Q_gyro_bias` by `gnss.coast_q_bias_factor` (default 100x) to loosen the filter's confidence in its current bias estimate. `R_imu[WZ,WZ]` can optionally be inflated by `gnss.coast_imu_wz_scale` (default 1.0, disabled) to down-weight the IMU heading rate and let encoder WZ dominate heading integration. When enabled (values of 200-1000x are typical for outdoor robots), the filter rapidly re-estimates gyro bias from encoder WZ readings during the blackout instead of letting a stale bias estimate silently corrupt heading. Leave at 1.0 if you trust your IMU gyro over your encoder during blackouts, or if you have no wheel encoder.
 
 **Coast mode triggers:**
-- After `gnss.coast_n` consecutive GPS rejections (default: 3)
-- After `gnss.coast_timeout_s` seconds of GPS silence (handles receiver-silent outages where no fixes arrive to reject)
+- After `gnss.coast_n` consecutive GPS rejections (default: 5)
+- After `gnss.coast_timeout_s` seconds of GPS silence (default: 0.0, disabled; set to 30.0 to catch receiver-silent outages where no fixes arrive to reject)
 
 **Coast mode exits** when the first GPS fix passes the chi2 gate after the blackout ends. Process noise returns to normal immediately.
 
 ```yaml
-gnss.coast_n: 3                 # rejections before entering coast
-gnss.coast_q_factor: 10.0       # position Q multiplier during coast
-gnss.coast_q_bias_factor: 100.0 # gyro bias Q multiplier during coast
-gnss.coast_imu_wz_scale: 500.0  # R_imu[WZ] multiplier: encoder dominates heading
-gnss.coast_timeout_s: 30.0      # also enter coast if GPS silent this long
+# Defaults:
+gnss.coast_n: 5                  # consecutive rejections before entering coast
+gnss.coast_q_factor: 20.0        # position Q multiplier during coast
+gnss.coast_q_bias_factor: 100.0  # gyro bias Q multiplier during coast
+gnss.coast_imu_wz_scale: 1.0     # R_imu[WZ] multiplier (1.0 = no effect, disabled)
+gnss.coast_timeout_s: 0.0        # silence-based entry (0.0 = disabled)
+
+# Recommended additions for outdoor robots with frequent GPS blackouts:
+# gnss.coast_imu_wz_scale: 500.0  # encoder dominates heading during blackout
+# gnss.coast_timeout_s: 30.0      # enter coast if GPS receiver goes silent (no fixes to reject)
 ```
 
 **Choosing coast_q_factor**
@@ -319,7 +326,7 @@ This parameter controls a tradeoff:
 - Too high (200+): P grows so large that even outlier GPS fixes (100-800m off) may pass chi2 during recovery
 - Too low (1.0-2.0): P may not grow enough for legitimate drift corrections to pass chi2 after long blackouts
 
-The NCLT benchmarks use `coast_q_factor: 10.0`. After the 228s first blackout in 2012-08-20, sigma_xy = 48m, which accepts drift corrections up to 193m but rejects outliers 840m off (chi2 = 306 >> threshold 16.27). After the 461s blackout in 2012-06-15, sigma_xy = 68m, which accepts drift corrections up to 274m.
+The NCLT benchmarks were run with `coast_q_factor: 10.0` (conservative, below the default of 20.0). After the 228s first blackout in 2012-08-20, sigma_xy = 48m, which accepts drift corrections up to 193m but rejects outliers 840m off (chi2 = 306 >> threshold 16.27). After the 461s blackout in 2012-06-15, sigma_xy = 68m, which accepts drift corrections up to 274m. At the default of 20.0, P grows faster and the recovery window is wider.
 
 ---
 
@@ -333,9 +340,9 @@ FusionCore stores a ring buffer of 100 IMU messages (1 second at 100 Hz). When a
 
 For wheeled ground robots, FusionCore fuses three pseudo-measurements on every encoder callback. Each one targets a different part of the state vector.
 
-**VZ = 0 (vertical velocity):** The robot cannot move vertically, so body-frame vertical velocity must be zero. This is the primary constraint. Noise sigma: 0.1 m/s.
+**VZ = 0 (vertical velocity):** The robot cannot move vertically, so body-frame vertical velocity must be zero. This is the primary constraint. The noise sigma starts at `ground_constraint.vz_sigma` (default 0.1 m/s) and adapts upward automatically when the robot traverses obstacles, curbs, or rough terrain where the chassis genuinely has transient vertical motion. On flat ground it relaxes back to the configured floor. No config changes needed between terrain types.
 
-**AZ = 0 (vertical acceleration):** Without this, a small mismatch between the IMU's local gravity reading and the WGS84 constant (9.80665 m/s²) leaks into the AZ state. Because the UKF process noise on acceleration is large, AZ absorbs the residual. AZ then integrates into VZ via the motion model, so the VZ=0 constraint above cannot fully compensate on its own. Constraining AZ directly eliminates the source of the leak. Noise sigma: 0.5 m/s².
+**AZ = 0 (vertical acceleration):** Without this, a small mismatch between the IMU's local gravity reading and the WGS84 constant (9.80665 m/s²) leaks into the AZ state. Because the UKF process noise on acceleration is large, AZ absorbs the residual. AZ then integrates into VZ via the motion model, so the VZ=0 constraint above cannot fully compensate on its own. Constraining AZ directly eliminates the source of the leak. The noise sigma starts at `ground_constraint.az_sigma` (default 0.5 m/s²) and adapts the same way as VZ.
 
 **Z position = 0 (optional, flat-terrain mode):** On flat terrain with GPS, GPS altitude corrections carry significant noise (typically 3-5m standard deviation). This noise causes Z position to oscillate, which adds to 3D ATE even when the robot is actually on flat ground. When `ground_constraint.z_position_sigma` is set to a positive value (recommended: 0.3m for known-flat terrain), FusionCore fuses a Z = 0 pseudo-measurement tight enough to dominate GPS altitude noise and keep the filter grounded.
 
@@ -361,11 +368,128 @@ FusionCore tracks the last update time for each sensor independently. If a senso
 
 ## Message covariances
 
+### Input covariances
+
 FusionCore uses the covariance values sensors actually publish rather than ignoring them:
 
 - GPS: full 3×3 matrix when `position_covariance_type == 3`
 - Wheel odometry: reads `twist.covariance` per-axis
 - IMU orientation: reads `orientation_covariance` from the message
+
+### Output covariance: pose.covariance
+
+FusionCore publishes `nav_msgs/Odometry` on `/fusion/odom`. The `pose.covariance` field is a 6×6 row-major matrix following the ROS convention: `[x, y, z, roll, pitch, yaw]`. The orientation block (rows and columns 3, 4, 5) must contain variances in Euler angle space, not quaternion component space.
+
+The UKF tracks orientation as a unit quaternion `(qw, qx, qy, qz)` and maintains a 23×23 covariance matrix P in quaternion space. Placing `P(QX,QX)`, `P(QY,QY)`, `P(QZ,QZ)` directly into the orientation block would be wrong: for a robot driving flat with a small yaw uncertainty σ_yaw, `qz = sin(yaw/2) ≈ yaw/2`, so `P(QZ,QZ) ≈ σ_yaw²/4`. Nav2 AMCL reads `pose.covariance[35]` as the yaw variance for particle resampling; it would receive a number four times too small at small angles and increasingly wrong as orientation changes.
+
+FusionCore instead computes the analytical 3×4 Jacobian `J = d(roll,pitch,yaw)/d(qw,qx,qy,qz)` at the current quaternion and propagates:
+
+```
+C_euler     = J · P_quat(4×4) · Jᵀ       ← 3×3 Euler angle covariance
+C_pos_euler = P_pos_quat(3×4) · Jᵀ       ← 3×3 position–Euler cross-covariance
+```
+
+The full 6×6 `pose.covariance` is then assembled as:
+
+```
+[ P_pos(3×3)       C_pos_euler(3×3) ]
+[ C_pos_euler(3×3)ᵀ  C_euler(3×3)  ]
+```
+
+This gives Nav2, AMCL, slam_toolbox, and any other consumer the correct yaw (and roll/pitch) variance, including all cross-correlation terms between position and orientation.
+
+**Gimbal lock:** At pitch = ±90°, all three Euler Jacobian denominators go to zero simultaneously: roll and yaw become undefined and the Jacobian is singular. FusionCore clamps all three denominators to a minimum of 1e-12, producing large-but-finite covariance rather than NaN. This is the mathematically correct behavior: at the singularity the filter genuinely does not know the roll–yaw decomposition, and the inflated covariance communicates that uncertainty correctly to downstream consumers.
+
+---
+
+## Observability: seeing inside the filter
+
+The most common question when setting up a sensor fusion filter is "why did that GPS fix get rejected?" or "is the filter actually converging?" Before, FusionCore logged a generic warning and you had to guess. Now every GPS fix, accepted or rejected, produces a structured message on `/fusion/debug/gnss_status` that tells you exactly what happened.
+
+### Why a GPS fix gets rejected
+
+When a GPS fix arrives, FusionCore runs two checks in order. If either check fails, the fix is dropped and the reason is recorded.
+
+**Check 1: Quality gate**
+
+Before any math runs, FusionCore looks at the fix metadata:
+
+- Is `hdop` above `gnss.max_hdop` (default 4.0)? If yes: `HDOP_HIGH`, drop it.
+- Is `satellites` below `gnss.min_satellites` (default 4)? If yes: `MIN_SATS`, drop it.
+- Is `fix_type` below `gnss.min_fix_type` (default GPS_FIX)? If yes: `FIX_TYPE_LOW`, drop it.
+
+When a quality gate fails, `mahalanobis_sq` is set to -1.0. The chi-squared math never ran.
+
+**Check 2: Mahalanobis gate (chi-squared)**
+
+If the fix passes quality checks, FusionCore computes how statistically surprising it is given the filter's current belief:
+
+```
+d² = ν^T · S^-1 · ν
+```
+
+where `ν` is the difference between what the GPS reported and what the filter predicted, and `S` is the innovation covariance (how uncertain that prediction was). If `d²` exceeds 16.27 (the 99.9th percentile of a chi-squared distribution with 3 degrees of freedom), the fix is rejected as a statistical outlier. The rejection reason is `CHI2_FAILED`.
+
+This is the gate that catches GPS spikes, multipath jumps, and fixes that arrive when the filter has drifted far from reality during a blackout.
+
+### What the Mahalanobis distance tells you
+
+Think of it this way: if `mahalanobis_sq` is 4.3 and the threshold is 16.27, the fix was well within the acceptance region and fused normally. If it's 847.3, the fix was roughly 53 times the acceptance boundary: almost certainly a GPS spike or severe multipath.
+
+A rising `mahalanobis_sq` that stays just below the threshold is a warning sign: GPS quality is degrading and fixes are being accepted that are increasingly noisy. The adaptive noise system will compensate, but it is a good prompt to check the GPS antenna environment.
+
+### The two debug topics
+
+**/fusion/debug/gnss_status** fires on every GPS fix:
+
+```bash
+ros2 topic echo /fusion/debug/gnss_status
+```
+
+```yaml
+accepted: false
+rejection_reason: CHI2_FAILED
+mahalanobis_sq: 847.3
+chi2_threshold: 16.27
+hdop: 1.2
+satellites: 8
+in_coast_mode: false
+position_sigma_x: 2.4
+position_sigma_y: 2.4
+```
+
+**/fusion/debug/filter_health** fires at 1 Hz with the overall filter state:
+
+```bash
+ros2 topic echo /fusion/debug/filter_health
+```
+
+```yaml
+gnss_innovation_norm: 1.2      # meters: how far GPS fixes have been from predictions
+imu_innovation_norm: 0.08      # how far IMU readings have been from predictions
+encoder_innovation_norm: 0.3   # same for wheel encoders
+position_sigma_x: 1.4          # 1-sigma position uncertainty right now (meters)
+position_sigma_y: 1.4
+heading_sigma_deg: 3.2         # heading uncertainty (degrees)
+heading_validated: true
+heading_source: GPS_TRACK
+gnss_in_coast: false
+gnss_consecutive_rejects: 0
+distance_traveled_m: 47.3
+gnss_outlier_count: 3
+```
+
+### What these numbers look like when the filter is healthy
+
+**Position sigma** starts large (you set it at 30-50m in the initial covariance), drops rapidly as the first few GPS fixes arrive, then slowly grows during GPS blackouts and drops again on recovery. A plot of `position_sigma_x` over time should look like a sawtooth that trends downward as the filter learns the robot's motion.
+
+**Innovation norms** should be roughly stable during normal operation. A sudden spike in `gnss_innovation_norm` followed by a return to baseline is exactly what good GPS outlier rejection looks like. The spike means a bad fix arrived, the filter rejected it (check `gnss_status.rejection_reason`), and position continued from inertial prediction until GPS recovered.
+
+**`heading_sigma_deg`** starts large and drops once the robot has traveled 5 m in a consistent direction and GPS track heading fires for the first time. If it stays large, the robot may not have moved enough, or may be turning a lot. Once it drops below ~10 degrees, the filter has a reliable heading estimate and lever arm correction activates.
+
+### No new dependencies
+
+These topics use standard ROS 2 machinery. `GnssStatus` and `FilterHealth` are custom message types defined inside `fusioncore_ros` itself. No external visualization tool is required. Any tool that can subscribe to a ROS 2 topic can read them: `ros2 topic echo`, `rqt_plot`, PlotJuggler, Foxglove, or your own Python script.
 
 ---
 
