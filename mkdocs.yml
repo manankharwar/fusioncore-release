@@ -44,6 +44,14 @@ markdown_extensions:
 
 plugins:
   - search
+  - blog:
+      blog_dir: blog
+      post_url_format: "{slug}"
+      archive: false
+      categories: false
+      authors: false
+      post_excerpt: required
+  - tags
 
 nav:
   - Home: index.md
@@ -53,14 +61,17 @@ nav:
     - Overview & Configs: hardware/index.md
     - Indoor / Wheels only (no GPS): hardware/wheels-indoor.md
     - Indoor / LiDAR ICP (no GPS): hardware/icp-indoor.md
+    - Visual SLAM + IMU (no GPS): hardware/vslam-imu.md
     - Ackermann / Car-like Robots: hardware/ackermann.md
     - Environment Presets: hardware/environment-presets.md
   - Nav2 Integration: nav2.md
   - Simulation: simulation.md
+  - FusionCore vs robot_localization: vs-robot-localization.md
   - Migrating from robot_localization: migration_from_robot_localization.md
   - How It Works: how-it-works.md
   - Troubleshooting: troubleshooting.md
   - Known Limitations: known-limitations.md
+  - Blog: blog/index.md
   - Reference:
     - Topics & TF: reference/topics.md
     - Benchmark Results: reference/benchmark.md

@@ -1,9 +1,9 @@
 # FusionCore
 
 [![CI](https://github.com/manankharwar/fusioncore/actions/workflows/ci.yml/badge.svg)](https://github.com/manankharwar/fusioncore/actions/workflows/ci.yml)
+[![arXiv](https://img.shields.io/badge/arXiv-2605.25239-b31b1b)](https://arxiv.org/abs/2605.25239)
 [![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20091053-blue)](https://doi.org/10.5281/zenodo.20091053)
 [![Docs](https://img.shields.io/badge/docs-manankharwar.github.io%2Ffusioncore-blue)](https://manankharwar.github.io/fusioncore/)
-[![Paper](https://img.shields.io/badge/paper-arXiv%20preprint-b31b1b)](paper/fusioncore_arxiv.pdf)
 [![Newsletter](https://img.shields.io/badge/newsletter-subscribe-orange)](https://manankharwar.substack.com)
 
 **ROS 2 UKF sensor fusion for robots that run in the real world. IMU + wheel encoders + GPS at 100 Hz. Handles bad calibration, timestamp jitter, delayed GPS, wheel slip, and ARM hardware out of the box. Apache 2.0.**
@@ -48,28 +48,6 @@ Inside the container, verify everything works:
 ```bash
 bash tools/quick_test.sh
 ```
-
----
-
-## Try it without hardware
-
-No ROS, no robot, 30 seconds:
-
-```bash
-git clone https://github.com/manankharwar/fusioncore && cd fusioncore
-pip install numpy matplotlib
-python3 tools/demo_quick.py --open
-```
-
-Shows two things from pre-baked NCLT benchmark data included in the repo:
-
-- **GPS spike rejection:** a 707 m corrupted GPS fix is injected at t=120 s. FusionCore's chi-squared gate blocks it (position moves 1 m). robot_localization EKF accepts it and deviates 50+ m before recovering.
-- **Overall accuracy:** FusionCore 5.6 m ATE vs RL-EKF 13.0 m ATE over a 600 s campus drive.
-
-<p align="center">
-  <img src="docs/assets/fig_spike_demo.png" alt="FusionCore GPS spike rejection demo: trajectory and error timeline" width="750">
-</p>
-
 ---
 
 ## Works on the hardware you actually have
@@ -120,9 +98,36 @@ The two FC losses are driven by a GPS data quality issue on 2012-08-20 (105 corr
 
 ---
 
-## Used by
+## Used on real hardware
 
-FusionCore is being tested or deployed on real hardware by members of the community. If you are using it on your robot, open an issue or leave a comment in [Discussions](https://github.com/manankharwar/fusioncore/discussions) and I will add you here.
+Real engineers, real robots, real sensor data. Not demos.
+
+> "The system was stable on real robot data and was relatively easy to configure. I was able to get reasonable behavior without spending excessive time on parameter tuning. The overall experience felt more deployment-oriented than research-demo-oriented."
+>
+> **Michał Bednarek** ([@mbed92](https://github.com/mbed92)), Robotics PhD
+> Factory differential-drive robot, ROS 2 Humble: Cartographer (point-cloud localization, no preloaded map) + wheel odometry + IMU
+
+<br>
+
+> "Having a go at using FusionCore in an agricultural field robot. Hopefully will have a robot moving in a month or two."
+>
+> **Sam** ([@samuk](https://github.com/samuk)), [Agroecology Lab](https://github.com/Agroecology-Lab/feldfreund_devkit_ros)
+> Outdoor agricultural robot, integration in progress
+
+> **Russ Hall**, Andino robot (Raspberry Pi)
+> OAK-D (stereo depth + IMU) + Velodyne VLP-16 + rtabmap: indoor SLAM mapping
+
+Running FusionCore on your robot? Drop a note in [Discussions #22](https://github.com/manankharwar/fusioncore/discussions/22) and I will add you here.
+
+---
+
+## In the ecosystem
+
+**rtabmap_ros (merged):** FusionCore is included as a named demo in the official [rtabmap_ros](https://github.com/introlab/rtabmap_ros) repository, maintained by @matlabbe. The demo ("Turtlebot3 Nav2, 2D LiDAR SLAM with FusionCore") shows FusionCore and icp_odometry running in a feedback loop: FusionCore's stable odom frame seeds scan matching via `guess_frame_id`, and the ICP result feeds back into FusionCore as a second velocity source. [View the demo](https://github.com/introlab/rtabmap_ros/tree/ros2/rtabmap_demos)
+
+**Stereolabs community:** FusionCore + ZED integration guide posted on the Stereolabs developer forum, acknowledged by Stereolabs support. Under active evaluation by [@privvyledge](https://github.com/privvyledge) comparing FusionCore against Wolf, TIER IV EagleEye, and robot_localization on two platforms: an F1/10 scale car (indoor, VESC + RealSense D435i) and a full-size autonomous van (GPS + ZED 2i + 360 LiDAR).
+
+**OpenMowerNext (integration in progress):** FusionCore is being integrated as the localization stack in [OpenMowerNext](https://github.com/jkaflik/OpenMowerNext), a community ROS 2 autonomous mowing system. The integration replaces robot_localization with a single FusionCore lifecycle node fusing RTK GPS (u-blox F9P), IMU, and wheel odometry, with ECEF datum calculated from the mower's home position. [PR #45](https://github.com/jkaflik/OpenMowerNext/pull/45)
 
 ---
 
@@ -132,7 +137,7 @@ If any of these have bitten you, FusionCore was built with them in mind:
 
 | robot_localization issue | What FusionCore does instead |
 |---|---|
-| UKF diverges with NaN on GPS-heavy sequences ([#780](https://github.com/cra-ros-pkg/robot_localization/issues/780), [#777](https://github.com/cra-ros-pkg/robot_localization/issues/777)) | Chi-squared gate on every sensor; covariance bounded at each step. All nine NCLT sequences finish without NaN. |
+| UKF diverges with NaN on GPS-heavy sequences ([#780](https://github.com/cra-ros-pkg/robot_localization/issues/780), [#777](https://github.com/cra-ros-pkg/robot_localization/issues/777)) | Chi-squared gate on every sensor; covariance bounded at each step. All twelve NCLT sequences finish without NaN. |
 | navsat_transform crashes at UTM zone boundaries ([#951](https://github.com/cra-ros-pkg/robot_localization/issues/951), [#904](https://github.com/cra-ros-pkg/robot_localization/issues/904)) | GPS fused directly in ECEF. No UTM projection, no zone boundary. |
 | No non-holonomic constraint for wheeled robots ([#744](https://github.com/cra-ros-pkg/robot_localization/issues/744)) | Built-in NHC: lateral and vertical velocity zeroed as a virtual measurement on every encoder update. |
 | Delayed sensor messages cause missed updates ([#911](https://github.com/cra-ros-pkg/robot_localization/issues/911)) | Rolling IMU buffer with retrodiction. Late GPS fixes replay missed IMU steps automatically (up to 500 ms). |
@@ -166,12 +171,24 @@ Apache 2.0.
 ## Citation
 
 ```bibtex
-@software{kharwar2026fusioncore,
+@article{kharwar2026fusioncore,
+  author  = {Kharwar, Manan},
+  title   = {FusionCore: A 23-State Unscented Kalman Filter for
+             IMU, Wheel Encoder, GPS, and Visual SLAM Fusion in ROS 2},
+  journal = {arXiv preprint arXiv:2605.25239},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2605.25239}
+}
+```
+
+If you prefer to cite the software release directly:
+
+```bibtex
+@software{kharwar2026fusioncore_software,
   author    = {Kharwar, Manan},
   title     = {FusionCore: ROS 2 UKF Sensor Fusion},
   year      = {2026},
   publisher = {Zenodo},
-  version   = {0.2.3},
   doi       = {10.5281/zenodo.20091053},
   url       = {https://doi.org/10.5281/zenodo.20091053}
 }
