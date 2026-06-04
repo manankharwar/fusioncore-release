@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fusioncore_ros VERSION 0.2.2)
+project(fusioncore_ros VERSION 0.3.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +11,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(geographic_msgs REQUIRED)
+find_package(gps_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
@@ -19,6 +20,7 @@ find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(fusioncore_core REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(PROJ QUIET)
 if(NOT PROJ_FOUND)
@@ -35,7 +37,9 @@ find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/FromLL.srv"
-  DEPENDENCIES geographic_msgs geometry_msgs
+  "msg/GnssStatus.msg"
+  "msg/FilterHealth.msg"
+  DEPENDENCIES geographic_msgs geometry_msgs std_msgs
 )
 
 add_executable(fusioncore_node
@@ -57,12 +61,14 @@ ament_target_dependencies(fusioncore_node
   nav_msgs
   geometry_msgs
   geographic_msgs
+  gps_msgs
   tf2
   tf2_ros
   tf2_geometry_msgs
   fusioncore_core
   compass_msgs
   diagnostic_msgs
+  std_msgs
   std_srvs
 )
 

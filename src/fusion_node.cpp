@@ -8,6 +8,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/nav_sat_status.hpp>
+#include <gps_msgs/msg/gps_fix.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <tf2_ros/transform_broadcaster.hpp>
@@ -23,6 +24,8 @@
 #include <diagnostic_msgs/msg/key_value.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include "fusioncore_ros/srv/from_ll.hpp"
+#include "fusioncore_ros/msg/gnss_status.hpp"
+#include "fusioncore_ros/msg/filter_health.hpp"
 #include <mutex>
 #include <optional>
 #include <set>
@@ -149,6 +152,14 @@ public:
     // Set to empty string to disable (use sensor_msgs/Imu heading instead)
     declare_parameter("gnss.azimuth_topic", "");
 
+    // Subscribe to /gnss/fix as gps_msgs/GPSFix instead of sensor_msgs/NavSatFix.
+    // GPSFix carries RTK_FLOAT status (unreachable via NavSatFix), separate hdop/vdop
+    // from the receiver, satellites_used, and err_horz/err_vert position bounds.
+    // Required when your GNSS driver publishes gps_msgs/GPSFix (e.g. nmea_navsat_driver
+    // with fix_type=RTK_FLOAT or ublox_dgnss in GPSFix mode).
+    // Set false (default) to use sensor_msgs/NavSatFix: works with all receivers.
+    declare_parameter("gnss.use_gps_fix", false);
+
     // Antenna lever arm params: primary receiver
     declare_parameter("gnss.lever_arm_x", 0.0);
     declare_parameter("gnss.lever_arm_y", 0.0);
@@ -201,12 +212,16 @@ public:
     declare_parameter("gnss.track_heading_enabled",   true);
     declare_parameter("gnss.track_heading_min_dist",  5.0);
     declare_parameter("gnss.track_heading_max_sigma", 0.4);
+    declare_parameter("gnss.track_heading_min_speed",    0.2);
+    declare_parameter("gnss.track_heading_max_yaw_rate", 0.3);
+    declare_parameter("gnss.lever_arm_max_heading_sigma_deg", 20.0);
 
-    declare_parameter("adaptive.imu",     true);
-    declare_parameter("adaptive.encoder", true);
-    declare_parameter("adaptive.gnss",    true);
-    declare_parameter("adaptive.window",  50);
-    declare_parameter("adaptive.alpha",   0.01);
+    declare_parameter("adaptive.imu",               true);
+    declare_parameter("adaptive.encoder",           true);
+    declare_parameter("adaptive.gnss",              true);
+    declare_parameter("adaptive.ground_constraint", true);
+    declare_parameter("adaptive.window",            50);
+    declare_parameter("adaptive.alpha",             0.01);
 
     // Zero-velocity update (ZUPT)
     // When encoder velocity and IMU angular rate are both below threshold,
@@ -215,6 +230,29 @@ public:
     declare_parameter("zupt.velocity_threshold", 0.05);  // m/s
     declare_parameter("zupt.angular_threshold",  0.05);  // rad/s
     declare_parameter("zupt.noise_sigma",        0.01);  // m/s: tight
+
+    // Lateral velocity NHC: how strongly to enforce VY=0 (m/s sigma).
+    // 0.05 (default): standard differential drive on good surface.
+    // 10.0+: effectively disabled, use for mecanum/omnidirectional robots.
+    // 0.3-1.0: Ackermann robots or slippery surfaces with real lateral slip.
+    declare_parameter("encoder.nhc_vy_sigma", 0.05);
+
+    // Auto-detect holonomic (mecanum/omnidirectional) robots at runtime.
+    // When true, FusionCore watches the encoder VY field. If VY is consistently
+    // non-zero, the robot is identified as holonomic and the VY=0 NHC is
+    // disabled automatically within ~0.1s of the first lateral motion.
+    // No config change needed. Set to false only if auto-detect causes problems.
+    declare_parameter("encoder.nhc_auto_detect", true);
+
+    // Body-frame vertical velocity constraint (VZ=0) tightness (m/s sigma).
+    // 0.1 (default): fine for flat floors and mild terrain.
+    // 0.3-1.0: robots traversing curbs, obstacles, or rough outdoor terrain.
+    declare_parameter("ground_constraint.vz_sigma", 0.1);
+
+    // Body-frame vertical acceleration constraint (AZ=0) tightness (m/s² sigma).
+    // 0.5 (default): loose enough for bumps and ramps.
+    // 2.0+: aggressive terrain where real vertical accelerations occur.
+    declare_parameter("ground_constraint.az_sigma", 0.5);
 
     // Flat-terrain Z position constraint. 0.0 = disabled (default).
     // Set to ~0.3 for campus/parking-lot/warehouse deployments where
@@ -266,6 +304,7 @@ public:
     heading_topic_ = get_parameter("gnss.heading_topic").as_string();
     gnss2_topic_    = get_parameter("gnss.fix2_topic").as_string();
     azimuth_topic_  = get_parameter("gnss.azimuth_topic").as_string();
+    use_gps_fix_    = get_parameter("gnss.use_gps_fix").as_bool();
 
     fusioncore::FusionCoreConfig config;
 
@@ -289,8 +328,10 @@ public:
     imu2_remove_gravity_ = get_parameter("imu2.remove_gravitational_acceleration").as_bool();
 
     config.encoder.vel_noise_x  = get_parameter("encoder.vel_noise").as_double();
-    config.encoder.vel_noise_y  = config.encoder.vel_noise_x;
+    config.encoder.vel_noise_y  = get_parameter("encoder.nhc_vy_sigma").as_double();
     config.encoder.vel_noise_wz = get_parameter("encoder.yaw_noise").as_double();
+    nhc_auto_detect_    = get_parameter("encoder.nhc_auto_detect").as_bool();
+    nhc_vy_auto_noise_  = config.encoder.vel_noise_x;  // VY noise proxy for holonomic robots
 
     encoder2_topic_     = get_parameter("encoder2.topic").as_string();
     enc2_vel_noise_     = get_parameter("encoder2.vel_noise").as_double();
@@ -374,15 +415,20 @@ public:
     config.gnss_recovery_rejection_n  = get_parameter("gnss.recovery_rejection_n").as_int();
     config.gnss_p_inflate_sigma       = get_parameter("gnss.p_inflate_sigma").as_double();
     config.gnss_recovery_timeout_s    = get_parameter("gnss.recovery_timeout_s").as_double();
-    config.gps_track_heading_enabled   = get_parameter("gnss.track_heading_enabled").as_bool();
-    config.gps_track_heading_min_dist  = get_parameter("gnss.track_heading_min_dist").as_double();
-    config.gps_track_heading_max_sigma = get_parameter("gnss.track_heading_max_sigma").as_double();
+    config.gps_track_heading_enabled       = get_parameter("gnss.track_heading_enabled").as_bool();
+    config.gps_track_heading_min_dist      = get_parameter("gnss.track_heading_min_dist").as_double();
+    config.gps_track_heading_max_sigma     = get_parameter("gnss.track_heading_max_sigma").as_double();
+    config.gps_track_heading_min_speed     = get_parameter("gnss.track_heading_min_speed").as_double();
+    config.gps_track_heading_max_yaw_rate  = get_parameter("gnss.track_heading_max_yaw_rate").as_double();
+    config.gnss_lever_arm_max_heading_sigma_deg =
+      get_parameter("gnss.lever_arm_max_heading_sigma_deg").as_double();
 
-    config.adaptive_imu     = get_parameter("adaptive.imu").as_bool();
-    config.adaptive_encoder = get_parameter("adaptive.encoder").as_bool();
-    config.adaptive_gnss    = get_parameter("adaptive.gnss").as_bool();
-    config.adaptive_window  = get_parameter("adaptive.window").as_int();
-    config.adaptive_alpha   = get_parameter("adaptive.alpha").as_double();
+    config.adaptive_imu               = get_parameter("adaptive.imu").as_bool();
+    config.adaptive_encoder           = get_parameter("adaptive.encoder").as_bool();
+    config.adaptive_gnss              = get_parameter("adaptive.gnss").as_bool();
+    config.adaptive_ground_constraint = get_parameter("adaptive.ground_constraint").as_bool();
+    config.adaptive_window            = get_parameter("adaptive.window").as_int();
+    config.adaptive_alpha             = get_parameter("adaptive.alpha").as_double();
 
     config.ukf.q_position   = get_parameter("ukf.q_position").as_double();
     config.ukf.q_orientation  = get_parameter("ukf.q_orientation").as_double();
@@ -405,7 +451,10 @@ public:
     zupt_angular_threshold_  = get_parameter("zupt.angular_threshold").as_double();
     zupt_noise_sigma_        = get_parameter("zupt.noise_sigma").as_double();
 
-    config.ground_z_position_sigma = get_parameter("ground_constraint.z_position_sigma").as_double();
+    config.encoder_nhc_vy_sigma        = get_parameter("encoder.nhc_vy_sigma").as_double();
+    config.ground_constraint_vz_sigma  = get_parameter("ground_constraint.vz_sigma").as_double();
+    config.ground_constraint_az_sigma  = get_parameter("ground_constraint.az_sigma").as_double();
+    config.ground_z_position_sigma     = get_parameter("ground_constraint.z_position_sigma").as_double();
 
     init_window_duration_    = get_parameter("init.stationary_window").as_double();
     wait_for_all_sensors_    = get_parameter("init.wait_for_all_sensors").as_bool();
@@ -540,12 +589,23 @@ public:
         "Radar Doppler velocity fusion enabled on topic: %s", radar_vel_topic_.c_str());
     }
 
-    gnss_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
-      "/gnss/fix", 10,
-      [this](const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
-        std::lock_guard<std::mutex> lock(fc_mutex_);
-        gnss_callback(msg, 0);
-      }, sensor_opts);
+    if (use_gps_fix_) {
+      gps_fix_sub_ = create_subscription<gps_msgs::msg::GPSFix>(
+        "/gnss/fix", 10,
+        [this](const gps_msgs::msg::GPSFix::SharedPtr msg) {
+          std::lock_guard<std::mutex> lock(fc_mutex_);
+          gps_fix_callback(msg, 0);
+        }, sensor_opts);
+      RCLCPP_INFO(get_logger(),
+        "GNSS: using gps_msgs/GPSFix on /gnss/fix (RTK_FLOAT capable)");
+    } else {
+      gnss_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
+        "/gnss/fix", 10,
+        [this](const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
+          std::lock_guard<std::mutex> lock(fc_mutex_);
+          gnss_callback(msg, 0);
+        }, sensor_opts);
+    }
 
     // compass_msgs/Azimuth heading: optional, preferred over sensor_msgs/Imu
     if (!azimuth_topic_.empty()) {
@@ -585,9 +645,11 @@ public:
         "Subscribed to dual antenna heading: %s", heading_topic_.c_str());
     }
 
-    odom_pub_  = create_publisher<nav_msgs::msg::Odometry>("/fusion/odom", 100);
-    pose_pub_  = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("/fusion/pose", 100);
-    diag_pub_  = create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
+    odom_pub_          = create_publisher<nav_msgs::msg::Odometry>("/fusion/odom", 100);
+    pose_pub_          = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("/fusion/pose", 100);
+    diag_pub_          = create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
+    gnss_status_pub_   = create_publisher<fusioncore_ros::msg::GnssStatus>("/fusion/debug/gnss_status", 10);
+    filter_health_pub_ = create_publisher<fusioncore_ros::msg::FilterHealth>("/fusion/debug/filter_health", 10);
 
     auto period = std::chrono::duration<double>(1.0 / publish_rate_);
     publish_timer_ = create_wall_timer(
@@ -769,6 +831,7 @@ public:
     gnss_vel_sub_.reset();
     radar_vel_sub_.reset();
     gnss_sub_.reset();
+    gps_fix_sub_.reset();
     gnss2_sub_.reset();
     gnss_heading_sub_.reset();
     azimuth_sub_.reset();
@@ -784,6 +847,8 @@ public:
     odom_pub_.reset();
     pose_pub_.reset();
     diag_pub_.reset();
+    gnss_status_pub_.reset();
+    filter_health_pub_.reset();
     deinit_proj();
     RCLCPP_INFO(get_logger(), "FusionCore deactivated.");
     return CallbackReturn::SUCCESS;
@@ -1303,6 +1368,35 @@ private:
     const double vy = msg->twist.twist.linear.y;
     const double wz = msg->twist.twist.angular.z;
 
+    // Auto-detect holonomic (mecanum/omnidirectional) robots.
+    // The outlier gate cannot distinguish "large VY innovation from a wrong NHC"
+    // from "genuine encoder spike": it rejects valid lateral motion and leaves
+    // the filter uncorrected during every sideways move.
+    // Detection: watch the raw encoder VY. If it is consistently non-zero,
+    // the robot genuinely moves laterally and the VY=0 NHC must not apply.
+    // This runs before update_encoder so var_vy is correct before the gate fires.
+    if (nhc_auto_detect_) {
+      if (std::abs(vy) > kNhcDetectVyThreshold_) {
+        ++nhc_nonzero_vy_count_;
+        if (!nhc_holonomic_detected_ && nhc_nonzero_vy_count_ >= kNhcDetectN_) {
+          nhc_holonomic_detected_ = true;
+          RCLCPP_INFO(get_logger(),
+            "NHC auto-detect: lateral motion detected (VY=%.3f m/s). "
+            "Disabling VY=0 constraint. Robot identified as holonomic.", vy);
+        }
+      } else {
+        nhc_nonzero_vy_count_ = 0;
+      }
+    }
+
+    // When holonomic and no message covariance for VY: inject VX noise as the
+    // VY variance so the encoder update passes the outlier gate. Without this,
+    // a 0.5 m/s lateral move with nhc_vy_sigma=0.05 is a 10-sigma deviation:
+    // the gate rejects the whole update and position goes uncorrected.
+    if (nhc_holonomic_detected_ && var_vy <= 0.0) {
+      var_vy = nhc_vy_auto_noise_ * nhc_vy_auto_noise_;
+    }
+
     fc_->update_encoder(t, vx, vy, wz, var_vx, var_vy, var_wz);
 
     // Non-holonomic ground constraint: wheeled robots cannot move vertically.
@@ -1450,7 +1544,7 @@ private:
         vslam_offset_z_ = s.x[fusioncore::Z] - raw_z;
         vslam_consecutive_rejects_ = 0;
         RCLCPP_WARN(get_logger(),
-          "VSLAM: %d consecutive rejections — reinitialization detected. "
+          "VSLAM: %d consecutive rejections: reinitialization detected. "
           "Re-anchoring map origin. new offset=(%.3f, %.3f, %.3f)",
           vslam_reinit_n_, vslam_offset_x_, vslam_offset_y_, vslam_offset_z_);
       }
@@ -1644,16 +1738,191 @@ private:
     }
 
     bool accepted = fc_->update_gnss(t, fix);
+    const auto& dbg = fc_->get_gnss_debug();
+
     if (!accepted) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "GNSS fix rejected (fix_type=%d, min=%d, hdop=%.2f, "
-        "quality check or Mahalanobis gate)",
-        static_cast<int>(fix.fix_type),
-        static_cast<int>(min_fix_type_),
-        fix.hdop);
+        "GNSS fix rejected: %s (hdop=%.2f, d2=%.1f, threshold=%.1f)",
+        gnss_reason_str(dbg.reason).c_str(),
+        fix.hdop,
+        dbg.mahalanobis_sq,
+        dbg.chi2_threshold);
     }
 
-    // Log heading observability status
+    publish_gnss_status(rclcpp::Time(msg->header.stamp));
+
+    auto fc_status = fc_->get_status();
+    if (!fc_status.heading_validated) {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Heading not yet validated: lever arm inactive. "
+        "Distance traveled: %.1fm (need %.1fm), or provide dual antenna / IMU orientation.",
+        fc_status.distance_traveled,
+        5.0);
+    }
+  }
+
+  // ─── GPSFix callback ──────────────────────────────────────────────────────
+  // Handles gps_msgs/GPSFix when gnss.use_gps_fix: true.
+  // Advantages over NavSatFix:
+  //   - RTK_FLOAT status (status 20) is expressible; NavSatFix can only reach RTK_FIXED.
+  //   - Receiver-native hdop/vdop fields for direct DOP-scaled noise.
+  //   - satellites_used for the quality gate.
+  //   - err_horz/err_vert (95% CI bounds) as a fallback covariance source.
+
+  void gps_fix_callback(const gps_msgs::msg::GPSFix::SharedPtr msg, int source_id = 0)
+  {
+    if (source_id == 0) mark_sensor_received("GNSS");
+    else                mark_sensor_received("GNSS2");
+    if (!fc_->is_initialized()) return;
+
+    if (msg->status.status < 0) return;
+
+    double t = rclcpp::Time(msg->header.stamp).seconds();
+
+    fusioncore::sensors::LLAPoint lla;
+    lla.lat_rad = msg->latitude  * M_PI / 180.0;
+    lla.lon_rad = msg->longitude * M_PI / 180.0;
+    lla.alt_m   = msg->altitude;
+
+    fusioncore::sensors::ECEFPoint ecef;
+    gnss_to_output(lla, ecef);
+
+    if (!gnss_ref_set_) {
+      gnss_ref_lla_  = lla;
+      gnss_ref_ecef_ = ecef;
+      gnss_ref_set_  = true;
+      RCLCPP_INFO(get_logger(), "GNSS reference set (GPSFix): lat=%.6f lon=%.6f",
+        msg->latitude, msg->longitude);
+    }
+
+    {
+      double dx = ecef.x - gnss_ref_ecef_.x;
+      double dy = ecef.y - gnss_ref_ecef_.y;
+      double dz = ecef.z - gnss_ref_ecef_.z;
+      if (std::sqrt(dx*dx + dy*dy + dz*dz) > 10000.0) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "GPSFix dropped: more than 10km from reference (hardware glitch)");
+        return;
+      }
+    }
+
+    Eigen::Vector3d enu;
+    if (convert_to_enu_at_reference_) {
+      enu = fusioncore::sensors::ecef_to_enu(ecef, gnss_ref_ecef_, gnss_ref_lla_);
+    } else {
+      enu = Eigen::Vector3d(ecef.x - gnss_ref_ecef_.x,
+                            ecef.y - gnss_ref_ecef_.y,
+                            ecef.z - gnss_ref_ecef_.z);
+    }
+
+    fusioncore::sensors::GnssFix fix;
+    fix.x = enu[0];
+    fix.y = enu[1];
+    fix.z = enu[2];
+    fix.source_id = source_id;
+    fix.lever_arm = (source_id == 0) ? gnss_lever_arm_ : gnss_lever_arm2_;
+
+    // gps_msgs/GPSStatus constants:
+    //   STATUS_NO_FIX=-1, STATUS_FIX=0, STATUS_SBAS_FIX=1, STATUS_GBAS_FIX=2
+    //   STATUS_DGPS_FIX=18, STATUS_RTK_FIX=19, STATUS_RTK_FLOAT=20
+    using S = gps_msgs::msg::GPSStatus;
+    switch (msg->status.status) {
+      case S::STATUS_RTK_FIX:
+        fix.fix_type = fusioncore::sensors::GnssFixType::RTK_FIXED; break;
+      case S::STATUS_RTK_FLOAT:
+        fix.fix_type = fusioncore::sensors::GnssFixType::RTK_FLOAT; break;
+      case S::STATUS_GBAS_FIX:
+        fix.fix_type = fusioncore::sensors::GnssFixType::RTK_FIXED; break;
+      case S::STATUS_DGPS_FIX:
+      case S::STATUS_SBAS_FIX:
+        fix.fix_type = fusioncore::sensors::GnssFixType::DGPS_FIX; break;
+      default:
+        fix.fix_type = fusioncore::sensors::GnssFixType::GPS_FIX; break;
+    }
+
+    // satellites_used is directly available in GPSFix (NavSatFix has no equivalent).
+    fix.satellites = (msg->status.satellites_used > 0)
+      ? static_cast<int>(msg->status.satellites_used) : 4;
+
+    // Covariance priority:
+    //   1. Full 3x3 from position_covariance_type==3 (most accurate)
+    //   2. Diagonal from position_covariance_type>=1
+    //   3. err_horz/err_vert (95% CI from receiver): construct a diagonal covariance
+    //   4. Receiver hdop/vdop: actual DOP values, scale with base_noise in the core
+    //   5. Defaults
+
+    constexpr double kMinVarXY = 4e-4;   // sigma = 0.02 m
+    constexpr double kMinVarZ  = 2.5e-3; // sigma = 0.05 m
+
+    if (msg->position_covariance_type == gps_msgs::msg::GPSFix::COVARIANCE_TYPE_KNOWN) {
+      Eigen::Matrix3d cov;
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+          cov(i, j) = msg->position_covariance[i*3 + j];
+      if (cov(0,0) > 0.0 && cov(1,1) > 0.0 && cov(2,2) > 0.0) {
+        if (cov(0,0) < kMinVarXY) cov(0,0) = kMinVarXY;
+        if (cov(1,1) < kMinVarXY) cov(1,1) = kMinVarXY;
+        if (cov(2,2) < kMinVarZ)  cov(2,2) = kMinVarZ;
+        fix.has_full_covariance = true;
+        fix.full_covariance = cov;
+        fix.hdop = std::sqrt((cov(0,0) + cov(1,1)) / 2.0);
+        fix.vdop = std::sqrt(cov(2,2));
+      } else {
+        fix.hdop = 1.5;
+        fix.vdop = 2.0;
+      }
+    } else if (msg->position_covariance_type >= gps_msgs::msg::GPSFix::COVARIANCE_TYPE_APPROXIMATED) {
+      double var_xy = (msg->position_covariance[0] + msg->position_covariance[4]) / 2.0;
+      if (var_xy < kMinVarXY) var_xy = kMinVarXY;
+      double var_z = msg->position_covariance[8];
+      if (var_z < kMinVarZ) var_z = kMinVarZ;
+      if (var_xy > 0.0 && var_z > 0.0) {
+        fix.hdop = std::sqrt(var_xy);
+        fix.vdop = std::sqrt(var_z);
+      } else {
+        fix.hdop = 1.5;
+        fix.vdop = 2.0;
+      }
+    } else if (msg->err_horz > 0.0 && msg->err_vert > 0.0) {
+      // err_horz/err_vert are 95% CI bounds in meters. Convert to 1-sigma variance.
+      double sigma_xy = msg->err_horz / 1.96;
+      double sigma_z  = msg->err_vert / 1.96;
+      double var_xy = sigma_xy * sigma_xy;
+      double var_z  = sigma_z  * sigma_z;
+      if (var_xy < kMinVarXY) var_xy = kMinVarXY;
+      if (var_z  < kMinVarZ)  var_z  = kMinVarZ;
+      Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+      cov(0,0) = var_xy;
+      cov(1,1) = var_xy;
+      cov(2,2) = var_z;
+      fix.has_full_covariance = true;
+      fix.full_covariance = cov;
+      fix.hdop = std::sqrt(var_xy);
+      fix.vdop = std::sqrt(var_z);
+    } else if (msg->hdop > 0.0 && msg->vdop > 0.0) {
+      // Receiver-native dimensionless DOP: used directly by the core noise model
+      // (sigma_xy = base_noise_xy * hdop, sigma_z = base_noise_z * vdop).
+      fix.hdop = msg->hdop;
+      fix.vdop = msg->vdop;
+    } else {
+      fix.hdop = 1.5;
+      fix.vdop = 2.0;
+    }
+
+    bool accepted = fc_->update_gnss(t, fix);
+    const auto& dbg = fc_->get_gnss_debug();
+
+    if (!accepted) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "GPSFix rejected: %s (hdop=%.2f, d2=%.1f, threshold=%.1f)",
+        gnss_reason_str(dbg.reason).c_str(),
+        fix.hdop,
+        dbg.mahalanobis_sq,
+        dbg.chi2_threshold);
+    }
+
+    publish_gnss_status(rclcpp::Time(msg->header.stamp));
+
     auto fc_status = fc_->get_status();
     if (!fc_status.heading_validated) {
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
@@ -1692,8 +1961,11 @@ private:
       }
     }
 
-    // Some drivers set covariance[0] = -1 to signal "no orientation"
-    if (msg->orientation_covariance[0] < 0.0) {
+    // Some drivers set covariance[0] = -1 to signal "no roll/pitch data" (yaw-only message).
+    // This callback only ever reads cov[8] (yaw variance), so reject only when
+    // yaw data is also absent. Rejects all-zero and all-unknown messages; accepts
+    // messages where cov[0] = -1 but cov[8] carries a valid yaw variance.
+    if (msg->orientation_covariance[0] < 0.0 && msg->orientation_covariance[8] <= 0.0) {
       orientation_valid = false;
     }
 
@@ -1786,6 +2058,82 @@ private:
     }
   }
 
+  // ─── Observability helpers ────────────────────────────────────────────────
+
+  // Converts a GnssRejectionReason enum to the string stored in the message.
+  static std::string gnss_reason_str(fusioncore::GnssRejectionReason r)
+  {
+    switch (r) {
+      case fusioncore::GnssRejectionReason::ACCEPTED:        return "ACCEPTED";
+      case fusioncore::GnssRejectionReason::FIX_TYPE_LOW:    return "FIX_TYPE_LOW";
+      case fusioncore::GnssRejectionReason::HDOP_HIGH:       return "HDOP_HIGH";
+      case fusioncore::GnssRejectionReason::VDOP_HIGH:       return "VDOP_HIGH";
+      case fusioncore::GnssRejectionReason::MIN_SATS:        return "MIN_SATS";
+      case fusioncore::GnssRejectionReason::CHI2_FAILED:     return "CHI2_FAILED";
+      case fusioncore::GnssRejectionReason::DELAY_TOO_LARGE: return "DELAY_TOO_LARGE";
+      default:                                                return "NOT_PROCESSED";
+    }
+  }
+
+  // Publishes /fusion/debug/gnss_status from the debug struct the core just populated.
+  // Called from gnss_callback and gps_fix_callback immediately after update_gnss().
+  void publish_gnss_status(const rclcpp::Time& stamp)
+  {
+    if (!gnss_status_pub_) return;
+    const auto& d = fc_->get_gnss_debug();
+
+    fusioncore_ros::msg::GnssStatus msg;
+    msg.header.stamp     = stamp;
+    msg.header.frame_id  = odom_frame_;
+    msg.accepted         = d.accepted;
+    msg.rejection_reason = gnss_reason_str(d.reason);
+    msg.mahalanobis_sq   = d.mahalanobis_sq;
+    msg.chi2_threshold   = d.chi2_threshold;
+    msg.hdop             = d.hdop;
+    msg.vdop             = d.vdop;
+    msg.satellites       = d.satellites;
+    msg.fix_type         = d.fix_type;
+    msg.in_coast_mode    = d.in_coast_mode;
+    msg.consecutive_rejects = d.consecutive_rejects;
+    msg.position_sigma_x = d.position_sigma_x;
+    msg.position_sigma_y = d.position_sigma_y;
+    msg.lever_arm_used   = d.lever_arm_used;
+    msg.heading_sigma_deg = d.heading_sigma_deg;
+
+    gnss_status_pub_->publish(msg);
+  }
+
+  // Extracts heading 1-sigma in degrees from the filter covariance via quaternion Jacobian.
+  double compute_heading_sigma_deg(const fusioncore::State& s) const
+  {
+    const double qw = s.x[fusioncore::QW];
+    const double qx = s.x[fusioncore::QX];
+    const double qy = s.x[fusioncore::QY];
+    const double qz = s.x[fusioncore::QZ];
+
+    const double t3 = 2.0 * (qw*qz + qx*qy);
+    const double t4 = 1.0 - 2.0 * (qy*qy + qz*qz);
+    const double safe_denom_yaw = std::max(t3*t3 + t4*t4, 1e-12);
+
+    // d(yaw)/d(qw, qx, qy, qz): row 2 of the full quaternion-to-Euler Jacobian
+    Eigen::Matrix<double, 1, 4> J_yaw;
+    J_yaw(0,0) = 2.0*qz*t4 / safe_denom_yaw;
+    J_yaw(0,1) = 2.0*qy*t4 / safe_denom_yaw;
+    J_yaw(0,2) = (2.0*qx*t4 + 4.0*qy*t3) / safe_denom_yaw;
+    J_yaw(0,3) = (2.0*qw*t4 + 4.0*qz*t3) / safe_denom_yaw;
+
+    static constexpr int qi[4] = {
+      fusioncore::QW, fusioncore::QX, fusioncore::QY, fusioncore::QZ
+    };
+    Eigen::Matrix4d P_quat;
+    for (int i = 0; i < 4; ++i)
+      for (int j = 0; j < 4; ++j)
+        P_quat(i,j) = s.P(qi[i], qi[j]);
+
+    double yaw_var = (J_yaw * P_quat * J_yaw.transpose())(0, 0);
+    return std::sqrt(std::max(yaw_var, 0.0)) * 180.0 / M_PI;
+  }
+
   // ─── Publish state ────────────────────────────────────────────────────────
 
   void publish_state()
@@ -1820,18 +2168,102 @@ private:
     // Publish UKF covariance so Nav2 and other consumers see real uncertainty.
     // pose.covariance is 6x6 row-major for [x, y, z, roll, pitch, yaw].
     // twist.covariance is 6x6 row-major for [vx, vy, vz, wx, wy, wz].
-    // Extract the relevant 6x6 sub-blocks from the 21x21 P matrix.
     const fusioncore::StateMatrix& P = s.P;
-    // Pose covariance: [x, y, z, roll, pitch, yaw] (ROS convention).
-    // Map orientation slots to QX, QY, QZ (3 of 4 quaternion components).
-    // QW is omitted: it's constrained by unit norm and has near-zero variance.
-    static constexpr int pose_idx[6] = {
-      fusioncore::X, fusioncore::Y, fusioncore::Z,
-      fusioncore::QX, fusioncore::QY, fusioncore::QZ
-    };
-    for (int i = 0; i < 6; ++i)
-      for (int j = 0; j < 6; ++j)
-        odom.pose.covariance[i * 6 + j] = P(pose_idx[i], pose_idx[j]);
+
+    // Pose covariance: ROS convention is [x, y, z, roll, pitch, yaw].
+    // The UKF tracks orientation as a quaternion (qw, qx, qy, qz), so we must
+    // propagate quaternion covariance through the quaternion-to-Euler Jacobian:
+    //
+    //   C_euler = J * P_quat * J^T      (3x3 Euler covariance)
+    //   C_pos_euler = P_pos_quat * J^T  (3x3 position-Euler cross-covariance)
+    //
+    // where J = d(roll,pitch,yaw)/d(qw,qx,qy,qz) is the 3x4 analytical Jacobian
+    // evaluated at the current quaternion. Without this step, Nav2 would read
+    // quaternion component variance instead of yaw variance (wrong by ~4x for
+    // small angles, increasingly wrong as orientation changes).
+    {
+      const double qw = s.x[fusioncore::QW];
+      const double qx = s.x[fusioncore::QX];
+      const double qy = s.x[fusioncore::QY];
+      const double qz = s.x[fusioncore::QZ];
+
+      // Intermediate terms for the three Euler angle formulas.
+      const double t0 = 2.0 * (qw*qx + qy*qz);          // roll numerator
+      const double t1 = 1.0 - 2.0 * (qx*qx + qy*qy);    // roll denominator
+      const double t2 = std::clamp(2.0 * (qw*qy - qz*qx), -1.0, 1.0); // pitch sin
+      const double t3 = 2.0 * (qw*qz + qx*qy);           // yaw numerator
+      const double t4 = 1.0 - 2.0 * (qy*qy + qz*qz);    // yaw denominator
+
+      // Gimbal lock protection: all three denominators go to zero when pitch = +/-90 deg.
+      // At pitch = +/-90 deg, t0=t1=0 (roll undefined) and t3=t4=0 (yaw undefined) and
+      // sqrt(1-t2^2)=0 (pitch Jacobian singular). Clamp all three to 1e-12 to produce
+      // large-but-finite covariance instead of NaN. The unit quaternion constraint
+      // guarantees none of these denominators can be negative.
+      const double safe_denom_roll  = std::max(t0*t0 + t1*t1, 1e-12);
+      const double safe_denom_yaw   = std::max(t3*t3 + t4*t4, 1e-12);
+      const double safe_pitch       = std::max(std::sqrt(1.0 - t2*t2), 1e-12);
+
+      // 3x4 Jacobian: rows = [roll, pitch, yaw], cols = [qw, qx, qy, qz].
+      Eigen::Matrix<double, 3, 4> J;
+
+      // d(roll)/d(qw, qx, qy, qz)  via d/d* atan2(t0, t1)
+      J(0,0) = 2.0*qx*t1 / safe_denom_roll;
+      J(0,1) = (2.0*qw*t1 + 4.0*qx*t0) / safe_denom_roll;
+      J(0,2) = (2.0*qz*t1 + 4.0*qy*t0) / safe_denom_roll;
+      J(0,3) = 2.0*qy*t1 / safe_denom_roll;
+
+      // d(pitch)/d(qw, qx, qy, qz)  via d/d* asin(t2)
+      J(1,0) =  2.0*qy / safe_pitch;
+      J(1,1) = -2.0*qz / safe_pitch;
+      J(1,2) =  2.0*qw / safe_pitch;
+      J(1,3) = -2.0*qx / safe_pitch;
+
+      // d(yaw)/d(qw, qx, qy, qz)  via d/d* atan2(t3, t4)
+      J(2,0) = 2.0*qz*t4 / safe_denom_yaw;
+      J(2,1) = 2.0*qy*t4 / safe_denom_yaw;
+      J(2,2) = (2.0*qx*t4 + 4.0*qy*t3) / safe_denom_yaw;
+      J(2,3) = (2.0*qw*t4 + 4.0*qz*t3) / safe_denom_yaw;
+
+      // 4x4 quaternion covariance sub-block from P (order: qw, qx, qy, qz).
+      static constexpr int qi[4] = {
+        fusioncore::QW, fusioncore::QX, fusioncore::QY, fusioncore::QZ
+      };
+      Eigen::Matrix4d P_quat;
+      for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+          P_quat(i,j) = P(qi[i], qi[j]);
+
+      // 3x4 position-quaternion cross-covariance (rows=XYZ, cols=qw,qx,qy,qz).
+      static constexpr int pi[3] = {
+        fusioncore::X, fusioncore::Y, fusioncore::Z
+      };
+      Eigen::Matrix<double, 3, 4> P_pos_quat;
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 4; ++j)
+          P_pos_quat(i,j) = P(pi[i], qi[j]);
+
+      // Propagate through Jacobian.
+      const Eigen::Matrix3d C_euler     = J * P_quat * J.transpose();
+      const Eigen::Matrix3d C_pos_euler = P_pos_quat * J.transpose();
+
+      // Fill 6x6 pose covariance (row-major, [x,y,z,roll,pitch,yaw]).
+      // top-left 3x3: position covariance
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+          odom.pose.covariance[i*6 + j] = P(pi[i], pi[j]);
+      // top-right 3x3: position-Euler cross-covariance
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+          odom.pose.covariance[i*6 + (3+j)] = C_pos_euler(i, j);
+      // bottom-left 3x3: Euler-position cross-covariance (symmetric)
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+          odom.pose.covariance[(3+i)*6 + j] = C_pos_euler(j, i);
+      // bottom-right 3x3: Euler angle covariance
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+          odom.pose.covariance[(3+i)*6 + (3+j)] = C_euler(i, j);
+    }
 
     // Twist state indices: VX=6,VY=7,VZ=8,WX=9,WY=10,WZ=11
     static constexpr int twist_idx[6] = {
@@ -1974,6 +2406,40 @@ private:
        {"update_count",          std::to_string(status.update_count)}}));
 
     diag_pub_->publish(diag_array);
+
+    // FilterHealth: plottable topic with innovation norms and position uncertainty.
+    // Consumed directly by Foxglove without a custom panel: every field is a float64.
+    if (filter_health_pub_) {
+      const fusioncore::State& s = fc_->get_state();
+
+      fusioncore_ros::msg::FilterHealth fh;
+      fh.header.stamp    = stamp;
+      fh.header.frame_id = odom_frame_;
+
+      fh.gnss_innovation_norm    = status.gnss_innovation_norm;
+      fh.imu_innovation_norm     = status.imu_innovation_norm;
+      fh.encoder_innovation_norm = status.encoder_innovation_norm;
+
+      fh.position_sigma_x = status.position_sigma_x;
+      fh.position_sigma_y = status.position_sigma_y;
+      fh.position_sigma_z = status.position_sigma_z;
+
+      fh.heading_sigma_deg = compute_heading_sigma_deg(s);
+
+      fh.heading_validated = status.heading_validated;
+      fh.heading_source    = heading_src_str(status.heading_source);
+
+      fh.gnss_in_coast           = status.gnss_in_coast;
+      fh.gnss_consecutive_rejects = status.gnss_consecutive_rejects;
+
+      fh.distance_traveled_m = status.distance_traveled;
+
+      fh.gnss_outlier_count    = status.gnss_outliers;
+      fh.imu_outlier_count     = status.imu_outliers;
+      fh.encoder_outlier_count = status.enc_outliers;
+
+      filter_health_pub_->publish(fh);
+    }
   }
 
   // ─── PROJ coordinate transforms ───────────────────────────────────────────
@@ -2098,10 +2564,13 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        gnss_vel_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        radar_vel_sub_;
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr    gnss_sub_;
+  rclcpp::Subscription<gps_msgs::msg::GPSFix>::SharedPtr          gps_fix_sub_;
   rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr                gnss2_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr                       odom_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_pub_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr         diag_pub_;
+  rclcpp::Publisher<fusioncore_ros::msg::GnssStatus>::SharedPtr               gnss_status_pub_;
+  rclcpp::Publisher<fusioncore_ros::msg::FilterHealth>::SharedPtr             filter_health_pub_;
   rclcpp::TimerBase::SharedPtr                                                publish_timer_;
   rclcpp::TimerBase::SharedPtr                                                diag_timer_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr                          reset_srv_;
@@ -2112,6 +2581,7 @@ private:
   double      publish_rate_;
   bool        force_2d_    = false;
   bool        publish_tf_  = true;
+  bool        use_gps_fix_  = false;
   std::string heading_topic_;
   std::string gnss2_topic_;
   std::string azimuth_topic_;
@@ -2166,6 +2636,16 @@ private:
   double zupt_velocity_threshold_ = 0.05;
   double zupt_angular_threshold_  = 0.05;
   double zupt_noise_sigma_        = 0.01;
+
+  // NHC holonomic auto-detection
+  // |VY| must exceed this to count as real lateral motion (filters vibration/noise)
+  static constexpr double kNhcDetectVyThreshold_ = 0.02;  // m/s
+  // Consecutive messages above threshold before holonomic flag is set (~0.1s at 50Hz)
+  static constexpr int    kNhcDetectN_            = 5;
+  bool   nhc_auto_detect_        = true;
+  bool   nhc_holonomic_detected_ = false;
+  int    nhc_nonzero_vy_count_   = 0;
+  double nhc_vy_auto_noise_      = 0.05;  // VX noise cached at configure time
 
   // Callback groups: sensor callbacks are mutually exclusive (protect UKF state);
   // publish timer runs in its own group so it never waits on a sensor callback.
