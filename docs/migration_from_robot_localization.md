@@ -21,7 +21,7 @@ ros2 launch fusioncore_ros fusioncore_nav2.launch.py \
   fusioncore_config:=/path/to/your_robot.yaml
 ```
 
-That's it. FusionCore starts, configures itself, activates, and Nav2 comes up 5 seconds later once localization is publishing. No separate `navsat_transform_node`, no feedback loop, no topic wiring.
+That's it. FusionCore starts, configures itself, activates, and Nav2 comes up 8 seconds later once localization is publishing. No separate `navsat_transform_node`, no feedback loop, no topic wiring.
 
 **Don't use Nav2?** Use `fusioncore.launch.py` instead:
 
@@ -326,7 +326,7 @@ Know these before you migrate:
 |---|---|---|
 | Multiple independent odometry sources | yes (odom0, odom1, ...) | primary wheel odom + one secondary via `encoder2.topic` |
 | Multiple IMUs | yes (imu0, imu1, ...) | primary `/imu/data` + one secondary via `imu2.topic` |
-| Configurable state vector | yes (per-sensor config booleans) | fixed 22D state (position, orientation, velocity, biases) |
+| Configurable state vector | yes (per-sensor config booleans) | fixed 23D state (position, orientation, velocity, biases, encoder WZ bias) |
 | Arbitrary sensor plugins | yes (extensible) | IMU, wheel odometry, GPS only |
 | Published filtered GPS | `publish_filtered_gps: true` | not currently supported |
 | navsat datum from ROS service | `/datum` service | not currently supported |
