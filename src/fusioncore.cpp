@@ -108,12 +108,17 @@ FusionCore::FusionCore(const FusionCoreConfig& config)
   }
 }
 
+void FusionCore::set_imu_lever_arm(const sensors::ImuLeverArm& lever_arm) {
+  config_.imu.lever_arm = lever_arm;
+}
+
 void FusionCore::init(const State& initial_state, double timestamp_seconds) {
   ukf_.init(initial_state);
   last_timestamp_    = timestamp_seconds;
   last_imu_time_     = -1.0;
   last_encoder_time_ = -1.0;
   last_gnss_time_    = -1.0;
+  last_mag_time_     = -1.0;
   update_count_      = 0;
   initialized_       = true;
 
@@ -157,6 +162,7 @@ void FusionCore::reset() {
   last_encoder_time_ = -1.0;
   last_gnss_time_    = -1.0;
   last_vslam_time_   = -1.0;
+  last_mag_time_     = -1.0;
   update_count_      = 0;
   heading_validated_ = false;
   heading_source_    = HeadingSource::NONE;
@@ -266,11 +272,18 @@ bool FusionCore::apply_delayed_measurement(
       ukf_.predict(dt);
       last_timestamp_ = imu.timestamp;
 
-      // Re-apply the IMU measurement so the filter sees the real dynamics
+      // Re-apply the IMU measurement so the filter sees the real dynamics.
+      // Pick the same measurement function as update_imu() to keep the
+      // replay consistent with the original update (lever-arm aware when
+      // the IMU is offset from base_link).
       sensors::ImuMeasurement z;
       z[0] = imu.wx; z[1] = imu.wy; z[2] = imu.wz;
       z[3] = imu.ax; z[4] = imu.ay; z[5] = imu.az;
-      ukf_.update<sensors::IMU_DIM>(z, sensors::imu_measurement_function, imu.R);
+      auto h_imu_replay = !config_.imu.lever_arm.is_zero()
+        ? sensors::imu_measurement_function_with_lever_arm(config_.imu.lever_arm)
+        : std::function<sensors::ImuMeasurement(const StateVector&)>(
+            sensors::imu_measurement_function);
+      ukf_.update<sensors::IMU_DIM>(z, h_imu_replay, imu.R);
       replayed_any = true;
     }
   }
@@ -424,11 +437,22 @@ void FusionCore::update_imu(
     R(2, 2) *= config_.gnss_coast_imu_wz_scale;
   }
 
+  // Pick the measurement function: plain if IMU is at base_link origin,
+  // else the lever-arm-aware variant that adds ω×(ω×r) centripetal to the
+  // predicted accel. Both produce identical output when lever_arm == 0, so
+  // we could always use the lambda; the explicit fork avoids the lambda
+  // allocation on the hot path when no lever arm is configured.
+  const bool use_imu_lever_arm = !config_.imu.lever_arm.is_zero();
+  auto h_imu = use_imu_lever_arm
+    ? sensors::imu_measurement_function_with_lever_arm(config_.imu.lever_arm)
+    : std::function<sensors::ImuMeasurement(const StateVector&)>(
+        sensors::imu_measurement_function);
+
   // Mahalanobis outlier rejection for IMU
   if (config_.outlier_rejection) {
     sensors::ImuMeasurement innovation_pre;
     sensors::ImuNoiseMatrix S;
-    ukf_.predict_measurement<sensors::IMU_DIM>(z, sensors::imu_measurement_function, R, innovation_pre, S);
+    ukf_.predict_measurement<sensors::IMU_DIM>(z, h_imu, R, innovation_pre, S);
     if (is_outlier<sensors::IMU_DIM>(innovation_pre, S, config_.outlier_threshold_imu)) {
       ++imu_outliers_;
       last_imu_time_ = timestamp_seconds;
@@ -436,7 +460,7 @@ void FusionCore::update_imu(
     }
   }
 
-  auto innovation = ukf_.update<sensors::IMU_DIM>(z, sensors::imu_measurement_function, R);
+  auto innovation = ukf_.update<sensors::IMU_DIM>(z, h_imu, R);
 
   last_imu_innovation_norm_ = innovation.norm();
 
@@ -802,7 +826,12 @@ bool FusionCore::apply_gnss_update(
 
   bool heading_reliable = heading_validated_ &&
     (heading_sigma_deg <= config_.gnss_lever_arm_max_heading_sigma_deg);
-  bool use_lever_arm = !fix.lever_arm.is_zero() && heading_reliable;
+  // Apply the antenna lever arm when heading is reliable (validated + sigma within
+  // bounds) OR when the user opted in to applying it pre-heading-validation.
+  // The pre-heading option turns GPS into an active yaw observation from startup,
+  // safe when Mahalanobis gating is on and fixes are RTK-grade.
+  bool use_lever_arm = !fix.lever_arm.is_zero()
+                       && (heading_reliable || config_.gnss.apply_lever_arm_pre_heading);
   gnss_debug_.lever_arm_used = use_lever_arm;
 
   auto h_gnss = use_lever_arm
@@ -1025,12 +1054,18 @@ FusionCoreStatus FusionCore::get_status() const {
     (last_timestamp_ - last_vslam_time_) > stale ? SensorHealth::STALE :
     SensorHealth::OK;
 
+  status.mag_health =
+    last_mag_time_ < 0.0 ? SensorHealth::NOT_INIT :
+    (last_timestamp_ - last_mag_time_) > stale ? SensorHealth::STALE :
+    SensorHealth::OK;
+
   // Outlier rejection counters
   status.gnss_outliers  = gnss_outliers_;
   status.imu_outliers   = imu_outliers_;
   status.enc_outliers   = enc_outliers_;
   status.hdg_outliers   = hdg_outliers_;
   status.vslam_outliers = vslam_outliers_;
+  status.mag_outliers   = mag_outliers_;
 
   // Innovation norms from last accepted update per sensor
   status.gnss_innovation_norm    = last_gnss_innovation_norm_;
@@ -1134,6 +1169,63 @@ bool FusionCore::update_pose(
     }
   }
 
+  return true;
+}
+
+bool FusionCore::update_magnetometer(
+  double timestamp_seconds,
+  double mx, double my, double mz)
+{
+  if (!initialized_)
+    throw std::runtime_error("FusionCore: update_magnetometer() called before init()");
+
+  predict_to(timestamp_seconds);
+
+  // Extract current roll and pitch from the filter state for tilt compensation.
+  // Yaw is what we are about to measure, so we only need roll and pitch here.
+  const State& s = ukf_.state();
+  double roll, pitch, yaw_state;
+  quat_to_euler(s.x[QW], s.x[QX], s.x[QY], s.x[QZ], roll, pitch, yaw_state);
+
+  // Compute tilt-compensated heading from raw field vector
+  double yaw_mag = sensors::mag_yaw_from_field(mx, my, mz, config_.mag, roll, pitch);
+
+  // Fuse as a 1-DOF heading measurement, same path as dual-antenna GPS heading
+  sensors::GnssHdgMeasurement z;
+  z[0] = yaw_mag;
+
+  sensors::GnssHdgNoiseMatrix R;
+  R(0,0) = config_.mag.noise_rad * config_.mag.noise_rad;
+
+  // bit 0 = dimension 0 (heading) is an angle: wrap innovation across +-pi
+  constexpr unsigned int MAG_ANGLE_DIMS = 0b1;
+
+  if (config_.outlier_rejection) {
+    sensors::GnssHdgMeasurement innov_pre;
+    sensors::GnssHdgNoiseMatrix S;
+    ukf_.predict_measurement<sensors::GNSS_HDG_DIM>(
+      z, sensors::gnss_hdg_measurement_function, R, innov_pre, S, MAG_ANGLE_DIMS);
+    if (is_outlier<sensors::GNSS_HDG_DIM>(innov_pre, S, config_.mag.chi2_threshold)) {
+      ++mag_outliers_;
+      return false;
+    }
+  }
+
+  ukf_.update<sensors::GNSS_HDG_DIM>(
+    z, sensors::gnss_hdg_measurement_function, R, MAG_ANGLE_DIMS);
+
+  // Magnetometer immediately provides valid heading.
+  // Upgrade from GPS_TRACK (which requires 5m of motion) but never downgrade
+  // from DUAL_ANTENNA (which is a stronger absolute source).
+  if (!heading_validated_ ||
+      heading_source_ == HeadingSource::NONE ||
+      heading_source_ == HeadingSource::GPS_TRACK) {
+    heading_validated_ = true;
+    heading_source_    = HeadingSource::MAGNETOMETER;
+  }
+
+  last_mag_time_ = timestamp_seconds;
+  ++update_count_;
   return true;
 }
 
