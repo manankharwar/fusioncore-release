@@ -13,7 +13,7 @@ Paper: [arXiv:2605.25239](https://arxiv.org/abs/2605.25239)
 | GPS fusion | navsat_transform node, UTM projection | Native ECEF, no projection node |
 | IMU bias | Not in state vector | Gyro + accel bias as filter states |
 | Outlier rejection | Scalar Mahalanobis threshold | Chi-squared gate per sensor DOF |
-| Noise covariance | Fixed at config time | Adapts from innovation sequence |
+| GPS noise estimation | Uses sensor-reported covariance as-is | Adapts from 50-sample innovation window |
 | ZUPT | Not built-in | Auto when stationary |
 | Delay compensation | `smooth_lagged_data` + `history_length` | IMU ring-buffer replay |
 | GPS fix quality gating | Not built-in | HDOP, satellite count, fix type |
@@ -56,8 +56,8 @@ where `Ĉ` is the empirical innovation covariance and `α = 0.01`. A floor preve
 | 2012-05-11 | Spring | 84 min | **9.7 m** | 11.5 m | FC +16% |
 | 2012-06-15 | Summer | 55 min | 49.2 m | **18.2 m** | RL +63% |
 | 2012-08-20 | Summer | 83 min | 98.3 m | **10.6 m** | RL +89% |
-| 2012-09-28 | Fall | 77 min | **10.8 m** | 55.7 m | FC +81% |
-| 2012-10-28 | Fall | 85 min | **29.9 m** | 60.0 m | FC +50% |
+| 2012-09-28 | Fall | 77 min | **22.4 m** | 53.8 m | FC +58% |
+| 2012-10-28 | Fall | 85 min | **15.6 m** | 56.4 m | FC +72% |
 | 2012-11-04 | Fall | 79 min | **60.1 m** | 122.0 m | FC +51% |
 | 2012-12-01 | Winter | 75 min | **21.0 m** | 90.7 m | FC +77% |
 | 2013-02-23 | Winter | 78 min | **59.4 m** | 82.2 m | FC +28% |
@@ -73,7 +73,7 @@ Metric: ATE RMSE (meters), SE3-aligned to RTK ground truth using EVO. Same IMU, 
 
 Both losses have identified root causes. They are documented here rather than hidden.
 
-**2012-06-15 (FC 49.2m, RL 18.2m):** The dataset's GPS-sparsest sequence, with a 462-second blackout. During coast mode, any residual wheel encoder yaw bias (`b_ewz`) compounds at 100Hz into quadratic lateral drift. RL-EKF's 2D mode has fewer divergence degrees of freedom. The fix is magnetometer integration for absolute heading during GPS outage: not yet implemented.
+**2012-06-15 (FC 49.2m, RL 18.2m):** The dataset's GPS-sparsest sequence, with a 462-second blackout. During coast mode, any residual wheel encoder yaw bias (`b_ewz`) compounds at 100Hz into quadratic lateral drift. RL-EKF's 2D mode has fewer divergence degrees of freedom. The fix is magnetometer integration for absolute heading during GPS outage: available in v0.3.1 via `magnetometer.enabled: true`.
 
 **2012-08-20 (FC 98.3m, RL 10.6m):** 105 mode-3 GPS fixes located 720-840m from RTK ground truth appear in a 24-second window at a blackout boundary. Coast mode relaxes the chi-squared gate slightly to re-acquire GPS after the blackout. The adversarial cluster each individually pass the gate and collectively pull the estimate. RL-EKF incidentally rejects them through its miscalibrated gate (the same gate that causes its ten other losses). The fix is a `max_implied_speed` pre-check upstream of chi-squared gating: not yet implemented.
 
@@ -91,6 +91,18 @@ These are open robot_localization issues that describe problems FusionCore handl
 | Delayed sensor messages cause missed updates ([#911](https://github.com/cra-ros-pkg/robot_localization/issues/911)) | IMU ring buffer with retrodiction up to 500ms |
 | Non-deterministic output across bag replays ([#957](https://github.com/cra-ros-pkg/robot_localization/issues/957)) | Message timestamps drive everything under `use_sim_time: true` |
 | IMU frame confusion ([#757](https://github.com/cra-ros-pkg/robot_localization/issues/757)) | TF lookup on every message, `imu.frame_id` override for broken drivers |
+
+---
+
+## See the difference in simulation
+
+The Gazebo demo runs both filters simultaneously on the same sensor stream and injects a GPS spike at t=30 s. No real hardware needed.
+
+```bash
+ros2 launch fusioncore_gazebo fusioncore_demo.launch.py
+```
+
+RViz shows green (FusionCore holds the circle), red (robot_localization follows the spike), yellow (raw GPS). See [Simulation](simulation.md#demo-fusioncore-vs-robot_localization-gps-spike) for details.
 
 ---
 
