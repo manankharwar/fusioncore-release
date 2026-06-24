@@ -38,16 +38,31 @@ Starts FusionCore with fake sensors and checks all outputs in about 15 seconds. 
 
 ### **Option B: Docker (no ROS install required)**
 
+The easiest way to try FusionCore — no ROS 2 installation needed. The image is hosted on GitHub Container Registry (GHCR).
+
 ```bash
+# Pull the image
 docker pull ghcr.io/manankharwar/fusioncore:latest
+
+# Quick test (15 seconds, no hardware)
+docker run --rm ghcr.io/manankharwar/fusioncore:latest bash tools/quick_test.sh
+
+# Interactive shell
 docker run --rm -it ghcr.io/manankharwar/fusioncore:latest bash
+
+# Run with your own YAML config + topic remaps
+docker run --rm -it --net=host \
+  -v ~/my_robot.yaml:/config/robot.yaml:ro \
+  ghcr.io/manankharwar/fusioncore:latest \
+  ros2 launch fusioncore_ros fusioncore.launch.py \
+    fusioncore_config:=/config/robot.yaml \
+    --ros-args \
+    -r /imu/data:=/your/imu/topic \
+    -r /gnss/fix:=/your/gps/topic
 ```
 
-Inside the container, verify everything works:
+Full guide (volume mounts, topic remapping, `--net=host`): [docs/docker.md](https://manankharwar.github.io/fusioncore/docker/)
 
-```bash
-bash tools/quick_test.sh
-```
 ---
 
 ## Works on the hardware you actually have
@@ -81,8 +96,8 @@ FusionCore vs robot_localization on the [NCLT dataset](http://robots.engin.umich
 | 2012-05-11 | Spring | 84 min | **9.7 m** | 11.5 m | FC +16% |
 | 2012-06-15 | Summer | 55 min | 49.2 m | **18.2 m** | RL +63% |
 | 2012-08-20 | Summer | 83 min | 98.3 m | **10.6 m** | RL +89% |
-| 2012-09-28 | Fall | 77 min | **10.8 m** | 55.7 m | FC +81% |
-| 2012-10-28 | Fall | 85 min | **29.9 m** | 60.0 m | FC +50% |
+| 2012-09-28 | Fall | 77 min | **22.4 m** | 53.8 m | FC +58% |
+| 2012-10-28 | Fall | 85 min | **15.6 m** | 56.4 m | FC +72% |
 | 2012-11-04 | Fall | 79 min | **60.1 m** | 122.0 m | FC +51% |
 | 2012-12-01 | Winter | 75 min | **21.0 m** | 90.7 m | FC +77% |
 | 2013-02-23 | Winter | 78 min | **59.4 m** | 82.2 m | FC +28% |
@@ -131,21 +146,21 @@ Running FusionCore on your robot? Drop a note in [Discussions #22](https://githu
 
 ---
 
-## Coming from robot_localization?
+## Switching from robot_localization?
 
-If any of these have bitten you, FusionCore was built with them in mind:
+FusionCore is a drop-in replacement for the robot_localization + navsat_transform stack. The migration guide covers the YAML and launch file changes: [manankharwar.github.io/fusioncore/migration_from_robot_localization](https://manankharwar.github.io/fusioncore/migration_from_robot_localization/)
 
-| robot_localization issue | What FusionCore does instead |
+The architectural differences that matter in practice:
+
+| Problem | How FusionCore handles it |
 |---|---|
-| UKF diverges with NaN on GPS-heavy sequences ([#780](https://github.com/cra-ros-pkg/robot_localization/issues/780), [#777](https://github.com/cra-ros-pkg/robot_localization/issues/777)) | Chi-squared gate on every sensor; covariance bounded at each step. All twelve NCLT sequences finish without NaN. |
-| navsat_transform crashes at UTM zone boundaries ([#951](https://github.com/cra-ros-pkg/robot_localization/issues/951), [#904](https://github.com/cra-ros-pkg/robot_localization/issues/904)) | GPS fused directly in ECEF. No UTM projection, no zone boundary. |
-| No non-holonomic constraint for wheeled robots ([#744](https://github.com/cra-ros-pkg/robot_localization/issues/744)) | Built-in NHC: lateral and vertical velocity zeroed as a virtual measurement on every encoder update. |
-| Delayed sensor messages cause missed updates ([#911](https://github.com/cra-ros-pkg/robot_localization/issues/911)) | Rolling IMU buffer with retrodiction. Late GPS fixes replay missed IMU steps automatically (up to 500 ms). |
-| Non-deterministic output across bag replays ([#957](https://github.com/cra-ros-pkg/robot_localization/issues/957)) | Message timestamps drive everything under `use_sim_time:true`. Same bag + same config = identical output. |
-| IMU frame confusion: body vs sensor frame ([#757](https://github.com/cra-ros-pkg/robot_localization/issues/757)) | TF lookup on every message. `imu.frame_id` override for broken driver frame names. |
-| navsat_transform CPU load scales with fix rate ([#890](https://github.com/cra-ros-pkg/robot_localization/issues/890)) | No navsat_transform node. ECEF conversion is one matrix multiply per GPS message inside the filter. |
-
-Migration guide: [manankharwar.github.io/fusioncore/migration_from_robot_localization](https://manankharwar.github.io/fusioncore/migration_from_robot_localization/)
+| GPS outliers corrupt the state | Chi-squared gate per sensor DOF rejects bad fixes before they reach the filter. Covariance bounded at every step — no NaN divergence. |
+| UTM zone boundary near the operating area | GPS fused directly in ECEF. No UTM projection, no zone boundary edge case. |
+| Wheeled robot drifts laterally without GPS | Non-holonomic constraint (NHC) zeros lateral and vertical velocity as a virtual measurement on every encoder update. |
+| GPS fixes arrive 50–200 ms late | IMU ring buffer with retrodiction. Late fixes replay missed IMU steps and reconstruct the exact filter state at the GPS timestamp. |
+| Bag replay gives different results each run | Message timestamps drive all updates under `use_sim_time: true`. Same bag, same config, identical output. |
+| IMU mounted off-axis or with a broken frame name | TF lookup on every message. `imu.frame_id` override for drivers that publish wrong frame names. |
+| navsat_transform node adds CPU load and startup ordering complexity | No navsat_transform node. ECEF conversion is one matrix multiply per GPS fix inside the filter. |
 
 ---
 
@@ -154,6 +169,7 @@ Migration guide: [manankharwar.github.io/fusioncore/migration_from_robot_localiz
 **[manankharwar.github.io/fusioncore](https://manankharwar.github.io/fusioncore/)**
 
 - [Getting Started](https://manankharwar.github.io/fusioncore/getting-started/)
+- [Docker](https://manankharwar.github.io/fusioncore/docker/)
 - [Configuration reference](https://manankharwar.github.io/fusioncore/configuration/)
 - [Hardware configs](https://manankharwar.github.io/fusioncore/hardware/)
 - [Nav2 integration](https://manankharwar.github.io/fusioncore/nav2/)
@@ -197,3 +213,7 @@ If you prefer to cite the software release directly:
 ---
 
 Issues answered within 24 hours. Open a GitHub issue or find the discussion on [ROS Discourse](https://discourse.ros.org).
+
+Running FusionCore on your robot? Open a [Discussion](https://github.com/manankharwar/fusioncore/discussions/22) to get listed in [ADOPTERS.md](ADOPTERS.md).
+
+Need guaranteed results on your hardware? [Commercial support and fixed-price integration](https://manankharwar.github.io/fusioncore/support/) available.
