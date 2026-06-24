@@ -2,22 +2,24 @@
 #include "fusioncore/motion_model.hpp"
 #include "fusioncore/sensors/gnss.hpp"
 #include "fusioncore/sensors/vslam.hpp"
+#include "fusioncore/sensors/magnetometer.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/magnetic_field.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/nav_sat_status.hpp>
 #include <gps_msgs/msg/gps_fix.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <tf2_ros/transform_broadcaster.hpp>
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_listener.h>
-#include <tf2/LinearMath/Quaternion.h>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_ros/transform_listener.hpp>
+#include <tf2/LinearMath/Quaternion.hpp>
+#include <tf2/LinearMath/Vector3.hpp>
+#include <tf2/LinearMath/Matrix3x3.hpp>
 #include <compass_msgs/msg/azimuth.hpp>
-#include <tf2/LinearMath/Vector3.h>
-#include <tf2/LinearMath/Matrix3x3.h>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
@@ -26,6 +28,7 @@
 #include "fusioncore_ros/srv/from_ll.hpp"
 #include "fusioncore_ros/msg/gnss_status.hpp"
 #include "fusioncore_ros/msg/filter_health.hpp"
+#include <lifecycle_msgs/msg/transition.hpp>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -70,6 +73,13 @@ public:
     // publish /fusion/odom; only the TF broadcast is suppressed.
     declare_parameter("publish.tf", true);
 
+    // When true (default), the node self-transitions configure -> activate
+    // automatically ~200ms after on_configure() returns. This removes the
+    // need for external callers to manage lifecycle transitions manually.
+    // Set to false when your launch file drives transitions itself (e.g. via
+    // OnStateTransition or nav2_lifecycle_manager) to avoid a double-activate.
+    declare_parameter("autostart", true);
+
     // Primary IMU topic. Override when your driver publishes at a non-default topic
     // (e.g. Clearpath Microstrain at /sensors/imu_0/data, Realsense at /camera/imu).
     // Using a launch-time remap is equivalent and preferred for readability.
@@ -90,6 +100,13 @@ public:
     // The filter measurement model always expects specific force. If your IMU
     // already subtracted gravity, enable this to add gravity back before fusing.
     declare_parameter("imu.remove_gravitational_acceleration", false);
+
+    // IMU lever arm (offset from base_link to IMU sensing point, body frame).
+    // Leave at 0 to auto-resolve from TF (base_frame -> imu_frame translation
+    // via the URDF). Set non-zero to override the TF value.
+    declare_parameter("imu.lever_arm_x", 0.0);
+    declare_parameter("imu.lever_arm_y", 0.0);
+    declare_parameter("imu.lever_arm_z", 0.0);
 
     // Optional second IMU source. When non-empty, FusionCore subscribes to this
     // topic and calls update_imu() for each message, treating the two sensors as
@@ -160,10 +177,19 @@ public:
     // Set false (default) to use sensor_msgs/NavSatFix: works with all receivers.
     declare_parameter("gnss.use_gps_fix", false);
 
-    // Antenna lever arm params: primary receiver
+    // Antenna lever arm params: primary receiver.
+    // Leave at 0 to auto-resolve from TF (base_frame -> GNSS msg frame_id
+    // translation, via URDF); set non-zero to override.
     declare_parameter("gnss.lever_arm_x", 0.0);
     declare_parameter("gnss.lever_arm_y", 0.0);
     declare_parameter("gnss.lever_arm_z", 0.0);
+
+    // When true, the GNSS lever arm is applied from the very first fix, not
+    // only after heading_validated_. Let RTK-grade fixes observe yaw directly
+    // through the antenna-offset projection from startup rather than waiting
+    // for the heading_observable_distance integration. Safe with Mahalanobis
+    // gating on.
+    declare_parameter("gnss.apply_lever_arm_pre_heading", false);
 
     // Antenna lever arm params: secondary receiver (gnss.fix2_topic)
     // Leave at 0.0 if second antenna is at the same position as the first,
@@ -230,6 +256,23 @@ public:
     declare_parameter("zupt.velocity_threshold", 0.05);  // m/s
     declare_parameter("zupt.angular_threshold",  0.05);  // rad/s
     declare_parameter("zupt.noise_sigma",        0.01);  // m/s: tight
+
+    // Raw magnetometer heading fusion.
+    // Subscribe to sensor_msgs/MagneticField and fuse heading via UKF 1-DOF update.
+    // Provides immediate yaw observability at startup and suppresses heading drift
+    // during GPS outages. Requires hard/soft iron calibration for accurate results.
+    // Set enabled: true only after calibrating with imu_calib or magneto.
+    declare_parameter("magnetometer.enabled",        false);
+    declare_parameter("magnetometer.topic",          std::string("/imu/mag"));
+    declare_parameter("magnetometer.noise_rad",      0.05);
+    declare_parameter("magnetometer.chi2_threshold", 9.21);
+    declare_parameter("magnetometer.declination_rad", 0.0);
+    // Hard iron bias (Tesla): [bx, by, bz]. Estimated from calibration.
+    declare_parameter("magnetometer.hard_iron",
+      std::vector<double>{0.0, 0.0, 0.0});
+    // Soft iron scale matrix (row-major 3x3). Identity = no correction.
+    declare_parameter("magnetometer.soft_iron",
+      std::vector<double>{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0});
 
     // Lateral velocity NHC: how strongly to enforce VY=0 (m/s sigma).
     // 0.05 (default): standard differential drive on good surface.
@@ -318,6 +361,23 @@ public:
     imu_topic_          = get_parameter("imu.topic").as_string();
     imu_remove_gravity_ = get_parameter("imu.remove_gravitational_acceleration").as_bool();
     imu_frame_override_ = get_parameter("imu.frame_id").as_string();
+
+    // IMU lever arm: start from explicit params; if all zero, the ROS
+    // wrapper will auto-resolve from TF (base_frame -> imu_frame) on the
+    // first IMU message and call fc_->set_imu_lever_arm() with
+    // the translation it extracts from URDF.
+    config.imu.lever_arm.x = get_parameter("imu.lever_arm_x").as_double();
+    config.imu.lever_arm.y = get_parameter("imu.lever_arm_y").as_double();
+    config.imu.lever_arm.z = get_parameter("imu.lever_arm_z").as_double();
+    imu_lever_arm_explicit_ = !config.imu.lever_arm.is_zero();
+    if (imu_lever_arm_explicit_) {
+      RCLCPP_INFO(get_logger(),
+        "IMU lever arm (explicit): x=%.3f y=%.3f z=%.3f m",
+        config.imu.lever_arm.x, config.imu.lever_arm.y, config.imu.lever_arm.z);
+    } else {
+      RCLCPP_INFO(get_logger(),
+        "IMU lever arm: will auto-resolve from TF on first IMU message");
+    }
     RCLCPP_INFO(get_logger(), "IMU gravity removal: %s",
       imu_remove_gravity_ ? "ENABLED" : "disabled");
     if (!imu_frame_override_.empty())
@@ -354,6 +414,14 @@ public:
     gnss_lever_arm_.x = get_parameter("gnss.lever_arm_x").as_double();
     gnss_lever_arm_.y = get_parameter("gnss.lever_arm_y").as_double();
     gnss_lever_arm_.z = get_parameter("gnss.lever_arm_z").as_double();
+    gnss_lever_arm_explicit_ = !gnss_lever_arm_.is_zero();
+    config.gnss.apply_lever_arm_pre_heading =
+      get_parameter("gnss.apply_lever_arm_pre_heading").as_bool();
+    if (config.gnss.apply_lever_arm_pre_heading) {
+      RCLCPP_INFO(get_logger(),
+        "GNSS lever arm will be applied pre-heading-validation "
+        "(gnss.apply_lever_arm_pre_heading=true)");
+    }
 
     gnss_lever_arm2_.x = get_parameter("gnss.lever_arm2_x").as_double();
     gnss_lever_arm2_.y = get_parameter("gnss.lever_arm2_y").as_double();
@@ -451,6 +519,34 @@ public:
     zupt_angular_threshold_  = get_parameter("zupt.angular_threshold").as_double();
     zupt_noise_sigma_        = get_parameter("zupt.noise_sigma").as_double();
 
+    mag_enabled_ = get_parameter("magnetometer.enabled").as_bool();
+    mag_topic_   = get_parameter("magnetometer.topic").as_string();
+    config.mag.noise_rad      = get_parameter("magnetometer.noise_rad").as_double();
+    config.mag.chi2_threshold = get_parameter("magnetometer.chi2_threshold").as_double();
+    config.mag.declination_rad = get_parameter("magnetometer.declination_rad").as_double();
+
+    {
+      auto hi = get_parameter("magnetometer.hard_iron").as_double_array();
+      if (hi.size() == 3) {
+        config.mag.hard_iron = Eigen::Vector3d(hi[0], hi[1], hi[2]);
+      }
+      auto si = get_parameter("magnetometer.soft_iron").as_double_array();
+      if (si.size() == 9) {
+        config.mag.soft_iron << si[0], si[1], si[2],
+                                si[3], si[4], si[5],
+                                si[6], si[7], si[8];
+      }
+    }
+
+    if (mag_enabled_) {
+      RCLCPP_INFO(get_logger(),
+        "Magnetometer heading fusion enabled on topic: %s "
+        "(noise=%.3f rad, declination=%.3f rad)",
+        mag_topic_.c_str(),
+        config.mag.noise_rad,
+        config.mag.declination_rad);
+    }
+
     config.encoder_nhc_vy_sigma        = get_parameter("encoder.nhc_vy_sigma").as_double();
     config.ground_constraint_vz_sigma  = get_parameter("ground_constraint.vz_sigma").as_double();
     config.ground_constraint_az_sigma  = get_parameter("ground_constraint.az_sigma").as_double();
@@ -496,6 +592,15 @@ public:
       "FusionCore configured. base_frame=%s odom_frame=%s rate=%.0fHz",
       base_frame_.c_str(), odom_frame_.c_str(), publish_rate_);
 
+    autostart_ = get_parameter("autostart").as_bool();
+    if (autostart_) {
+      autostart_timer_ = create_wall_timer(200ms, [this]() {
+        autostart_timer_->cancel();
+        trigger_transition(lifecycle_msgs::msg::Transition::TRANSITION_ACTIVATE);
+      });
+      RCLCPP_INFO(get_logger(), "Autostart enabled: activating in 200ms.");
+    }
+
     return CallbackReturn::SUCCESS;
   }
 
@@ -515,9 +620,14 @@ public:
 
     rclcpp::SubscriptionOptions sensor_opts;
     sensor_opts.callback_group = sensor_cb_group_;
+    // BEST_EFFORT QoS: compatible with both BEST_EFFORT and RELIABLE publishers.
+    // Most hardware drivers (ublox, Septentrio, Microstrain, etc.) publish sensor
+    // data as BEST_EFFORT. Using RELIABLE here silently drops all messages from
+    // those drivers because the QoS policies are incompatible in ROS 2.
+    auto sensor_qos = rclcpp::SensorDataQoS();
 
     imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-      imu_topic_, 100,
+      imu_topic_, sensor_qos,
       [this](const sensor_msgs::msg::Imu::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(fc_mutex_);
         imu_callback(msg);
@@ -526,7 +636,7 @@ public:
 
     if (!imu2_topic_.empty()) {
       imu2_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-        imu2_topic_, 100,
+        imu2_topic_, sensor_qos,
         [this](const sensor_msgs::msg::Imu::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           imu2_callback(msg);
@@ -536,7 +646,7 @@ public:
     }
 
     encoder_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      "/odom/wheels", 50,
+      "/odom/wheels", sensor_qos,
       [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(fc_mutex_);
         encoder_callback(msg);
@@ -547,7 +657,7 @@ public:
     // behavior identical to a single-encoder setup.
     if (!encoder2_topic_.empty()) {
       encoder2_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-        encoder2_topic_, 50,
+        encoder2_topic_, sensor_qos,
         [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           encoder2_callback(msg);
@@ -558,7 +668,7 @@ public:
 
     if (!vslam_topic_.empty()) {
       vslam_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-        vslam_topic_, 50,
+        vslam_topic_, sensor_qos,
         [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           vslam_callback(msg);
@@ -569,7 +679,7 @@ public:
 
     if (!gnss_vel_topic_.empty()) {
       gnss_vel_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-        gnss_vel_topic_, 10,
+        gnss_vel_topic_, sensor_qos,
         [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           gnss_vel_callback(msg);
@@ -580,7 +690,7 @@ public:
 
     if (!radar_vel_topic_.empty()) {
       radar_vel_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-        radar_vel_topic_, 10,
+        radar_vel_topic_, sensor_qos,
         [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           radar_vel_callback(msg);
@@ -591,7 +701,7 @@ public:
 
     if (use_gps_fix_) {
       gps_fix_sub_ = create_subscription<gps_msgs::msg::GPSFix>(
-        "/gnss/fix", 10,
+        "/gnss/fix", sensor_qos,
         [this](const gps_msgs::msg::GPSFix::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           gps_fix_callback(msg, 0);
@@ -600,7 +710,7 @@ public:
         "GNSS: using gps_msgs/GPSFix on /gnss/fix (RTK_FLOAT capable)");
     } else {
       gnss_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
-        "/gnss/fix", 10,
+        "/gnss/fix", sensor_qos,
         [this](const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           gnss_callback(msg, 0);
@@ -610,7 +720,7 @@ public:
     // compass_msgs/Azimuth heading: optional, preferred over sensor_msgs/Imu
     if (!azimuth_topic_.empty()) {
       azimuth_sub_ = create_subscription<compass_msgs::msg::Azimuth>(
-        azimuth_topic_, 10,
+        azimuth_topic_, sensor_qos,
         [this](const compass_msgs::msg::Azimuth::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           azimuth_callback(msg);
@@ -619,10 +729,22 @@ public:
         "compass_msgs/Azimuth heading enabled on topic: %s", azimuth_topic_.c_str());
     }
 
+    // Raw magnetometer heading: optional, enabled via magnetometer.enabled
+    if (mag_enabled_) {
+      mag_sub_ = create_subscription<sensor_msgs::msg::MagneticField>(
+        mag_topic_, sensor_qos,
+        [this](const sensor_msgs::msg::MagneticField::SharedPtr msg) {
+          std::lock_guard<std::mutex> lock(fc_mutex_);
+          mag_callback(msg);
+        }, sensor_opts);
+      RCLCPP_INFO(get_logger(),
+        "Magnetometer subscribed on topic: %s", mag_topic_.c_str());
+    }
+
     // Second GNSS receiver: optional
     if (!gnss2_topic_.empty()) {
       gnss2_sub_ = create_subscription<sensor_msgs::msg::NavSatFix>(
-        gnss2_topic_, 10,
+        gnss2_topic_, sensor_qos,
         [this](const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           gnss_callback(msg, 1);
@@ -636,7 +758,7 @@ public:
     // This is the standard way dual antenna GPS receivers report heading in ROS.
     if (!heading_topic_.empty()) {
       gnss_heading_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-        heading_topic_, 10,
+        heading_topic_, sensor_qos,
         [this](const sensor_msgs::msg::Imu::SharedPtr msg) {
           std::lock_guard<std::mutex> lock(fc_mutex_);
           gnss_heading_callback(msg);
@@ -835,6 +957,7 @@ public:
     gnss2_sub_.reset();
     gnss_heading_sub_.reset();
     azimuth_sub_.reset();
+    mag_sub_.reset();
     publish_timer_.reset();
     diag_timer_.reset();
     reset_srv_.reset();
@@ -856,6 +979,7 @@ public:
 
   CallbackReturn on_cleanup(const rclcpp_lifecycle::State &)
   {
+    autostart_timer_.reset();
     fc_.reset();
     tf_broadcaster_.reset();
     tf_listener_.reset();
@@ -1124,6 +1248,38 @@ private:
           validated_frame.c_str(), imu_frame_resolved_.c_str(), imu_frame_resolved_.c_str());
       } else {
         RCLCPP_DEBUG(get_logger(), "IMU TF frame confirmed: %s", imu_frame_resolved_.c_str());
+      }
+    }
+
+    // One-shot auto-resolve of the IMU lever arm from TF. Only runs when
+    // the user did NOT set imu.lever_arm_x/y/z explicitly (all zero).
+    // Picks up the translation from base_frame -> imu_frame published by
+    // robot_state_publisher from the URDF.
+    if (!imu_lever_arm_explicit_ && !imu_lever_arm_tf_resolved_ &&
+        imu_frame != base_frame_) {
+      try {
+        auto tf = tf_buffer_->lookupTransform(
+          base_frame_, imu_frame, tf2::TimePointZero,
+          tf2::durationFromSec(0.2));
+        fusioncore::sensors::ImuLeverArm la;
+        la.x = tf.transform.translation.x;
+        la.y = tf.transform.translation.y;
+        la.z = tf.transform.translation.z;
+        if (!la.is_zero()) {
+          fc_->set_imu_lever_arm(la);
+          RCLCPP_INFO(get_logger(),
+            "IMU lever arm auto-resolved from TF %s -> %s: x=%.3f y=%.3f z=%.3f m",
+            base_frame_.c_str(), imu_frame.c_str(), la.x, la.y, la.z);
+        } else {
+          RCLCPP_INFO(get_logger(),
+            "IMU lever arm auto-resolved to zero (IMU is at base_frame origin)");
+        }
+        imu_lever_arm_tf_resolved_ = true;
+      } catch (const tf2::TransformException &ex) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+          "IMU lever arm auto-resolve failed (%s -> %s): %s. "
+          "Leaving lever arm at zero; set imu.lever_arm_x/y/z explicitly to override.",
+          base_frame_.c_str(), imu_frame.c_str(), ex.what());
       }
     }
 
@@ -1618,6 +1774,41 @@ private:
 
     double t = rclcpp::Time(msg->header.stamp).seconds();
 
+    // One-shot auto-resolve of the GNSS lever arm from TF, primary receiver
+    // only. Uses msg->header.frame_id (typically "gps" or "gnss_link")
+    // looked up against base_frame_. Only runs when the user did not set
+    // gnss.lever_arm_x/y/z explicitly.
+    if (source_id == 0 && !gnss_lever_arm_explicit_ && !gnss_lever_arm_tf_resolved_) {
+      if (!msg->header.frame_id.empty() && msg->header.frame_id != base_frame_) {
+        try {
+          auto tf = tf_buffer_->lookupTransform(
+            base_frame_, msg->header.frame_id, tf2::TimePointZero,
+            tf2::durationFromSec(0.2));
+          gnss_lever_arm_.x = tf.transform.translation.x;
+          gnss_lever_arm_.y = tf.transform.translation.y;
+          gnss_lever_arm_.z = tf.transform.translation.z;
+          if (!gnss_lever_arm_.is_zero()) {
+            RCLCPP_INFO(get_logger(),
+              "GNSS lever arm auto-resolved from TF %s -> %s: x=%.3f y=%.3f z=%.3f m",
+              base_frame_.c_str(), msg->header.frame_id.c_str(),
+              gnss_lever_arm_.x, gnss_lever_arm_.y, gnss_lever_arm_.z);
+          } else {
+            RCLCPP_INFO(get_logger(),
+              "GNSS lever arm auto-resolved to zero (antenna at base_frame origin)");
+          }
+          gnss_lever_arm_tf_resolved_ = true;
+        } catch (const tf2::TransformException &ex) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+            "GNSS lever arm auto-resolve failed (%s -> %s): %s. "
+            "Leaving lever arm at zero; set gnss.lever_arm_x/y/z explicitly to override.",
+            base_frame_.c_str(), msg->header.frame_id.c_str(), ex.what());
+        }
+      } else {
+        // Empty frame_id or same as base: nothing to resolve, mark done.
+        gnss_lever_arm_tf_resolved_ = true;
+      }
+    }
+
     fusioncore::sensors::LLAPoint lla;
     lla.lat_rad = msg->latitude  * M_PI / 180.0;
     lla.lon_rad = msg->longitude * M_PI / 180.0;
@@ -2058,6 +2249,21 @@ private:
     }
   }
 
+  void mag_callback(const sensor_msgs::msg::MagneticField::SharedPtr msg)
+  {
+    if (!fc_->is_initialized()) return;
+    double t = rclcpp::Time(msg->header.stamp).seconds();
+    bool accepted = fc_->update_magnetometer(
+      t,
+      msg->magnetic_field.x,
+      msg->magnetic_field.y,
+      msg->magnetic_field.z);
+    if (!accepted) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+        "Magnetometer heading update rejected (chi2 gate)");
+    }
+  }
+
   // ─── Observability helpers ────────────────────────────────────────────────
 
   // Converts a GnssRejectionReason enum to the string stored in the message.
@@ -2379,6 +2585,14 @@ private:
         {{"outlier_count", std::to_string(status.vslam_outliers)}}));
     }
 
+    // Magnetometer (only shown when configured)
+    if (mag_enabled_) {
+      diag_array.status.push_back(make_status("Magnetometer",
+        health_to_level(status.mag_health),
+        health_to_str(status.mag_health),
+        {{"outlier_count", std::to_string(status.mag_outliers)}}));
+    }
+
     // Filter
     auto heading_src_str = [](fusioncore::HeadingSource src) -> std::string {
       switch (src) {
@@ -2386,6 +2600,7 @@ private:
         case fusioncore::HeadingSource::DUAL_ANTENNA:    return "DUAL_ANTENNA";
         case fusioncore::HeadingSource::IMU_ORIENTATION: return "IMU_ORIENTATION (9-axis)";
         case fusioncore::HeadingSource::GPS_TRACK:       return "GPS_TRACK";
+        case fusioncore::HeadingSource::MAGNETOMETER:    return "MAGNETOMETER";
       }
       return "Unknown";
     };
@@ -2437,6 +2652,7 @@ private:
       fh.gnss_outlier_count    = status.gnss_outliers;
       fh.imu_outlier_count     = status.imu_outliers;
       fh.encoder_outlier_count = status.enc_outliers;
+      fh.mag_outlier_count     = status.mag_outliers;
 
       filter_health_pub_->publish(fh);
     }
@@ -2557,6 +2773,7 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr          imu_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr          imu2_sub_;
   rclcpp::Subscription<compass_msgs::msg::Azimuth>::SharedPtr     azimuth_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::MagneticField>::SharedPtr mag_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr          gnss_heading_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        encoder_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr        encoder2_sub_;
@@ -2585,6 +2802,8 @@ private:
   std::string heading_topic_;
   std::string gnss2_topic_;
   std::string azimuth_topic_;
+  std::string mag_topic_;
+  bool        mag_enabled_ = false;
   std::string encoder2_topic_;
   double      enc2_vel_noise_ = 0.05;
   double      enc2_yaw_noise_ = 0.02;
@@ -2631,6 +2850,14 @@ private:
   fusioncore::sensors::GnssLeverArm gnss_lever_arm_;    // primary receiver
   fusioncore::sensors::GnssLeverArm gnss_lever_arm2_;   // secondary receiver (fix2_topic)
 
+  // Auto-resolve flags: true means a non-zero value was given in the YAML
+  // and we should NOT overwrite it from TF. Default (all zero) triggers
+  // one-shot TF resolution on the first matching message.
+  bool imu_lever_arm_explicit_    = false;
+  bool gnss_lever_arm_explicit_   = false;
+  bool imu_lever_arm_tf_resolved_  = false;
+  bool gnss_lever_arm_tf_resolved_ = false;
+
   // ZUPT parameters
   bool   zupt_enabled_            = true;
   double zupt_velocity_threshold_ = 0.05;
@@ -2660,6 +2887,10 @@ private:
   bool                     sensor_wait_done_     = false;
   std::set<std::string>    sensors_expected_;
   std::set<std::string>    sensors_received_;
+
+  // Autostart: self-transition configure -> activate without external lifecycle management
+  bool autostart_ = true;
+  rclcpp::TimerBase::SharedPtr autostart_timer_;
 
   // Deterministic replay checkpoint (#27)
   std::string checkpoint_path_;
