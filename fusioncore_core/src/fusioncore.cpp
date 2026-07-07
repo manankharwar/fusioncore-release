@@ -2,6 +2,7 @@
 #include "fusioncore/sensors/imu.hpp"
 #include <stdexcept>
 #include <cmath>
+#include <limits>
 
 namespace fusioncore {
 
@@ -142,6 +143,7 @@ void FusionCore::init(const State& initial_state, double timestamp_seconds) {
   gnss_consecutive_rejects_ = 0;
   gnss_in_coast_            = false;
   gnss_in_recovery_         = false;
+  reject_after_gap_         = false;
   ukf_.set_position_noise_scale(1.0);
   ukf_.set_gyro_bias_noise_scale(1.0);
 
@@ -177,6 +179,7 @@ void FusionCore::reset() {
   gnss_consecutive_rejects_ = 0;
   gnss_in_coast_            = false;
   gnss_in_recovery_         = false;
+  reject_after_gap_         = false;
   ukf_.set_position_noise_scale(1.0);
   ukf_.set_gyro_bias_noise_scale(1.0);
 
@@ -345,6 +348,19 @@ void FusionCore::predict_to(double timestamp_seconds) {
   }
 
   double dt = timestamp_seconds - last_timestamp_;
+  // Large backward time jump (clock reset, badly out-of-order timestamps,
+  // bag-replay clock corruption on WSL2): re-sync the clock to the new time
+  // base instead of freezing last_timestamp_ in the future. If we just returned,
+  // last_timestamp_ would stay ahead and every following measurement would skip
+  // its predict (dt stays negative) while still running its update, so P shrinks
+  // with no Q injected until it goes non-PSD and the Cholesky factorization
+  // fails. Small backward steps (delayed measurements within the delay window)
+  // are still handled by the retrodiction path; this only catches jumps beyond
+  // that window. We do not fold in the spurious measurement here: just re-base.
+  if (dt < -config_.max_measurement_delay) {
+    last_timestamp_ = timestamp_seconds;
+    return;
+  }
   if (dt < config_.min_dt) return;
   if (dt > config_.max_dt) {
     // Gap too large for a single step (sensor dropout, startup lag, etc.).
@@ -849,21 +865,57 @@ bool FusionCore::apply_gnss_update(
     double d2 = innovation_pre.dot(S.ldlt().solve(innovation_pre));
     gnss_debug_.mahalanobis_sq = d2;
 
+    // Physical plausibility gate: the fix cannot be farther from the predicted
+    // position than the robot could have moved or drifted since the last accepted
+    // fix (dead-reckoning error <= distance traveled <= max_speed * dt). This
+    // catches an adversarial outlier cluster at a blackout boundary that a
+    // coast-relaxed chi2 gate would admit. It is checked filter-vs-fix (not
+    // GPS-to-GPS) so it scales with the gap and is immune to the cluster being
+    // internally self-consistent. Rejected fixes do NOT count toward coast, so
+    // an outlier can never inflate P and relax the gate.
+    if (config_.gnss_max_speed > 0.0 && last_gnss_time_ >= 0.0) {
+      double gap_s = timestamp_seconds - last_gnss_time_;
+      double offset_xy = std::sqrt(innovation_pre[0]*innovation_pre[0] +
+                                   innovation_pre[1]*innovation_pre[1]);
+      double max_offset = config_.gnss_max_speed * std::max(gap_s, 0.0) +
+                          config_.gnss_max_speed_margin;
+      if (offset_xy > max_offset) {
+        ++gnss_outliers_;
+        gnss_debug_.accepted = false;
+        gnss_debug_.reason   = GnssRejectionReason::IMPLAUSIBLE_JUMP;
+        return false;  // do not touch the coast counters: an outlier must not relax the gate
+      }
+    }
+
     if (d2 > config_.outlier_threshold_gnss) {
       ++gnss_outliers_;
       gnss_debug_.accepted = false;
       gnss_debug_.reason   = GnssRejectionReason::CHI2_FAILED;
 
       if (config_.gnss_coast_n > 0) {
+        // At the start of a rejection sequence, decide whether GPS was
+        // continuous (a persistent outlier like a multipath spike) or is
+        // returning after a gap (the filter may have drifted blind). Only the
+        // latter justifies inflating P to re-admit GPS. last_gnss_time_ is the
+        // last ACCEPTED fix, so the gap to it is small during a continuous
+        // spike and large after an outage.
+        if (gnss_consecutive_rejects_ == 0) {
+          double gap = (last_gnss_time_ < 0.0)
+                         ? std::numeric_limits<double>::infinity()
+                         : (timestamp_seconds - last_gnss_time_);
+          reject_after_gap_ = (gap >= config_.gnss_coast_min_gap_s);
+        }
         ++gnss_consecutive_rejects_;
         gnss_debug_.consecutive_rejects = gnss_consecutive_rejects_;
-        if (gnss_consecutive_rejects_ >= config_.gnss_coast_n && !gnss_in_coast_) {
+        if (reject_after_gap_ &&
+            gnss_consecutive_rejects_ >= config_.gnss_coast_n && !gnss_in_coast_) {
           gnss_in_coast_ = true;
           gnss_debug_.in_coast_mode = true;
           ukf_.set_position_noise_scale(config_.gnss_coast_q_factor);
           ukf_.set_gyro_bias_noise_scale(config_.gnss_coast_q_bias_factor);
         }
-        if (config_.gnss_recovery_rejection_n > 0 &&
+        if (reject_after_gap_ &&
+            config_.gnss_recovery_rejection_n > 0 &&
             gnss_consecutive_rejects_ == config_.gnss_recovery_rejection_n) {
           double s2 = config_.gnss_p_inflate_sigma * config_.gnss_p_inflate_sigma;
           ukf_.inflate_position_covariance(s2);
@@ -1180,6 +1232,15 @@ bool FusionCore::update_magnetometer(
     throw std::runtime_error("FusionCore: update_magnetometer() called before init()");
 
   predict_to(timestamp_seconds);
+
+  // Reject readings taken in a locally disturbed field (motor, steel, rebar):
+  // the magnitude no longer matches Earth's field, so the tilt-compensated
+  // heading is untrustworthy in a way the 1-DOF chi2 gate below cannot reliably
+  // catch. See sensors::mag_field_disturbed. Disabled when field_strength <= 0.
+  if (sensors::mag_field_disturbed(mx, my, mz, config_.mag)) {
+    ++mag_outliers_;
+    return false;
+  }
 
   // Extract current roll and pitch from the filter state for tilt compensation.
   // Yaw is what we are about to measure, so we only need roll and pitch here.
