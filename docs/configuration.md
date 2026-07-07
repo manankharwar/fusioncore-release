@@ -178,6 +178,19 @@ fusioncore:
     # Corrects for elliptical distortion in the magnetic field.
     # Estimated alongside hard iron using imu_calib or magneto.
 
+    magnetometer.field_strength: 0.0
+    # Local Earth total-field magnitude, in the SAME units as the incoming reading
+    # (e.g. ~0.48 for Gauss, ~48 for microtesla). A clean reading's corrected
+    # magnitude equals this; a nearby motor or steel structure distorts it and
+    # produces a wrong heading the chi2 gate cannot reliably catch. When the
+    # magnitude deviates by more than field_tolerance the reading is rejected.
+    # Look up the total field at https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml
+    # 0.0 = disabled (no magnitude check).
+
+    magnetometer.field_tolerance: 0.2
+    # Allowed fractional deviation of the field magnitude before a reading is
+    # treated as locally disturbed. 0.2 = accept within +-20% of field_strength.
+
     # ── GPS coast mode ────────────────────────────────────────────────────────
     # During GPS blackouts, inflates process noise so P grows and the chi2 gate
     # relaxes by the time GPS resumes. Prevents the filter from rejecting its
@@ -186,6 +199,15 @@ fusioncore:
 
     gnss.coast_n: 3
     # Consecutive chi2 GPS rejections before entering coast mode. 0 = disabled.
+
+    gnss.coast_min_gap_s: 1.0
+    # Rejection-triggered coast only fires if the rejection streak began after a
+    # GPS gap of at least this many seconds (the receiver actually went silent and
+    # the filter dead-reckoned). A continuously present GPS that keeps failing the
+    # chi2 gate is a persistent outlier (e.g. a sustained multipath spike), not
+    # filter drift, so inflating P to re-admit it would let the outlier defeat the
+    # gate. Gating on a preceding gap keeps a sustained spike rejected for its full
+    # duration while preserving post-outage re-acquisition. 0 = old behavior.
 
     gnss.coast_q_factor: 10.0
     # Q_position multiplier in coast mode. Controls how fast position uncertainty
@@ -264,6 +286,18 @@ fusioncore:
     # this gate rejects those jumps automatically when covariance is calibrated.
     # Do NOT lower these below chi2 critical values. At 7.0 normal GPS noise
     # trips the gate and every fix gets rejected.
+
+    gnss.max_speed: 0.0
+    # Physical-plausibility gate on GPS position. Rejects any fix farther from the
+    # filter's predicted position than the robot could have moved or drifted since
+    # the last accepted fix: max_speed * gap_seconds + max_speed_margin. This is a
+    # kinematic backstop that catches an impossible GPS jump the chi2 gate may
+    # admit when its covariance has been inflated during coast recovery. Set to the
+    # platform's maximum plausible speed in m/s (a few times cruise is safe); this
+    # is a per-robot spec like wheel radius, not per-run tuning. 0.0 = disabled.
+    gnss.max_speed_margin: 5.0
+    # Slack (m) added to the max_speed * gap bound: covers GPS noise and the
+    # uncertainty in the predicted position. 3-5 m is typical.
 
     # ── Adaptive noise ────────────────────────────────────────────────────────
     adaptive.imu: true
