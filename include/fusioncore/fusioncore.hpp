@@ -75,6 +75,23 @@ struct FusionCoreConfig {
   double outlier_threshold_hdg   = 10.83;  // chi2(1, 0.999): 1D heading
   double outlier_threshold_vslam = 22.46;  // chi2(6, 0.999): 6D pose
 
+  // Physical plausibility gate for GNSS position.
+  // A fix cannot be farther from the filter's predicted position than the robot
+  // could physically have moved or drifted since the last accepted fix:
+  // dead-reckoning error is bounded by the distance traveled, which is bounded
+  // by max_speed * dt. This rejects an adversarial outlier cluster arriving at a
+  // GPS-blackout boundary, which a coast-relaxed chi2 gate would otherwise admit
+  // (the chi2 covariance has been inflated to re-acquire, so a far outlier slips
+  // through; chi2 alone cannot tell a 700 m outlier from a legitimate recovery
+  // fix after a long gap, but physics can). An implausible fix is rejected and
+  // does NOT count toward coast, so an outlier can never relax the gate.
+  // Set to the platform's maximum plausible speed (m/s); a few times cruise
+  // speed is safe. 0 = disabled (default, preserves prior behavior).
+  double gnss_max_speed        = 0.0;
+  // Slack added to the max_speed * dt bound (m): covers GPS noise and the fact
+  // that the predicted position itself has some uncertainty. ~3-5 m is typical.
+  double gnss_max_speed_margin = 5.0;
+
   // Adaptive noise covariance
   // Whether to enable adaptive R estimation for each sensor
   bool adaptive_imu     = true;
@@ -156,6 +173,16 @@ struct FusionCoreConfig {
   // and then rejects the recovery fixes as apparent outliers.
   // 0 = disabled; typical value: 5
   int    gnss_coast_n        = 5;
+  // Rejection-triggered coast only fires when the rejection sequence began
+  // after a GPS gap of at least this many seconds (i.e. the filter plausibly
+  // drifted blind and is now rejecting the returning fix). A continuously
+  // present GPS that keeps failing the chi2 gate is a persistent outlier (e.g.
+  // a multipath spike), NOT filter drift: inflating P to admit it would let the
+  // outlier defeat the gate. Gating coast on a preceding gap keeps a sustained
+  // spike rejected for its whole duration while preserving post-outage
+  // re-acquisition. The pure-absence coast path (gnss_coast_timeout_s) is
+  // unaffected. Set to 0 to restore the old gap-agnostic behavior.
+  double gnss_coast_min_gap_s = 1.0;
   // Multiplier applied to q_position each predict step while in coast mode.
   // 20.0 = 4.5x position sigma growth per second at 100Hz IMU.
   double gnss_coast_q_factor = 20.0;
@@ -223,6 +250,7 @@ enum class GnssRejectionReason {
   MIN_SATS        = 5,  // satellites < min_satellites
   CHI2_FAILED     = 6,  // Mahalanobis distance > threshold
   DELAY_TOO_LARGE = 7,  // measurement older than max_measurement_delay
+  IMPLAUSIBLE_JUMP = 8, // fix farther from prediction than max_speed*dt allows
 };
 
 // Per-fix observability data: populated by update_gnss() on every call.
@@ -482,6 +510,10 @@ private:
   // Inertial coast mode tracking
   int  gnss_consecutive_rejects_ = 0;
   bool gnss_in_coast_            = false;
+  // Whether the current rejection sequence began after a GPS gap. Captured at
+  // the first rejection of a sequence and used to gate rejection-triggered
+  // coast so a continuous outlier (spike) cannot inflate P to defeat the gate.
+  bool reject_after_gap_         = false;
   // Recovery mode: after a timeout-triggered coast, accept the first returning
   // GPS fix unconditionally (bypass chi2 gate). After 7+ minutes blind, dead
   // reckoning error can be hundreds of meters, far outside the chi2 gate.
