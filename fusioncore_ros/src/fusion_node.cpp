@@ -220,6 +220,8 @@ public:
     declare_parameter("outlier_threshold_enc",   11.34);
     declare_parameter("outlier_threshold_hdg",   10.83);
     declare_parameter("outlier_threshold_vslam", 22.46);
+    declare_parameter("gnss.max_speed",          0.0);
+    declare_parameter("gnss.max_speed_margin",   5.0);
     // VSLAM pose input (ORB-SLAM3, RTAB-Map, Kimera, etc.)
     declare_parameter("vslam.topic",              std::string(""));
     declare_parameter("vslam.position_noise",     0.1);
@@ -228,6 +230,7 @@ public:
     declare_parameter("vslam.reinit_n",           10);
 
     declare_parameter("gnss.coast_n",               5);
+    declare_parameter("gnss.coast_min_gap_s",       1.0);
     declare_parameter("gnss.coast_q_factor",        20.0);
     declare_parameter("gnss.coast_timeout_s",       0.0);
     declare_parameter("gnss.coast_q_bias_factor",   100.0);
@@ -273,6 +276,12 @@ public:
     // Soft iron scale matrix (row-major 3x3). Identity = no correction.
     declare_parameter("magnetometer.soft_iron",
       std::vector<double>{1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0});
+    // Disturbance rejection by field magnitude. field_strength = local Earth
+    // total field in the SAME units as the incoming reading (Gauss, microtesla);
+    // a reading whose magnitude deviates by more than field_tolerance is treated
+    // as locally disturbed (motor, steel) and rejected. 0.0 = disabled.
+    declare_parameter("magnetometer.field_strength",  0.0);
+    declare_parameter("magnetometer.field_tolerance", 0.2);
 
     // Lateral velocity NHC: how strongly to enforce VY=0 (m/s sigma).
     // 0.05 (default): standard differential drive on good surface.
@@ -464,6 +473,8 @@ public:
 
     config.outlier_rejection      = get_parameter("outlier_rejection").as_bool();
     config.outlier_threshold_gnss = get_parameter("outlier_threshold_gnss").as_double();
+    config.gnss_max_speed         = get_parameter("gnss.max_speed").as_double();
+    config.gnss_max_speed_margin  = get_parameter("gnss.max_speed_margin").as_double();
     config.outlier_threshold_imu  = get_parameter("outlier_threshold_imu").as_double();
     config.outlier_threshold_enc   = get_parameter("outlier_threshold_enc").as_double();
     config.outlier_threshold_hdg   = get_parameter("outlier_threshold_hdg").as_double();
@@ -476,6 +487,7 @@ public:
     vslam_reinit_n_       = get_parameter("vslam.reinit_n").as_int();
 
     config.gnss_coast_n               = get_parameter("gnss.coast_n").as_int();
+    config.gnss_coast_min_gap_s       = get_parameter("gnss.coast_min_gap_s").as_double();
     config.gnss_coast_q_factor        = get_parameter("gnss.coast_q_factor").as_double();
     config.gnss_coast_timeout_s       = get_parameter("gnss.coast_timeout_s").as_double();
     config.gnss_coast_q_bias_factor   = get_parameter("gnss.coast_q_bias_factor").as_double();
@@ -524,6 +536,8 @@ public:
     config.mag.noise_rad      = get_parameter("magnetometer.noise_rad").as_double();
     config.mag.chi2_threshold = get_parameter("magnetometer.chi2_threshold").as_double();
     config.mag.declination_rad = get_parameter("magnetometer.declination_rad").as_double();
+    config.mag.field_strength  = get_parameter("magnetometer.field_strength").as_double();
+    config.mag.field_tolerance = get_parameter("magnetometer.field_tolerance").as_double();
 
     {
       auto hi = get_parameter("magnetometer.hard_iron").as_double_array();
