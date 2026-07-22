@@ -1,0 +1,13 @@
+Source: ros-humble-fusioncore-ros
+Section: misc
+Priority: optional
+Maintainer: "Manan Kharwar" <manan.kharwar@ansys.com>
+Build-Depends: debhelper (>= 9.0.0), libproj-dev, ros-humble-ament-cmake-auto, ros-humble-compass-msgs, ros-humble-diagnostic-msgs, ros-humble-eigen3-cmake-module, ros-humble-fusioncore-core, ros-humble-geographic-msgs, ros-humble-geometry-msgs, ros-humble-gps-msgs, ros-humble-lifecycle-msgs, ros-humble-nav-msgs, ros-humble-rclcpp, ros-humble-rclcpp-lifecycle, ros-humble-rosidl-default-generators, ros-humble-rosidl-default-runtime, ros-humble-sensor-msgs, ros-humble-std-msgs, ros-humble-std-srvs, ros-humble-tf2, ros-humble-tf2-geometry-msgs, ros-humble-tf2-ros, ros-humble-ros-workspace, ros-humble-rosidl-typesupport-fastrtps-c, ros-humble-rosidl-typesupport-fastrtps-cpp
+Homepage: https://github.com/manankharwar/fusioncore
+Standards-Version: 3.9.2
+
+Package: ros-humble-fusioncore-ros
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libproj-dev, ros-humble-compass-msgs, ros-humble-diagnostic-msgs, ros-humble-eigen3-cmake-module, ros-humble-fusioncore-core, ros-humble-geographic-msgs, ros-humble-geometry-msgs, ros-humble-gps-msgs, ros-humble-lifecycle-msgs, ros-humble-nav-msgs, ros-humble-rclcpp, ros-humble-rclcpp-lifecycle, ros-humble-rosidl-default-runtime, ros-humble-sensor-msgs, ros-humble-std-msgs, ros-humble-std-srvs, ros-humble-tf2, ros-humble-tf2-geometry-msgs, ros-humble-tf2-ros, ros-humble-ros-workspace
+Description: ROS 2 UKF sensor fusion for IMU, wheel encoders, GPS, and visual SLAM pose.
+ 23-state filter with ECEF-native GPS handling, online gyro/accel/encoder bias estimation, adaptive noise covariance, chi-squared outlier rejection on every sensor, and map reinitialization recovery for GPS-denied operation. Drop-in robot_localization alternative. Benchmarked on 12 full-length NCLT sequences: wins 10 of 12 vs robot_localization EKF.
