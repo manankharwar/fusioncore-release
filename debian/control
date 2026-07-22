@@ -1,0 +1,13 @@
+Source: ros-jazzy-fusioncore-ros
+Section: misc
+Priority: optional
+Maintainer: "Manan Kharwar" <manan.kharwar@ansys.com>
+Build-Depends: debhelper (>= 9.0.0), libproj-dev, ros-jazzy-ament-cmake-auto, ros-jazzy-compass-msgs, ros-jazzy-diagnostic-msgs, ros-jazzy-eigen3-cmake-module, ros-jazzy-fusioncore-core, ros-jazzy-geographic-msgs, ros-jazzy-geometry-msgs, ros-jazzy-gps-msgs, ros-jazzy-lifecycle-msgs, ros-jazzy-nav-msgs, ros-jazzy-rclcpp, ros-jazzy-rclcpp-lifecycle, ros-jazzy-rosidl-default-generators, ros-jazzy-rosidl-default-runtime, ros-jazzy-sensor-msgs, ros-jazzy-std-msgs, ros-jazzy-std-srvs, ros-jazzy-tf2, ros-jazzy-tf2-geometry-msgs, ros-jazzy-tf2-ros, ros-jazzy-ros-workspace, ros-jazzy-rosidl-typesupport-fastrtps-c, ros-jazzy-rosidl-typesupport-fastrtps-cpp
+Homepage: https://github.com/manankharwar/fusioncore
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-fusioncore-ros
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libproj-dev, ros-jazzy-compass-msgs, ros-jazzy-diagnostic-msgs, ros-jazzy-eigen3-cmake-module, ros-jazzy-fusioncore-core, ros-jazzy-geographic-msgs, ros-jazzy-geometry-msgs, ros-jazzy-gps-msgs, ros-jazzy-lifecycle-msgs, ros-jazzy-nav-msgs, ros-jazzy-rclcpp, ros-jazzy-rclcpp-lifecycle, ros-jazzy-rosidl-default-runtime, ros-jazzy-sensor-msgs, ros-jazzy-std-msgs, ros-jazzy-std-srvs, ros-jazzy-tf2, ros-jazzy-tf2-geometry-msgs, ros-jazzy-tf2-ros, ros-jazzy-ros-workspace
+Description: ROS 2 UKF sensor fusion for IMU, wheel encoders, GPS, and visual SLAM pose.
+ 23-state filter with ECEF-native GPS handling, online gyro/accel/encoder bias estimation, adaptive noise covariance, chi-squared outlier rejection on every sensor, and map reinitialization recovery for GPS-denied operation. Drop-in robot_localization alternative. Benchmarked on 12 full-length NCLT sequences: wins 10 of 12 vs robot_localization EKF.
