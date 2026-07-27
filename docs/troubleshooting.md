@@ -201,13 +201,21 @@ If transforms are printing, the error is a race condition at startup: the downst
 
 ## Encoder or GPS getting rejected (outlier gate)
 
-The fastest way to diagnose rejections is to look at the structured debug topic instead of parsing log lines:
+**Start here: the at-a-glance field.** `/fusion/debug/filter_health` carries `gnss_last_reject_reason`, the reason the most recent fix was dropped (empty until the first rejection). This is the fastest check in the field and the one that survives in a recorded bag, because it is on the lightweight health topic you are already monitoring and recording:
+
+```bash
+ros2 topic echo /fusion/debug/filter_health --field gnss_last_reject_reason
+```
+
+Do not rely on `gnss_outlier_count` alone to tell you GPS is being rejected: that counter only counts chi2 and physical-plausibility rejects. Quality-gate rejects (`HDOP_HIGH`, `VDOP_HIGH`, `FIX_TYPE_LOW`, `MIN_SATS`) and `DELAY_TOO_LARGE` leave it at zero, so a filter dropping every fix on vertical DOP shows `gnss_outlier_count: 0` while `gnss_last_reject_reason: VDOP_HIGH`.
+
+**For the full per-fix detail**, look at the structured debug firehose (one message per fix, accepted or not):
 
 ```bash
 ros2 topic echo /fusion/debug/gnss_status
 ```
 
-Every GPS fix produces one message here, whether it was accepted or not. The `rejection_reason` field tells you exactly which gate fired. The `mahalanobis_sq` field tells you how far the fix was from the filter's prediction (-1.0 means the quality gate failed before the math ran).
+The `rejection_reason` field tells you exactly which gate fired. The `mahalanobis_sq` field tells you how far the fix was from the filter's prediction (-1.0 means the quality gate failed before the math ran).
 
 ```yaml
 accepted: false
@@ -231,15 +239,50 @@ ros2 topic echo /fusion/debug/filter_health --field imu_outlier_count
 
 Common causes and fixes:
 
-| Symptom | Cause | Fix |
+| Reason | Cause | Fix |
 |---|---|---|
-| `rejection_reason: HDOP_HIGH` at startup | Open sky not acquired yet | Normal: clears within 30–60 s once receiver locks |
-| `rejection_reason: CHI2_FAILED` after outage | Filter drifted during blackout, returning GPS fails gate | Coast mode relaxes the gate automatically; no action needed |
-| `rejection_reason: CHI2_FAILED` persistently | Fix is far from what filter predicts | Check for antenna obstruction or TF mismatch |
+| `HDOP_HIGH` at startup | Open sky not acquired yet | Normal: clears within 30–60 s once the receiver locks |
+| `HDOP_HIGH` persistently | Consumer receiver near buildings/trees; `gnss.max_hdop` (default 4.0) too strict | Raise `gnss.max_hdop` (e.g. 8.0). The DOP already scales the fix noise, so a marginal fix is down-weighted, not trusted blindly |
+| `VDOP_HIGH` | Fix is horizontally fine but vertically poor (obstructed sky); irrelevant to a 2D ground robot | Raise `gnss.max_vdop` (e.g. 20.0). On a `publish.force_2d` robot vertical precision does not matter |
+| `FIX_TYPE_LOW` | `gnss.min_fix_type` set above what the receiver provides (e.g. RTK required on a non-RTK M9N) | Lower `gnss.min_fix_type` to `1` (GPS) for a consumer receiver |
+| `MIN_SATS` | Fewer satellites than `gnss.min_satellites` | Move to more open sky; lower `gnss.min_satellites` only if you understand the accuracy cost |
+| `DELAY_TOO_LARGE` | Fix arrived older than `max_measurement_delay` (0.5 s); usually a clock-sync or timestamp problem, not GPS | Check the fix timestamps and system clock. On WSL2 see the WSL2 section below |
+| `CHI2_FAILED` after outage | Filter drifted during a blackout, the returning GPS fails the gate | Coast mode relaxes the gate automatically; no action needed |
+| `CHI2_FAILED` persistently | Fix is far from what the filter predicts | Check for antenna obstruction, a multipath spike (working as intended), or a TF/lever-arm mismatch |
+| `IMPLAUSIBLE_JUMP` | Fix implies motion faster than `gnss.max_speed` allows since the last accepted fix | Working as intended for a spike. If it rejects real motion, raise `gnss.max_speed` to your robot's true top speed |
 | `encoder_outlier_count` climbing | Noise config too tight vs actual velocity variance | Loosen `encoder.vel_noise` or enable `adaptive.encoder: true` |
 | `imu_outlier_count` climbing | Driver publishing wrong scale or units | Check `linear_acceleration.z` at rest: should be ~9.81 or ~0.0 depending on `imu.remove_gravitational_acceleration` |
 
 Do **not** lower outlier thresholds below their chi-squared critical values. At `7.0` normal GPS noise trips the gate and every fix gets rejected. The defaults are statistically calibrated.
+
+---
+
+## Fusion output far worse than raw wheel odometry (position runs away)
+
+**Symptom:** your wheel odometry alone is reasonable (drives 6 m, reads ~6 m), but the fused output diverges wildly: position climbing tens or hundreds of meters, orientation matching neither the IMU nor the odometry.
+
+**Most likely cause: your sensors are not on a common clock.** A filter fuses measurements *ordered by their timestamps*. If one driver stamps with a different clock (an IMU on a companion board, a sensor on a second machine without NTP, a driver stamping with its own epoch), that sensor's stamps can run seconds ahead of the others. The filter clock rides the leading sensor, and every message from the lagging sensors arrives looking seconds old and **cannot be fused at all**.
+
+**How to check, in 30 seconds:**
+
+```bash
+ros2 topic echo /your/imu/topic --field header.stamp --once
+ros2 topic echo /your/odom/topic --field header.stamp --once
+```
+
+The two stamps should agree within milliseconds. If they differ by more than `max_measurement_delay` (0.5 s default), that is the whole problem. FusionCore also tells you directly:
+
+- At startup: `IMU header.stamp is +3.14s from this node's clock...`
+- At runtime: `STALE sensor rejections climbing (imu=0 encoder=412)... IMU stamp minus encoder stamp is currently +3.14s`
+- On the health topic: `ros2 topic echo /fusion/debug/filter_health --field encoder_stale_reject_count` climbing means the encoder is not being fused, at all.
+
+**The fix is in the sensor driver, not the filter:**
+
+- Stamp messages with the node clock (`this->get_clock()->now()` / `node.get_clock().now()`) instead of a device or companion-board clock.
+- If sensors live on different machines, sync the clocks with chrony or NTP.
+- If a sensor has a genuinely large, known latency (not skew), raise `max_measurement_delay`, but understand this widens the retrodiction window for everyone.
+
+Versions before 0.3.4 did not reject the skewed sensor: they repeatedly re-based the filter clock backward and re-integrated the offset window at the fast sensor's rate, which is what produced the runaway. Upgrade if you see this signature on an older build.
 
 ---
 
