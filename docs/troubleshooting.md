@@ -246,7 +246,7 @@ Common causes and fixes:
 | `VDOP_HIGH` | Fix is horizontally fine but vertically poor (obstructed sky); irrelevant to a 2D ground robot | Raise `gnss.max_vdop` (e.g. 20.0). On a `publish.force_2d` robot vertical precision does not matter |
 | `FIX_TYPE_LOW` | `gnss.min_fix_type` set above what the receiver provides (e.g. RTK required on a non-RTK M9N) | Lower `gnss.min_fix_type` to `1` (GPS) for a consumer receiver |
 | `MIN_SATS` | Fewer satellites than `gnss.min_satellites` | Move to more open sky; lower `gnss.min_satellites` only if you understand the accuracy cost |
-| `DELAY_TOO_LARGE` | Fix arrived older than `max_measurement_delay` (0.5 s); usually a clock-sync or timestamp problem, not GPS | Check the fix timestamps and system clock. On WSL2 see the WSL2 section below |
+| `DELAY_TOO_LARGE` | Fix arrived older than `max_measurement_delay` (default 0.5 s). Two distinct causes: a clock-sync/timestamp problem, or real transport latency (fix stamped correctly but delivered late) | First compare each sensor's `header.stamp` to the node clock (clock problem). If stamps are fine, the messages are arriving late: on WiFi links (hotspots especially) disable power save (`iw wlan0 set power_save off`) and set `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST` when all nodes share one host, so DDS stays off the wireless interface. A moderately late fix is still valuable: raising `max_measurement_delay` (e.g. 2.0) lets the snapshot/IMU-replay retrodiction rewind and fuse it at its true time. Field case: a hotspot's power-save latency delivered every fix 1 to 3 s late and all were discarded; at 2.0 s the same data fused to ~2 m sigma |
 | `CHI2_FAILED` after outage | Filter drifted during a blackout, the returning GPS fails the gate | Coast mode relaxes the gate automatically; no action needed |
 | `CHI2_FAILED` persistently | Fix is far from what the filter predicts | Check for antenna obstruction, a multipath spike (working as intended), or a TF/lever-arm mismatch |
 | `IMPLAUSIBLE_JUMP` | Fix implies motion faster than `gnss.max_speed` allows since the last accepted fix | Working as intended for a spike. If it rejects real motion, raise `gnss.max_speed` to your robot's true top speed |
@@ -273,8 +273,12 @@ ros2 topic echo /your/odom/topic --field header.stamp --once
 The two stamps should agree within milliseconds. If they differ by more than `max_measurement_delay` (0.5 s default), that is the whole problem. FusionCore also tells you directly:
 
 - At startup: `IMU header.stamp is +3.14s from this node's clock...`
-- At runtime: `STALE sensor rejections climbing (imu=0 encoder=412)... IMU stamp minus encoder stamp is currently +3.14s`
-- On the health topic: `ros2 topic echo /fusion/debug/filter_health --field encoder_stale_reject_count` climbing means the encoder is not being fused, at all.
+- At runtime: `Dropping stale sensor samples at 48.2/s (totals imu=0 encoder=412): that sensor is effectively NOT being fused. IMU stamp minus encoder stamp is +3.14s against a max_measurement_delay of 0.50s`
+- On the health topic: `ros2 topic echo /fusion/debug/filter_health --field encoder_stale_reject_count`
+
+**Read the rate, not the total.** A time-base mismatch rejects nearly every sample, so the rate lands near the sensor's publish rate (tens per second) and the totals climb without bound. A handful of drops over a whole run is a different thing: a late sample on a wireless link, harmless, and the filter keeps fusing everything else. The warning above only fires above 1 rejection per second sustained; below that the drop is logged at debug level. So `encoder_stale_reject_count: 2` after ten minutes of driving is not a problem, and `412` and climbing is.
+
+If the rate is low but nonzero and you want those stragglers fused rather than dropped, the offset is real transport latency rather than skew: raise `max_measurement_delay` above the offset you measured and retrodiction will rewind and fuse them at their true time.
 
 **The fix is in the sensor driver, not the filter:**
 
