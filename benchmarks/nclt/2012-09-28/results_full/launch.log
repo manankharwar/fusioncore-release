@@ -1,0 +1,90 @@
+[INFO] [launch]: All log files can be found below /home/manankharwar/.ros/log/2026-06-19-21-15-42-884056-DESKTOP-SE199PS-56387
+[INFO] [launch]: Default logging verbosity is set to INFO
+[INFO] [launch.user]: Starting NCLT benchmark...
+[INFO] [nclt_player.py-1]: process started with pid [56474]
+[INFO] [static_transform_publisher-2]: process started with pid [56475]
+[INFO] [static_transform_publisher-3]: process started with pid [56476]
+[INFO] [fusioncore_node-4]: process started with pid [56477]
+[INFO] [ekf_node-5]: process started with pid [56478]
+[INFO] [navsat_transform_node-6]: process started with pid [56479]
+[static_transform_publisher-3] [INFO] [1781918149.418394258] [gps_tf]: Spinning until stopped - publishing transform
+[static_transform_publisher-3] translation: ('0.000000', '0.000000', '0.300000')
+[static_transform_publisher-3] rotation: ('0.000000', '0.000000', '0.000000', '1.000000')
+[static_transform_publisher-3] from 'base_link' to 'gnss_link'
+[static_transform_publisher-2] [INFO] [1781918149.471900309] [imu_tf]: Spinning until stopped - publishing transform
+[static_transform_publisher-2] translation: ('0.000000', '0.000000', '0.000000')
+[static_transform_publisher-2] rotation: ('0.000000', '0.000000', '0.000000', '1.000000')
+[static_transform_publisher-2] from 'base_link' to 'imu_link'
+[ekf_node-5] [INFO] [1781918149.694854749] [rl_ekf]: Waiting for clock to start...
+[navsat_transform_node-6] [INFO] [1781918149.765181094] [navsat_transform]: Waiting for clock to start...
+[fusioncore_node-4] [INFO] [1781918150.498252985] [fusioncore]: FusionCore node created
+[fusioncore_node-4] [INFO] [1781918151.488160734] [fusioncore]: Configuring FusionCore...
+[fusioncore_node-4] [INFO] [1781918151.521536894] [fusioncore]: IMU gravity removal: disabled
+[fusioncore_node-4] [INFO] [1781918151.521686063] [fusioncore]: GNSS min_fix_type: 1 (1=GPS, 2=DGPS, 3=RTK_FLOAT, 4=RTK_FIXED)
+[fusioncore_node-4] [INFO] [1781918151.626354311] [fusioncore]: PROJ: transform ready (EPSG:4326 → EPSG:4978)
+[fusioncore_node-4] [INFO] [1781918151.626487384] [fusioncore]: PROJ: using first GPS fix as local reference origin
+[fusioncore_node-4] [INFO] [1781918151.856980143] [fusioncore]: Dual antenna heading disabled.
+[fusioncore_node-4] [INFO] [1781918151.857041530] [fusioncore]: FusionCore configured. base_frame=base_link odom_frame=odom rate=100Hz
+[fusioncore_node-4] [INFO] [1781918151.884109482] [fusioncore]: Activating FusionCore...
+[fusioncore_node-4] [INFO] [1781918151.884218060] [fusioncore]: --- TF Validation ---
+[fusioncore_node-4] [INFO] [1781918152.638815535] [fusioncore]:   [OK]      imu_link -> base_link
+[fusioncore_node-4] [INFO] [1781918152.638975924] [fusioncore]: ---------------------
+[fusioncore_node-4] [INFO] [1781918153.174396013] [fusioncore]: IMU topic: /imu/data
+[INFO] [ros2-7]: process started with pid [56630]
+[fusioncore_node-4] [INFO] [1781918154.170055809] [fusioncore]: FusionCore active. Listening for sensors.
+[nclt_player.py-1] [INFO] [1781918155.468841542] [nclt_player]: Loading NCLT data from: /mnt/c/Users/Admin/ROS/ROS/fusioncore/benchmarks/nclt/2012-09-28/raw files
+[nclt_player.py-1] [INFO] [1781918158.943485184] [nclt_player]:   Euler: 218477 rows from ms25_euler.csv
+[ros2-7] [WARN] [ros2bag]: Positional "topics" argument deprecated. Please use optional "--topics" argument instead.
+[ros2-7] stdin is not a terminal device. Keyboard handling disabled.[INFO] [1781918165.022318443] [rosbag2_recorder]: Event publisher thread: Started
+[ros2-7] [INFO] [1781918165.022990637] [rosbag2_recorder]: Press SPACE for pausing/resuming
+[ros2-7] [INFO] [1781918165.045130448] [rosbag2_recorder]: Starting recording to '/mnt/c/Users/Admin/ROS/ROS/fusioncore/benchmarks/nclt/2012-09-28/bag_full'
+[ros2-7] [INFO] [1781918165.283111239] [rosbag2_recorder]: Listening for topics...
+[ros2-7] [INFO] [1781918165.283207323] [rosbag2_recorder]: Recording...
+[ros2-7] [INFO] [1781918165.283327404] [rosbag2_recorder]: Topics discovery started.
+[ros2-7] [INFO] [1781918166.586267325] [rosbag2_recorder]: Subscribed to topic '/clock'
+[ros2-7] [INFO] [1781918167.116586512] [rosbag2_recorder]: Subscribed to topic '/gnss/fix'
+[ros2-7] [INFO] [1781918169.786274904] [rosbag2_recorder]: Subscribed to topic '/fusion/odom'
+[nclt_player.py-1] [INFO] [1781918170.574640258] [nclt_player]:   IMU:  218450 rows from ms25.csv
+[nclt_player.py-1] [INFO] [1781918171.034522537] [nclt_player]:   GPS:  19191 fixes (21727 no-fix skipped)
+[nclt_player.py-1] [INFO] [1781918179.223520746] [nclt_player]:   Odom: 499134 velocity estimates from odometry_mu_100hz.csv
+[nclt_player.py-1] [INFO] [1781918179.637104081] [nclt_player]: Loaded 736775 events  (218450 IMU, 19191 GPS, 499134 odom)  rate=1.0x
+[fusioncore_node-4] [INFO] [1781918179.643593175] [fusioncore]: Filter initialized at t=1348867239.971 (first IMU)
+[fusioncore_node-4] [INFO] [1781918179.837350755] [fusioncore]: GNSS reference set: lat=42.293909 lon=-83.708335
+[fusioncore_node-4] [INFO] [1781918179.837999865] [fusioncore]: Heading not yet validated: lever arm inactive. Distance traveled: 0.0m (need 5.0m), or provide dual antenna / IMU orientation.
+[navsat_transform_node-6] [ERROR] [1781918180.028172827] [navsat_transform]: Latitude 42.2939d more than 20d from N pole
+[navsat_transform_node-6] [ERROR] [1781918180.179018496] [navsat_transform]: Latitude 42.2939d more than 20d from N pole
+[navsat_transform_node-6] [INFO] [1781918180.193407522] [navsat_transform]: Datum (latitude, longitude, altitude) is (42.29, -83.71, 0.00)
+[navsat_transform_node-6] [INFO] [1781918180.193476624] [navsat_transform]: Datum UTM coordinate is (17 north, 276728.50, 4685961.88)
+[navsat_transform_node-6] [INFO] [1781918180.193577325] [navsat_transform]: Corrected for magnetic declination of 0, user-specified offset of 0 and meridian convergence of -0.0318224. Transform heading factor is now -0.0318224
+[ros2-7] [INFO] [1781918180.803750911] [rosbag2_recorder]: Subscribed to topic '/rl/odometry'
+[ros2-7] [INFO] [1781918180.803859013] [rosbag2_recorder]: All requested topics are subscribed. Stopping discovery...
+[ros2-7] [INFO] [1781918180.803885213] [rosbag2_recorder]: Topics discovery stopped.
+[fusioncore_node-4] [INFO] [1781918185.049704299] [fusioncore]: Heading not yet validated: lever arm inactive. Distance traveled: 0.0m (need 5.0m), or provide dual antenna / IMU orientation.
+[fusioncore_node-4] [INFO] [1781918190.179291593] [fusioncore]: Heading not yet validated: lever arm inactive. Distance traveled: 0.0m (need 5.0m), or provide dual antenna / IMU orientation.
+[fusioncore_node-4] [INFO] [1781918195.448635137] [fusioncore]: Heading not yet validated: lever arm inactive. Distance traveled: 0.0m (need 5.0m), or provide dual antenna / IMU orientation.
+[fusioncore_node-4] [INFO] [1781918200.579038768] [fusioncore]: Heading not yet validated: lever arm inactive. Distance traveled: 1.1m (need 5.0m), or provide dual antenna / IMU orientation.
+[fusioncore_node-4] [WARN] [1781918490.982579829] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=2257.9, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781920121.303284746] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=550.6, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781920126.371134238] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=230.9, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781920131.503818900] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=111.8, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781920136.708965631] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=76.7, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781920141.898630033] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=59.0, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781920147.179681430] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=48.6, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781920152.304394472] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=41.0, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781920157.301162661] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=35.5, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781920162.310292634] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=29.5, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781920167.509700573] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=24.6, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781920172.509999849] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=20.5, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781920177.707556423] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=16.7, threshold=16.3)
+[ekf_node-5] [ERROR] [1781920415.004517859] [rl_ekf]: Failed to meet update rate! Took 0.052664000000000002477seconds. Try decreasing the rate, limiting sensor output frequency, or limiting the number of sensors.
+[ekf_node-5] [ERROR] [1781920499.398161183] [rl_ekf]: Failed to meet update rate! Took 0.079703999999999997073seconds. Try decreasing the rate, limiting sensor output frequency, or limiting the number of sensors.
+[ekf_node-5] [ERROR] [1781920504.078952112] [rl_ekf]: Failed to meet update rate! Took 0.059993999999999998718seconds. Try decreasing the rate, limiting sensor output frequency, or limiting the number of sensors.
+[ekf_node-5] [ERROR] [1781920505.133605043] [rl_ekf]: Failed to meet update rate! Took 0.099809999999999995945seconds. Try decreasing the rate, limiting sensor output frequency, or limiting the number of sensors.
+[ekf_node-5] [ERROR] [1781920506.465023036] [rl_ekf]: Failed to meet update rate! Took 0.070158999999999999142seconds. Try decreasing the rate, limiting sensor output frequency, or limiting the number of sensors.
+[fusioncore_node-4] [WARN] [1781921116.449691018] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=40.1, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781921121.456425282] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=18.4, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781921127.053428734] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=17.1, threshold=16.3)
+[ekf_node-5] [ERROR] [1781921185.084955141] [rl_ekf]: Failed to meet update rate! Took 0.059365000000000001101seconds. Try decreasing the rate, limiting sensor output frequency, or limiting the number of sensors.
+[fusioncore_node-4] [WARN] [1781921519.630088615] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=18.5, threshold=16.3)
+[fusioncore_node-4] [WARN] [1781921596.421032281] [fusioncore]: GNSS fix rejected: CHI2_FAILED (hdop=3.00, d2=2485.6, threshold=16.3)
+[nclt_player.py-1] [INFO] [1781922861.195919995] [nclt_player]: Playback complete.
