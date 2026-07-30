@@ -25,7 +25,10 @@
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <diagnostic_msgs/msg/key_value.hpp>
 #include <std_srvs/srv/trigger.hpp>
-#include "fusioncore_ros/srv/from_ll.hpp"
+// Nav2 interop: nav2_waypoint_follower hardcodes this service type for GPS
+// waypoint conversion, so /fromLL must be served with it. Interface only.
+#include "robot_localization/srv/from_ll.hpp"
+#include "fusioncore_ros/stale_rate_tracker.hpp"
 #include "fusioncore_ros/msg/gnss_status.hpp"
 #include "fusioncore_ros/msg/filter_health.hpp"
 #include <lifecycle_msgs/msg/transition.hpp>
@@ -855,14 +858,22 @@ public:
         RCLCPP_INFO(get_logger(), "Filter reset via ~/reset service.");
       });
 
-    // fromLL service: converts GPS lat/lon/alt to map frame x/y/z.
-    // Drop-in replacement for robot_localization's /fromLL service used by
-    // nav2_waypoint_follower for GPS waypoint navigation.
-    from_ll_srv_ = create_service<fusioncore_ros::srv::FromLL>(
+    // fromLL service: converts GPS lat/lon/alt to map frame x/y/z, for
+    // nav2_waypoint_follower's GPS waypoint navigation.
+    //
+    // The type MUST be robot_localization/srv/FromLL, not our own. ROS 2 matches
+    // services on name AND type, and nav2_waypoint_follower has that type compiled
+    // into its header (waypoint_follower.hpp: ServiceClient<robot_localization::
+    // srv::FromLL>). Serving an identically-shaped fusioncore_ros/srv/FromLL left
+    // Nav2's client waiting for a service that, from its point of view, never
+    // appeared: it never errors, it just hangs, which is how this went unnoticed
+    // (reported in issue #73 while wiring up followGpsWaypoints).
+    // Only the interface is shared. No robot_localization code runs.
+    from_ll_srv_ = create_service<robot_localization::srv::FromLL>(
       "/fromLL",
       [this](
-        const fusioncore_ros::srv::FromLL::Request::SharedPtr request,
-        fusioncore_ros::srv::FromLL::Response::SharedPtr response)
+        const robot_localization::srv::FromLL::Request::SharedPtr request,
+        robot_localization::srv::FromLL::Response::SharedPtr response)
       {
         std::lock_guard<std::mutex> lock(fc_mutex_);
         if (!gnss_ref_set_) {
@@ -2034,10 +2045,15 @@ private:
     const auto& dbg = fc_->get_gnss_debug();
 
     if (!accepted) {
+      // Print vdop too: a VDOP_HIGH rejection that only shows hdop sends the user
+      // hunting in the wrong place (field report, issue #73 follow-up). For NavSatFix
+      // input these are pseudo-DOPs derived from the message covariance, sqrt(var) in
+      // meters, since NavSatFix carries no true DOP fields.
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "GNSS fix rejected: %s (hdop=%.2f, d2=%.1f, threshold=%.1f)",
+        "GNSS fix rejected: %s (hdop=%.2f, vdop=%.2f, d2=%.1f, threshold=%.1f)",
         gnss_reason_str(dbg.reason).c_str(),
         fix.hdop,
+        fix.vdop,
         dbg.mahalanobis_sq,
         dbg.chi2_threshold);
     }
@@ -2775,23 +2791,39 @@ private:
       fh.imu_stale_reject_count     = status.imu_stale_rejects;
       fh.encoder_stale_reject_count = status.encoder_stale_rejects;
 
-      // A climbing stale count means a sensor is not being fused AT ALL because
-      // its stamps lag the filter clock: the classic symptom of sensors on
-      // different time bases (issue #73). Say so in plain words, with the
-      // measured inter-sensor offset, instead of letting it fail silently.
-      if (status.encoder_stale_rejects > prev_enc_stale_ ||
-          status.imu_stale_rejects     > prev_imu_stale_) {
-        prev_enc_stale_ = status.encoder_stale_rejects;
-        prev_imu_stale_ = status.imu_stale_rejects;
-        double offset = (last_imu_time_ > 0.0 && last_enc_stamp_sec_ > 0.0)
-                          ? (last_imu_time_ - last_enc_stamp_sec_) : 0.0;
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
-          "STALE sensor rejections climbing (imu=%d encoder=%d): the lagging "
-          "sensor is NOT being fused. IMU stamp minus encoder stamp is "
-          "currently %+.2fs; sensors must share a time base. Fix the sensor "
-          "drivers' clocks (stamp with node time, or chrony/NTP across "
-          "machines).",
-          status.imu_stale_rejects, status.encoder_stale_rejects, offset);
+      // How loudly to report stale rejections is decided by StaleRateTracker, so
+      // the policy can be unit tested (tests/test_stale_rate.cpp) rather than
+      // only existing inside this callback. See issue #73: warning on the raw
+      // count made 2 drops in a whole run look like a broken clock.
+      double stale_rate = 0.0;
+      const auto alarm = stale_tracker_.update(
+        status.imu_stale_rejects, status.encoder_stale_rejects,
+        now().seconds(), stale_rate);
+
+      if (alarm != fusioncore_ros::StaleAlarm::None) {
+        const double offset = (last_imu_time_ > 0.0 && last_enc_stamp_sec_ > 0.0)
+                                ? (last_imu_time_ - last_enc_stamp_sec_) : 0.0;
+        // Read live rather than cached so the hint reflects a runtime override.
+        const double max_delay = get_parameter("max_measurement_delay").as_double();
+        if (alarm == fusioncore_ros::StaleAlarm::Warn) {
+          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+            "Dropping stale sensor samples at %.1f/s (totals imu=%d encoder=%d): "
+            "that sensor is effectively NOT being fused. IMU stamp minus encoder "
+            "stamp is %+.2fs against a max_measurement_delay of %.2fs. Either the "
+            "drivers are on different clocks (stamp with node time, or run "
+            "chrony/NTP across machines), or the link adds real latency, in which "
+            "case raise max_measurement_delay above the offset.",
+            stale_rate, status.imu_stale_rejects, status.encoder_stale_rejects,
+            offset, max_delay);
+        } else {
+          RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 10000,
+            "Dropped a stale sensor sample (%.2f/s, totals imu=%d encoder=%d, "
+            "offset %+.2fs vs max_measurement_delay %.2fs). Occasional drops are "
+            "normal; only a sustained rate above %.1f/s means a sensor is not "
+            "being fused.",
+            stale_rate, status.imu_stale_rejects, status.encoder_stale_rejects,
+            offset, max_delay, stale_tracker_.warn_rate_hz());
+        }
       }
 
       filter_health_pub_->publish(fh);
@@ -2933,12 +2965,12 @@ private:
   bool   imu_clock_checked_  = false;
   bool   enc_clock_checked_  = false;
   double last_enc_stamp_sec_ = -1.0;
-  int    prev_imu_stale_     = 0;
-  int    prev_enc_stale_     = 0;
+  // Turns the running stale counts into a rate and decides warn vs debug.
+  fusioncore_ros::StaleRateTracker stale_tracker_{1.0};
   rclcpp::TimerBase::SharedPtr                                                publish_timer_;
   rclcpp::TimerBase::SharedPtr                                                diag_timer_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr                          reset_srv_;
-  rclcpp::Service<fusioncore_ros::srv::FromLL>::SharedPtr                     from_ll_srv_;
+  rclcpp::Service<robot_localization::srv::FromLL>::SharedPtr                 from_ll_srv_;
 
   std::string base_frame_;
   std::string odom_frame_;
