@@ -98,7 +98,16 @@ fusioncore:
     gnss.base_noise_z: 2.0      # m
     gnss.heading_noise: 0.02    # rad: for dual antenna heading
 
-    gnss.max_hdop: 4.0          # reject fixes with HDOP worse than this
+    # Quality gate. Which pair applies depends on what your receiver publishes,
+    # and getting this wrong is silent: rejected fixes leave the filter dead
+    # reckoning with nothing but a throttled log line to say so.
+    gnss.max_sigma_xy: 25.0     # m of reported 1-sigma. THIS is the gate that runs
+    gnss.max_sigma_z: 50.0      # for sensor_msgs/NavSatFix, which carries no DOP.
+                                # A standalone receiver reports 2-8 m horizontal and
+                                # 10-25 m vertical in normal conditions, all usable.
+    gnss.max_hdop: 4.0          # dimensionless DOP. Only applies when the fix has no
+    gnss.max_vdop: 6.0          # covariance at all, i.e. gps_msgs/GPSFix reporting
+                                # receiver-native DOP.
     gnss.min_satellites: 4
     gnss.min_fix_type: 1        # 1=GPS, 2=DGPS, 3=RTK_FLOAT, 4=RTK_FIXED
                                 # NavSatFix: status=2 maps to RTK_FIXED. RTK_FLOAT (3)
@@ -319,8 +328,20 @@ fusioncore:
     # platform's maximum plausible speed in m/s (a few times cruise is safe); this
     # is a per-robot spec like wheel radius, not per-run tuning. 0.0 = disabled.
     gnss.max_speed_margin: 5.0
-    # Slack (m) added to the max_speed * gap bound: covers GPS noise and the
-    # uncertainty in the predicted position. 3-5 m is typical.
+    # Fixed slack (m) added to the bound, covering prediction error that the
+    # receiver's own noise does not explain. 3-5 m is typical.
+    gnss.max_speed_sigma_k: 5.0
+    # Multiples of the receiver's REPORTED horizontal sigma also added to the
+    # bound, so the gate adapts to the receiver instead of being a fixed distance.
+    # This matters more than it looks. With sigma_k at 0 the whole bound is
+    # absolute metres: at 1 Hz with max_speed 2.0 and a 5 m margin it is 7 m,
+    # and a standalone receiver whose own sigma is ~6 m then trips it constantly.
+    # Measured on a u-blox M9N: 157 of 500 good fixes rejected, loop closure
+    # 2.62 m -> 7.27 m. The full bound is:
+    #     max_speed * gap  +  max_speed_margin  +  sigma_k * reported_sigma_xy
+    # Scaled by the RECEIVER's sigma deliberately, never by the filter's own
+    # covariance: chi2 is already the covariance-scaled test, and this gate exists
+    # precisely to catch what a coast-inflated chi2 lets through.
 
     # ── Adaptive noise ────────────────────────────────────────────────────────
     adaptive.imu: true
@@ -517,9 +538,19 @@ reference.use_first_fix: true
 
 FusionCore supports two GPS message types on `gnss.fix_topic` (default `/gnss/fix`). The default is `sensor_msgs/NavSatFix` because every ROS GPS driver publishes it. Set `gnss.use_gps_fix: true` to switch to `gps_msgs/GPSFix` if your driver supports it.
 
+!!! note "`nmea_navsat_driver` does NOT publish `gps_msgs/GPSFix`"
+
+    An earlier version of this table listed it as a `GPSFix` source. That was
+    wrong, reported by a user on issue #73. Checked against the driver source:
+    it publishes `sensor_msgs/NavSatFix` on `fix`, `geometry_msgs/TwistStamped`
+    on `vel`, `geometry_msgs/QuaternionStamped` on `heading`, and
+    `sensor_msgs/TimeReference`. If you are on `nmea_navsat_driver`, leave
+    `gnss.use_gps_fix` at `false`. To get `GPSFix` from an NMEA receiver, run
+    `fix_translator` from `gps_umd`, which converts `NavSatFix` to `GPSFix`.
+
 | | `sensor_msgs/NavSatFix` | `gps_msgs/GPSFix` |
 |---|---|---|
-| Driver support | Universal | nmea_navsat_driver, ublox_dgnss, others |
+| Driver support | Universal | gpsd_client (gps_umd), septentrio_gnss_driver, swiftnav-ros2, KumarRobotics/ublox |
 | RTK_FLOAT status | Not expressible | Yes (status 20) |
 | Separate HDOP / VDOP | No | Yes |
 | Satellites used | No | Yes |
