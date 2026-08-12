@@ -88,9 +88,23 @@ struct FusionCoreConfig {
   // Set to the platform's maximum plausible speed (m/s); a few times cruise
   // speed is safe. 0 = disabled (default, preserves prior behavior).
   double gnss_max_speed        = 0.0;
-  // Slack added to the max_speed * dt bound (m): covers GPS noise and the fact
-  // that the predicted position itself has some uncertainty. ~3-5 m is typical.
+  // Fixed slack added to the max_speed * dt bound (m), covering prediction error
+  // that is not explained by the receiver's own noise.
   double gnss_max_speed_margin = 5.0;
+  // Multiples of the receiver's REPORTED horizontal sigma added to the bound.
+  //
+  // Without this the whole bound is absolute metres, and a fixed margin cannot
+  // tell an impossible jump from ordinary noise unless it happens to sit well
+  // outside the receiver's spread. Measured 2026-08-03 on a u-blox M9N: the
+  // bound worked out to 7 m at 1 Hz while the receiver's own sigma was ~6 m, so
+  // the gate sat inside the noise distribution and rejected 157 of 500 perfectly
+  // good fixes, turning a 2.62 m loop closure into 7.27 m.
+  //
+  // Deliberately scaled by the RECEIVER's sigma and not by the filter's P. The
+  // entire point of this gate is to catch an outlier cluster that a coast-relaxed
+  // chi2 would admit, and chi2 is already the P-scaled test. Scaling this one by
+  // P too would just be a second chi2 and would reopen the hole it exists to plug.
+  double gnss_max_speed_sigma_k = 5.0;
 
   // Adaptive noise covariance
   // Whether to enable adaptive R estimation for each sensor
@@ -245,12 +259,14 @@ enum class GnssRejectionReason {
   NOT_PROCESSED   = 0,  // update_gnss not yet called
   ACCEPTED        = 1,
   FIX_TYPE_LOW    = 2,  // fix_type < min_fix_type
-  HDOP_HIGH       = 3,  // hdop > max_hdop
-  VDOP_HIGH       = 4,  // vdop > max_vdop
+  HDOP_HIGH       = 3,  // hdop > max_hdop (dimensionless DOP path only)
+  VDOP_HIGH       = 4,  // vdop > max_vdop (dimensionless DOP path only)
   MIN_SATS        = 5,  // satellites < min_satellites
   CHI2_FAILED     = 6,  // Mahalanobis distance > threshold
   DELAY_TOO_LARGE = 7,  // measurement older than max_measurement_delay
   IMPLAUSIBLE_JUMP = 8, // fix farther from prediction than max_speed*dt allows
+  SIGMA_XY_HIGH   = 9,  // reported horizontal sigma in METRES > max_sigma_xy
+  SIGMA_Z_HIGH    = 10, // reported vertical sigma in METRES > max_sigma_z
 };
 
 // Per-fix observability data: populated by update_gnss() on every call.
@@ -260,6 +276,11 @@ struct GnssFixDebug {
   GnssRejectionReason reason            = GnssRejectionReason::NOT_PROCESSED;
   double             mahalanobis_sq     = -1.0;  // -1 = not computed (quality gate failed first)
   double             chi2_threshold     = 0.0;
+  // Why GPS track heading did not fuse on this fix, when it did not.
+  // Silent skipping is how the original problem stayed invisible: the user saw a
+  // zig-zag path and had no way to tell which heading source caused it.
+  bool               track_heading_skipped_stronger_source = false;
+  bool               track_heading_skipped_motion          = false;
   double             hdop               = 0.0;
   double             vdop               = 0.0;
   int                satellites         = 0;
@@ -416,6 +437,10 @@ public:
   );
 
   const State&       get_state()      const;
+
+  // Diagnostic passthrough: metres the last measurement update moved position.
+  // See UKF::last_position_correction().
+  double last_position_correction() const { return ukf_.last_position_correction(); }
   FusionCoreStatus   get_status()     const;
   const GnssFixDebug& get_gnss_debug() const { return gnss_debug_; }
   void               reset();

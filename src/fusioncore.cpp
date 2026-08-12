@@ -839,11 +839,20 @@ bool FusionCore::update_gnss(
   if (!fix.is_valid(config_.gnss)) {
     gnss_debug_.accepted       = false;
     gnss_debug_.mahalanobis_sq = -1.0;
+    // Order matches is_valid() so the reported reason is the gate that
+    // actually fired. Naming the wrong gate sends people tuning a parameter
+    // that was never involved, which is what happened on issue #73.
     if (fix.fix_type < config_.gnss.min_fix_type)
       gnss_debug_.reason = GnssRejectionReason::FIX_TYPE_LOW;
-    else if (fix.hdop > config_.gnss.max_hdop)
+    else if (fix.satellites < config_.gnss.min_satellites)
+      gnss_debug_.reason = GnssRejectionReason::MIN_SATS;
+    else if (fix.has_sigma() && fix.sigma_xy > config_.gnss.max_sigma_xy)
+      gnss_debug_.reason = GnssRejectionReason::SIGMA_XY_HIGH;
+    else if (fix.has_sigma() && fix.sigma_z > config_.gnss.max_sigma_z)
+      gnss_debug_.reason = GnssRejectionReason::SIGMA_Z_HIGH;
+    else if (!fix.has_sigma() && fix.hdop > config_.gnss.max_hdop)
       gnss_debug_.reason = GnssRejectionReason::HDOP_HIGH;
-    else if (fix.vdop > config_.gnss.max_vdop)
+    else if (!fix.has_sigma() && fix.vdop > config_.gnss.max_vdop)
       gnss_debug_.reason = GnssRejectionReason::VDOP_HIGH;
     else
       gnss_debug_.reason = GnssRejectionReason::MIN_SATS;
@@ -924,6 +933,15 @@ bool FusionCore::apply_gnss_update(
       R(i,i) = std::max(R(i,i), R_gnss_(i,i));
   }
 
+  // Captured BEFORE the position update, because the GPS track-heading gates
+  // below must judge the motion the robot was actually doing over the baseline,
+  // not the velocity that this very fix just corrected. Same reasoning as Fix 8
+  // in update_distance_traveled().
+  const double pre_speed_for_hdg = std::sqrt(
+      ukf_.state().x[VX] * ukf_.state().x[VX] +
+      ukf_.state().x[VY] * ukf_.state().x[VY]);
+  const double pre_yaw_rate_for_hdg = std::abs(ukf_.state().x[WZ]);
+
   double heading_sigma_rad = compute_heading_sigma_rad();
   double heading_sigma_deg = heading_sigma_rad * 180.0 / M_PI;
   gnss_debug_.heading_sigma_deg = heading_sigma_deg;
@@ -965,12 +983,28 @@ bool FusionCore::apply_gnss_update(
       double gap_s = timestamp_seconds - last_gnss_time_;
       double offset_xy = std::sqrt(innovation_pre[0]*innovation_pre[0] +
                                    innovation_pre[1]*innovation_pre[1]);
+      // Three terms, and each one is a different thing the offset can legitimately
+      // contain: how far the robot could physically have moved, a fixed allowance
+      // for prediction error, and the receiver's own noise. The last term is what
+      // was missing: without it the bound is pure absolute metres and cannot tell
+      // an impossible jump from ordinary noise on a receiver whose sigma happens
+      // to be comparable to the bound. See the config comment for the numbers.
+      const double sigma_term = fix.has_sigma()
+        ? config_.gnss_max_speed_sigma_k * fix.sigma_xy
+        : 0.0;
       double max_offset = config_.gnss_max_speed * std::max(gap_s, 0.0) +
-                          config_.gnss_max_speed_margin;
+                          config_.gnss_max_speed_margin +
+                          sigma_term;
       if (offset_xy > max_offset) {
         ++gnss_outliers_;
         gnss_debug_.accepted = false;
         gnss_debug_.reason   = GnssRejectionReason::IMPLAUSIBLE_JUMP;
+        // Record it for get_status() too, not just the per-fix debug struct.
+        // Without this the status topic reports NOT_PROCESSED, the enum's
+        // initial value, so a user watching gnss_last_reject_reason sees a fix
+        // vanish for no stated reason. On the 2026-08-03 field run this hid 158
+        // rejections behind a meaningless label while the outlier counter rose.
+        last_gnss_rejection_reason_ = gnss_debug_.reason;
         return false;  // do not touch the coast counters: an outlier must not relax the gate
       }
     }
@@ -979,6 +1013,7 @@ bool FusionCore::apply_gnss_update(
       ++gnss_outliers_;
       gnss_debug_.accepted = false;
       gnss_debug_.reason   = GnssRejectionReason::CHI2_FAILED;
+      last_gnss_rejection_reason_ = gnss_debug_.reason;
 
       if (config_.gnss_coast_n > 0) {
         // At the start of a rejection sequence, decide whether GPS was
@@ -1042,7 +1077,37 @@ bool FusionCore::apply_gnss_update(
   // Displacement accumulates across multiple GPS fixes (using a separate reference
   // position that only advances when a heading fusion fires) so the baseline is
   // always large enough for the uncertainty to be meaningful.
-  if (config_.gps_track_heading_enabled) {
+  // Two guards before any of this runs.
+  //
+  // (a) A stronger absolute heading source makes this one harmful, not merely
+  //     redundant. GPS track heading is course over ground, so on any curved
+  //     path it differs from body heading by a real bias, and a biased
+  //     measurement pulls the estimate wrong no matter how honest its R is.
+  //     A dual antenna, a magnetometer, or a 9-axis IMU orientation all beat
+  //     it outright, and the heading_source_ ladder already ranks them.
+  //     Reported on issue #73: a Nav2 path that was straight without GPS became
+  //     a zig-zag with it, on a robot with a perfectly good magnetometer.
+  //
+  // (b) The min_speed / max_yaw_rate parameters have always been documented as
+  //     guarding track heading, but they only ever gated distance_traveled_ and
+  //     the heading_validated_ flag in update_distance_traveled(). The fusion
+  //     itself ran unguarded, so a slow turning robot fused its turn radius as
+  //     a heading. Applying them here is what those parameters already promise.
+  const bool have_stronger_heading =
+      heading_validated_ && (heading_source_ == HeadingSource::DUAL_ANTENNA ||
+                             heading_source_ == HeadingSource::MAGNETOMETER ||
+                             heading_source_ == HeadingSource::IMU_ORIENTATION);
+  const bool motion_suits_track_heading =
+      (pre_speed_for_hdg    >= config_.gps_track_heading_min_speed) &&
+      (pre_yaw_rate_for_hdg <= config_.gps_track_heading_max_yaw_rate);
+
+  gnss_debug_.track_heading_skipped_stronger_source = have_stronger_heading;
+  gnss_debug_.track_heading_skipped_motion          =
+      !have_stronger_heading && !motion_suits_track_heading;
+
+  if (config_.gps_track_heading_enabled &&
+      !have_stronger_heading &&
+      motion_suits_track_heading) {
     if (!hdg_fix_set_) {
       // Initialize reference on first accepted fix; no heading yet.
       last_hdg_fix_x_ = fix.x;
