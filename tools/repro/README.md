@@ -254,3 +254,192 @@ curves away. Both alpha values land near 108-132 m on 2013-04-05 while `c8b8b1f`
 heading drift is the prime suspect. Note that the frozen `yaw = 0.00` and
 `b_gz = 0.00000` seen in earlier runs of this repro were an ARTEFACT of the -99
 weighting suppressing those states, not evidence that heading was healthy.
+
+## The heading drift that remains after 0.3.7 (`heading.cpp`)
+
+`alpha = 1.0` fixed position. Heading is a SEPARATE defect and is still open. In a
+120 s blackout with the gyro reporting `wz = 0`, the encoder reporting `wz = 0` and
+truth dead straight, yaw still runs to -134 degrees.
+
+`heading.cpp` attributes every step's yaw change to predict versus each individual
+update, and prints the states that could drive it. Two things it found:
+
+**1. The unobservable direction is occupied.** In steady state:
+
+```
+b_gz = 0.01192    b_ewz = 0.01192    wz = -0.01192
+```
+
+Identical magnitudes. The filter has concluded the robot really is turning at
+-0.0119 rad/s while BOTH sensors carry a bias that exactly conceals it. Nothing in
+the data contradicts that: the gyro measures `wz + b_gz` and the encoder measures
+`wz + b_ewz`, two equations in three unknowns. Integrated over the blackout that is
+about 82 degrees.
+
+**2. The quaternion covariance is unbounded, and that is the bigger half.**
+`P(QZ,QZ)` reaches **4.30**. A unit quaternion component cannot leave [-1,1], so a
+variance of 4.30 is not uncertainty, it is a broken state. `state.hpp` initializes
+it to 1e-8 and says "P for them must stay tiny", pointing at "the clamp rationale in
+generate_sigma_points()". There is no clamp there. Only a hemisphere sign flip.
+
+Sigma points are built as `x +/- L.col(i)`, so at that covariance the quaternion
+entries come out near +/-10. Averaging renormalized near-random rotations gives the
+40 ms spin the instrument catches: yaw going 66 -> 119 -> 173 -> -165 degrees.
+
+### Three fixes tried. All measured, none shippable. Do not retry these naively.
+
+```
+                                    yaw @140s   speed          verdict
+shipped 0.3.7                        -134.11    fast           the bug
+normalize every sigma point             0.00    100x SLOWER    accurate, unusable
+normalize only if |q| outside 1.5/0.667 0.00    100x SLOWER    same
+cap P(Q*,Q*) diagonal at 0.25        -134.55    100x SLOWER    catastrophic
+```
+
+Normalizing works PERFECTLY on accuracy: yaw holds at exactly 0.00 across the whole
+blackout, `P(QZ,QZ)` stays near 3.7e-03, and the largest single-step yaw change in
+the entire run is 0.000 degrees. It is unusable only on speed, at roughly 1x
+realtime, because normalizing collapses the radial degree of freedom so the
+reconstructed covariance is no longer consistent with the points it came from, and
+every step falls through to the `SelfAdjointEigenSolver` fallback.
+
+Capping the diagonal is worse than the bug. `b_gz` explodes to -19 rad/s and yaw
+moves 179.995 degrees in one 10 ms step, because capping `P(i,i)` while leaving
+`P(i,j)` alone drives the correlation coefficient above 1 and makes P non-PSD by
+construction. Scaling the row and column instead keeps P valid but destroys the
+cross-covariance a magnetometer needs to correct yaw at all (tried previously, broke
+`MagnetometerTest.UpdateMovesYawTowardMeasurement`). Both horns of one dilemma.
+
+### What a real fix has to do
+
+Bound the quaternion block while keeping P positive semi-definite AND keeping the
+cross-covariances that let an absolute heading source pull yaw. The three attempts
+above each satisfy two of those three. The textbook answer is an error-state or
+multiplicative formulation (MEKF/USQUE), where orientation uncertainty lives in a
+3-vector tangent space and can never leave the manifold, rather than as 4 correlated
+components of a 23-state covariance. That is a structural change, not a patch.
+
+Cheaper and worth trying first: an absolute heading source removes the need. A
+magnetometer pins yaw, which bounds `P(QZ,QZ)`, which keeps the sigma points on the
+manifold. FusionCore already has `update_magnetometer`. That is the same conclusion
+the literature review reached, and it is why this is a hardware-run feature.
+
+## `sensitivity.cpp`: the filter is chaotic at the microsecond level
+
+Eight full NCLT runs of 2013-04-05, identical code and identical data, returned
+FusionCore ATE between **32 m and 345 m** while robot_localization on the same runs
+returned 230 to 268 m. Achieved filter rate does not explain it: correlation with
+ATE is **r = +0.05**. So the cause is not "the CPU was slower that run".
+
+This feeds the filter the same measurements with the only three things that CAN
+differ between two replays, and measures the divergence.
+
+```
+                                    x        y      yaw    vs baseline
+--- GPS present the whole time ---
+baseline                        19.955   -0.018    -1.86      0.000 m
+callback order swapped          19.947   -0.016    -1.52      0.008 m
+IMU stamp +1 microsecond        19.367    0.317   106.96      0.677 m
+one extra predict per second    19.955   -0.018    -1.85      0.000 m
+
+--- 120 s GPS blackout ---
+baseline                        66.141  -36.973  -134.11      0.000 m
+callback order swapped          60.014  -37.558  -120.22      6.154 m
+IMU stamp +1 microsecond        23.966   -9.022   173.62     50.596 m
+one extra predict per second    54.915  -25.818  -167.05     15.825 m
+```
+
+**A 1 microsecond stamp shift moves the answer by up to 50 m and 175 degrees.**
+
+Note the first block: GPS is present and healthy, and yaw still swings from -1.86 to
+106.96 degrees. Position holds because GPS pins it. **The blackout does not create the
+instability, it removes what was hiding it.** Yaw is chaotic whenever the quaternion
+covariance is unbounded, which is always; GPS just masks the positional consequence.
+
+### What this settles
+
+- The 9x NCLT spread is this. Not the harness, not CPU load, not configuration.
+- **A single NCLT number from this filter is not meaningful.** The same sequence
+  returns 32 m or 345 m on microsecond timing. Report medians over >= 3 runs.
+- Every A/B run this month was unmeasurable, because no shipped parameter has a
+  9x effect. `gnss_recovery_rejection_n` 15 vs 0, three runs each: medians 141.6
+  vs 210.2, spreads 9.0x and 8.8x, ranges overlapping almost completely. No
+  measurable effect. Do not change that default on benchmark evidence.
+- **Fixing the heading defect is not an accuracy improvement, it is what makes
+  FusionCore deterministic.** See [[project_heading_drift_blackout]]: bound the
+  quaternion block while keeping P PSD and keeping the cross-covariances.
+
+Use this as the acceptance test for any candidate fix: all four rows must agree.
+It takes 20 minutes and is deterministic, instead of a 70 minute benchmark whose
+answer is a coin flip.
+
+## `quat_cov.cpp`: it is an OBSERVABILITY problem, not a numerical one
+
+The obvious reading of the chaos is that the quaternion block of P is numerically
+broken. It is not. Splitting the 4x4 block into its non-physical direction (along q
+itself, the norm) and its real one:
+
+```
+   t      radial   tangential   P(QZ,QZ)     |q|      rad share
+10.0    4.4e-02     7.18e+00      7.16     1.000000     0.6%
+100.0   7.1e-02     3.97e+00      3.67     1.000000     1.7%
+```
+
+**The extra degree of freedom is fine.** `|q|` holds at 1.000000 and the radial part
+stays near 0.05. What grows is the TANGENTIAL part: 7.18 is about **300 degrees of
+heading uncertainty**, and that is HONEST. Yaw is genuinely unobservable with encoder
+plus 6-axis IMU plus GPS position. The filter is correctly reporting that it does not
+know which way it points.
+
+The failure is that a quaternion-in-state UKF cannot REPRESENT that much angular
+uncertainty. Past about a radian the sigma points span the rotation group and their
+weighted mean is meaningless. Note it is already 7.18 at t=10 with GPS healthy, which
+is why 1 us swings yaw 108 degrees even outside a blackout.
+
+### FOURTH failed fix: cap the quaternion block by congruence
+
+`P' = S P S` with `S = V diag(sqrt(min(lam,cap)/lam)) V^T`, cap 0.05, applied to the
+4x4 block AND every cross-covariance row and column. Unlike the diagonal clamp this
+is PSD by construction, and the 4x4 eigendecomposition costs nothing measurable.
+
+It bounded the covariance perfectly (tangential 7.18 -> 0.055) and **made the filter
+worse**:
+
+```
+                        before cap    with cap
+blackout 30s  order         1.02 m     13.87 m
+              1 us         25.74 m     39.38 m
+              predict       0.01 m     22.59 m
+blackout 120s order         6.15 m    102.56 m
+              predict      15.83 m    135.16 m
+```
+
+Yaw then walks steadily: 26 -> -14 -> -38 -> -62 -> -86 -> -110 -> -133 -> -157 ->
+179 deg, a clean -2.36 deg/s. The filter locked onto a wrong yaw rate and could no
+longer correct it. **Low covariance means small Kalman gain**: capping uncertainty
+does not make the estimate right, it removes the filter's ability to fix it.
+Confidently wrong instead of chaotically wrong. Reverted.
+
+### The conclusion after four attempts
+
+```
+normalize every sigma point     accurate, 100x slower, unusable
+threshold normalize             same
+clamp P diagonals               breaks PSD, catastrophic
+congruence cap (this)           valid PSD, but confidently wrong
+```
+
+Every numerical intervention either destroys performance or destroys correctability.
+That is not four unlucky implementations, it is the same wall: **you cannot fix an
+unobservable state by manipulating its covariance.** The covariance is not lying. The
+information is genuinely absent.
+
+**So the fix is a sensor, not code.** An absolute heading source (magnetometer, dual
+antenna, or a fused 9-axis orientation) makes yaw observable, which bounds the
+covariance HONESTLY, which keeps the sigma points in the linear regime, which makes
+the filter deterministic. Everything else is treating the symptom.
+
+Caveat for this rover: UART-RVC does NOT expose a magnetically referenced heading
+(its yaw is relative to power-on, proven by rotating 90 deg and power cycling). A
+magnetometer here needs UART-SHTP mode or a separate compass. See
+[[project_heading_drift_blackout]].
