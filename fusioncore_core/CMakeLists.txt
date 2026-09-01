@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 3.16)
-project(fusioncore_core VERSION 0.3.7)
+project(fusioncore_core VERSION 0.3.8)
+
+# Default to Release when the caller has not chosen. A plain "colcon build" sets
+# no build type, which means no optimisation flags at all, and Eigen without
+# inlining is drastically slower: the consistency suite took 298 s that way and
+# 4.3 s at -O3, a factor of 69. That is the difference between a 23-state UKF
+# holding 100 Hz on a Raspberry Pi and starving. An explicit -DCMAKE_BUILD_TYPE
+# still wins, so debug builds are unaffected.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -63,6 +73,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_clock_skew tests/test_clock_skew.cpp TIMEOUT 300)
   target_link_libraries(test_clock_skew fusioncore_core Eigen3::Eigen)
+
+  ament_add_gtest(test_consistency tests/test_consistency.cpp TIMEOUT 600)
+  target_link_libraries(test_consistency fusioncore_core Eigen3::Eigen)
 endif()
 
 ament_export_targets(fusioncore_core_targets HAS_LIBRARY_TARGET)
