@@ -267,6 +267,24 @@ struct FusionCoreConfig {
   double gnss_p_inflate_sigma = 50.0;
 };
 
+// How often each outcome happened, and when it first and last did.
+//
+// A single "last reason" field is a snapshot and answers almost nothing. It
+// cannot say whether a gate ever fired, how many times, or when it started,
+// because every fix overwrites it. That gap is what made a whole run look
+// healthy on 2026-09-06: every fix reported ACCEPTED while the chi2 gate sat 39x
+// below its threshold and could not have rejected anything. Establishing that
+// took a day of replaying bags and injecting synthetic spikes; a per-reason count
+// would have said "CHI2_FAILED: 0 of 222" straight out of the recording.
+//
+// Timestamps are the filter clock, in seconds, and are -1.0 until the outcome
+// has happened at least once.
+struct OutcomeTally {
+  int    count      = 0;
+  double first_seen = -1.0;
+  double last_seen  = -1.0;
+};
+
 // How heading was validated: tracked per filter run
 enum class HeadingSource {
   NONE            = 0,  // no independent heading: lever arm disabled
@@ -289,7 +307,51 @@ enum class GnssRejectionReason {
   IMPLAUSIBLE_JUMP = 8, // fix farther from prediction than max_speed*dt allows
   SIGMA_XY_HIGH   = 9,  // reported horizontal sigma in METRES > max_sigma_xy
   SIGMA_Z_HIGH    = 10, // reported vertical sigma in METRES > max_sigma_z
+  CONTINUITY_BREAK = 11, // fix disagrees with the two fixes before it
 };
+
+// Why GPS track heading did or did not fuse on a given fix.
+//
+// Heading has no absolute source on a rover with no magnetometer, no dual antenna
+// and an IMU that publishes orientation as invalid, so GPS track is the only thing
+// that can bound yaw. When it silently declines to fire, yaw uncertainty grows
+// without limit, and that single number then disables the lever arm, inflates the
+// position covariance and drives NIS low enough that the chi2 outlier gate can no
+// longer fire. Measured on the 2026-09-06 field run: yaw 1-sigma reached 101 deg,
+// the lever arm was applied on 0 of 222 fixes, and the largest innovation of the
+// whole run sat 39x below the rejection threshold. Two booleans already recorded
+// part of this and were never published, so a bag could not say which gate was
+// responsible. This enum covers every branch and is published.
+enum class TrackHeadingState {
+  NOT_ATTEMPTED    = 0,  // feature disabled, or no fix processed yet
+  FUSED            = 1,  // a heading measurement was applied to the filter
+  STRONGER_SOURCE  = 2,  // dual antenna / magnetometer / IMU orientation already owns heading
+  MOTION_UNSUITABLE = 3, // too slow, or turning faster than track_heading_max_yaw_rate
+  BASELINE_SHORT   = 4,  // displacement since the reference fix < track_heading_min_dist
+  SIGMA_HIGH       = 5,  // sigma_xy/dist > track_heading_max_sigma, bearing too uncertain
+  CHI2_FAILED      = 6,  // bearing computed but rejected as an outlier
+};
+
+// Sizes for the tally arrays, which are indexed by static_cast<int>(reason).
+// The static_asserts below hold these to the enums, so adding a reason without
+// bumping the count fails the build instead of silently going uncounted.
+constexpr int GNSS_REJECTION_REASON_COUNT = 12;
+constexpr int MAG_REJECTION_REASON_COUNT  = 4;
+
+// Why a magnetometer reading was rejected (or ACCEPTED if it passed).
+enum class MagRejectionReason {
+  NOT_PROCESSED    = 0,
+  ACCEPTED         = 1,
+  CHI2_FAILED      = 2,  // Mahalanobis distance > threshold
+  FIELD_MAGNITUDE  = 3,  // corrected field magnitude outside configured range
+};
+
+static_assert(static_cast<int>(GnssRejectionReason::CONTINUITY_BREAK) + 1 ==
+              GNSS_REJECTION_REASON_COUNT,
+              "GNSS_REJECTION_REASON_COUNT must match GnssRejectionReason");
+static_assert(static_cast<int>(MagRejectionReason::FIELD_MAGNITUDE) + 1 ==
+              MAG_REJECTION_REASON_COUNT,
+              "MAG_REJECTION_REASON_COUNT must match MagRejectionReason");
 
 // Per-fix observability data: populated by update_gnss() on every call.
 // Retrieve via get_gnss_debug() after update_gnss() returns.
@@ -303,6 +365,11 @@ struct GnssFixDebug {
   // zig-zag path and had no way to tell which heading source caused it.
   bool               track_heading_skipped_stronger_source = false;
   bool               track_heading_skipped_motion          = false;
+  // The same question answered completely, including the two cases the booleans
+  // above never covered: baseline too short, and bearing sigma too high.
+  TrackHeadingState  track_heading_state = TrackHeadingState::NOT_ATTEMPTED;
+  double             track_heading_baseline_m = 0.0;  // displacement since the reference fix
+  double             track_heading_sigma_rad  = 0.0;  // sigma_xy/dist, -1 if not computed
   double             hdop               = 0.0;
   double             vdop               = 0.0;
   int                satellites         = 0;
@@ -314,6 +381,15 @@ struct GnssFixDebug {
   // Lever arm observability
   bool               lever_arm_used     = false;  // was lever arm correction applied for this fix
   double             heading_sigma_deg  = 0.0;    // heading 1-sigma at time of this fix (degrees)
+};
+
+// Per-reading observability data: populated by update_magnetometer() on every call.
+struct MagnetometerDebug {
+  bool              accepted       = false;
+  MagRejectionReason reason        = MagRejectionReason::NOT_PROCESSED;
+  double            mahalanobis_sq = -1.0;
+  double            chi2_threshold  = 0.0;
+  double            measured_field  = 0.0;
 };
 
 enum class SensorHealth {
@@ -329,6 +405,15 @@ struct FusionCoreStatus {
   SensorHealth gnss_health          = SensorHealth::NOT_INIT;
   double       position_uncertainty = 0.0;
   int          update_count         = 0;
+
+  // True once the IMU and the wheel encoders have disagreed about the SIGN of the
+  // yaw rate, consistently, while the robot was genuinely turning. One of the two
+  // has a frame convention wrong. Latches: it describes the setup, not the moment.
+  bool          yaw_rate_sign_conflict = false;
+  double        yaw_rate_imu_mean      = 0.0;  // rad/s, over the samples that voted
+  double        yaw_rate_encoder_mean  = 0.0;  // rad/s, same samples
+  double        yaw_rate_disagree_frac = 0.0;  // of samples where BOTH were turning
+  int           yaw_rate_turn_samples  = 0;    // how many that was
 
   // Heading observability
   bool          heading_validated   = false;
@@ -365,6 +450,7 @@ struct FusionCoreStatus {
   // rejection). Quality-gate rejects (HDOP/VDOP/fix-type/sats) and delay rejects
   // do NOT increment gnss_outliers, so this is the only place they are reported.
   GnssRejectionReason gnss_last_rejection_reason = GnssRejectionReason::NOT_PROCESSED;
+  MagRejectionReason mag_last_rejection_reason = MagRejectionReason::NOT_PROCESSED;
 
   // Stale-measurement rejections from inter-sensor clock skew: this sensor's
   // stamps run more than max_measurement_delay behind the filter clock while
@@ -464,7 +550,16 @@ public:
   // See UKF::last_position_correction().
   double last_position_correction() const { return ukf_.last_position_correction(); }
   FusionCoreStatus   get_status()     const;
+
+  // Per-outcome tallies, indexed by static_cast<int>(the reason enum).
+  // Counts every fix, accepted included, so "the gate never fired" and
+  // "no fix ever arrived" are distinguishable. Reset by init() and reset().
+  const std::array<OutcomeTally, GNSS_REJECTION_REASON_COUNT>&
+    gnss_outcome_tally() const { return gnss_tally_; }
+  const std::array<OutcomeTally, MAG_REJECTION_REASON_COUNT>&
+    mag_outcome_tally() const { return mag_tally_; }
   const GnssFixDebug& get_gnss_debug() const { return gnss_debug_; }
+  const MagnetometerDebug& get_magnetometer_debug() const { return mag_debug_; }
   void               reset();
   bool               is_initialized()    const { return initialized_; }
   bool               is_heading_valid()  const { return heading_validated_; }
@@ -479,6 +574,11 @@ private:
   double last_imu_time_     = -1.0;
   double last_encoder_time_ = -1.0;
   double last_gnss_time_    = -1.0;
+  // Fix-to-fix continuity: the last two ACCEPTED fixes, for the second difference.
+  // Only accepted fixes, so a rejected spike can never become the reference that
+  // makes the next good fix look like a break.
+  double cont_x1_ = 0.0, cont_y1_ = 0.0, cont_t1_ = -1.0;   // most recent
+  double cont_x2_ = 0.0, cont_y2_ = 0.0, cont_t2_ = -1.0;   // the one before
   double last_vslam_time_   = -1.0;
   double last_mag_time_     = -1.0;
   int    update_count_      = 0;
@@ -564,6 +664,7 @@ private:
 
   // Per-fix observability: updated on every update_gnss() call
   GnssFixDebug gnss_debug_;
+  MagnetometerDebug mag_debug_;
 
   // Last accepted innovation norms per sensor: updated on each accepted update
   double last_gnss_innovation_norm_    = 0.0;
@@ -575,6 +676,14 @@ private:
   bool gnss_in_coast_            = false;
   // Persists the reason of the last rejected GNSS fix, for status reporting.
   GnssRejectionReason last_gnss_rejection_reason_ = GnssRejectionReason::NOT_PROCESSED;
+  // Persists the reason of the last rejected magnetometer reading.
+  MagRejectionReason last_mag_rejection_reason_ = MagRejectionReason::NOT_PROCESSED;
+  std::array<OutcomeTally, GNSS_REJECTION_REASON_COUNT> gnss_tally_{};
+  std::array<OutcomeTally, MAG_REJECTION_REASON_COUNT>  mag_tally_{};
+  // Record the outcome sitting in gnss_debug_/mag_debug_ and stamp it. Called at
+  // every terminal point so accepted and rejected fixes are both counted.
+  void note_gnss_outcome(double timestamp_seconds);
+  void note_mag_outcome(double timestamp_seconds);
 
   // Inter-sensor clock-skew protection. Raw per-stream stamps (recorded whether
   // or not the measurement was accepted, unlike last_*_time_ which only tracks
@@ -645,6 +754,28 @@ private:
     sensors::ImuNoiseMatrix R;
   };
   std::deque<ImuBufferEntry> imu_buffer_;
+
+  // ─── Yaw rate sign agreement ─────────────────────────────────────────────
+  // A rover ran for months with its gyro yaw rate inverted: the BNO085 in
+  // UART-RVC mode reports yaw increasing clockwise while REP-103 is
+  // counterclockwise positive. Both sensors were healthy, the encoders were
+  // right, and the filter watched them contradict each other every cycle
+  // without comment. The disagreement was noticed twice and blamed on the
+  // wheels both times. Because imu.gyro_noise defaults far tighter than
+  // encoder.yaw_noise, the filter leans on the gyro for heading, which is
+  // exactly the sensor that was wrong.
+  //
+  // Only samples taken while genuinely turning count, so noise around zero
+  // cannot vote, and the verdict needs to persist rather than fire on one
+  // sample.
+  double yaw_sign_imu_wz_        = 0.0;    // most recent IMU yaw rate
+  double yaw_sign_imu_stamp_     = -1.0;
+  double yaw_sign_imu_sum_       = 0.0;   // summed over disagreeing samples only
+  double yaw_sign_enc_sum_       = 0.0;
+  int    yaw_sign_votes_         = 0;     // samples where BOTH were turning
+  int    yaw_sign_disagree_      = 0;     // of those, how many disagreed in sign
+  bool   yaw_sign_conflict_      = false;
+  void note_yaw_rate_sign(double stamp, double enc_wz);
 
   // Heading observability tracking
   bool          heading_validated_ = false;
