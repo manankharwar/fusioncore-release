@@ -524,3 +524,294 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
+
+// ─── GPS track heading reports WHY it did not fuse ───────────────────────────
+//
+// This exists because of the 2026-09-06 field run. Yaw 1-sigma reached 101 deg,
+// which disabled the lever arm (0 of 222 fixes), inflated the position covariance
+// to 5.25 m, drove NIS to 0.20 against an honest 3.0, and left the chi2 outlier
+// gate 39x away from ever firing. The whole cascade came from track heading
+// silently declining to fuse, and the bag could not say which gate stopped it:
+// two booleans covered "a stronger source owns heading" and "the motion is
+// unsuitable", but the two cases that actually applied, a baseline shorter than
+// track_heading_min_dist and a bearing sigma over the limit, were recorded
+// nowhere. Diagnosing it took a day of replaying and reading source.
+
+namespace {
+// Drive east in a straight line, feeding GNSS fixes and matching wheel odometry,
+// then report what the filter says about track heading on the last fix.
+TrackHeadingState run_track_heading(double min_dist, double max_sigma,
+                                    double fix_sigma, double step_m,
+                                    int steps, double* baseline_out = nullptr)
+{
+  FusionCoreConfig cfg;
+  cfg.gps_track_heading_enabled  = true;
+  cfg.gps_track_heading_min_dist = min_dist;
+  cfg.gps_track_heading_max_sigma = max_sigma;
+  cfg.gps_track_heading_min_speed = 0.1;
+  cfg.gps_track_heading_max_yaw_rate = 1.0;
+  cfg.outlier_rejection = false;
+
+  FusionCore fc(cfg);
+  State s0;
+  fc.init(s0, 0.0);
+
+  const double dt = 1.0;
+  double t = 0.0, x = 0.0;
+  for (int i = 0; i < steps; ++i) {
+    t += dt;
+    // Encoder motion so the speed gate is satisfied and the filter is moving.
+    fc.update_encoder(t, step_m / dt, 0.0, 0.0);
+    x += step_m;
+    sensors::GnssFix fix;
+    fix.x = x; fix.y = 0.0; fix.z = 0.0;
+    fix.sigma_xy = fix.sigma_z = fix_sigma;
+    // hdop/vdop scale the noise model, and the sigma gate reads the R the filter
+    // actually built rather than this field. Leaving them at the 99.0 default
+    // makes R enormous and every case reports SIGMA_HIGH, so mirror what the ROS
+    // node does with a covariance-bearing fix and put the metres here too.
+    fix.hdop = fix.vdop = fix_sigma;
+    fix.fix_type = sensors::GnssFixType::RTK_FLOAT; fix.satellites = 12;
+    fc.update_gnss(t, fix);
+  }
+  if (baseline_out) *baseline_out = fc.get_gnss_debug().track_heading_baseline_m;
+  return fc.get_gnss_debug().track_heading_state;
+}
+}  // namespace
+
+TEST(GNSSTest, TrackHeadingReportsBaselineTooShort) {
+  // 1 m per fix against a 15 m minimum: the baseline never gets there, and before
+  // this change the bag simply showed nothing at all.
+  double baseline = -1.0;
+  EXPECT_EQ(run_track_heading(15.0, 0.4, 1.0, 1.0, 5, &baseline),
+            TrackHeadingState::BASELINE_SHORT);
+  EXPECT_GT(baseline, 0.0) << "the baseline actually reached must be reported";
+  EXPECT_LT(baseline, 15.0);
+}
+
+TEST(GNSSTest, TrackHeadingReportsSigmaTooHigh) {
+  // Baseline is long enough, but the bearing the geometry implies is worse than
+  // the gate allows. This is the field case, and it was previously invisible.
+  // The threshold is deliberately far from the boundary so the test asserts the
+  // reported STATE and does not quietly become a test of the noise model.
+  EXPECT_EQ(run_track_heading(5.0, 1e-6, 3.24, 5.0, 4),
+            TrackHeadingState::SIGMA_HIGH);
+}
+
+TEST(GNSSTest, TrackHeadingReportsFusedWhenItActuallyFires) {
+  // Same geometry with the sigma gate opened wide: it fuses. Paired with the test
+  // above this proves the states are distinguishing a real condition rather than
+  // reporting one stuck value.
+  EXPECT_EQ(run_track_heading(5.0, 1e6, 3.24, 5.0, 4),
+            TrackHeadingState::FUSED);
+}
+
+TEST(GNSSTest, TrackHeadingReportsDisabled) {
+  FusionCoreConfig cfg;
+  cfg.gps_track_heading_enabled = false;
+  FusionCore fc(cfg);
+  State s0;
+  fc.init(s0, 0.0);
+  sensors::GnssFix fix;
+  fix.x = 1.0; fix.sigma_xy = fix.sigma_z = 1.0;
+  fix.fix_type = sensors::GnssFixType::RTK_FLOAT; fix.satellites = 12;
+  fc.update_gnss(1.0, fix);
+  EXPECT_EQ(fc.get_gnss_debug().track_heading_state,
+            TrackHeadingState::NOT_ATTEMPTED);
+}
+
+// ─── The outlier gate can be told what "short-term" means ────────────────────
+//
+// A receiver's reported covariance describes ABSOLUTE accuracy: multipath and
+// ionospheric error that moves slowly. Consecutive fixes are far more consistent
+// than that number implies. Measured on the 2026-09-06 rover log, 3.24 m declared
+// against a 0.171 m median second difference, a factor of 55.
+//
+// The update wants the absolute figure or the filter believes GPS to centimetres
+// it has not earned. The gate wants the short-term figure, because an outlier IS
+// a break in short-term consistency. With the absolute figure in both places, S
+// is so large that nothing looks surprising: on that log a spike had to exceed
+// 29 m before it was rejected, while an accepted 15 m spike moved position 4.5 m.
+namespace {
+// Feed a straight run of clean fixes, then one displaced by `spike` metres.
+// Returns true if that last fix was rejected.
+bool spike_rejected(double spike, double outlier_sigma_xy) {
+  FusionCoreConfig cfg;
+  cfg.outlier_rejection = true;
+  cfg.gnss.outlier_sigma_xy = outlier_sigma_xy;
+  cfg.gnss_max_speed = 0.0;              // isolate the chi2 gate
+  FusionCore fc(cfg);
+  State s0;
+  fc.init(s0, 0.0);
+  double t = 0.0, x = 0.0;
+  auto feed = [&](double ex) {
+    sensors::GnssFix f;
+    f.x = ex; f.y = 0.0; f.z = 0.0;
+    f.sigma_xy = f.sigma_z = 3.24;       // what this receiver declares
+    f.hdop = f.vdop = 3.24;
+    f.fix_type = sensors::GnssFixType::RTK_FLOAT;
+    f.satellites = 12;
+    return fc.update_gnss(t, f);
+  };
+  for (int i = 0; i < 40; ++i) {
+    t += 1.0;
+    fc.update_encoder(t, 0.4, 0.0, 0.0);
+    x += 0.4;
+    feed(x);
+  }
+  t += 1.0;
+  fc.update_encoder(t, 0.4, 0.0, 0.0);
+  x += 0.4;
+  return !feed(x + spike);
+}
+}  // namespace
+
+// Smallest spike (in whole metres) this configuration rejects, or -1.
+int spike_threshold(double outlier_sigma_xy) {
+  for (int d = 1; d <= 120; ++d)
+    if (spike_rejected(d, outlier_sigma_xy)) return d;
+  return -1;
+}
+
+TEST(GNSSTest, OutlierSigmaDefaultsToTheOldBehaviour) {
+  // Zero must change nothing: this ships to existing users.
+  EXPECT_FALSE(spike_rejected(2.0, 0.0)) << "ordinary noise must never be rejected";
+  EXPECT_TRUE (spike_rejected(60.0, 0.0)) << "a 60 m jump must still be caught";
+}
+
+TEST(GNSSTest, OutlierSigmaNeverLoosensTheGate) {
+  // The invariant that matters. Telling the gate the receiver is more consistent
+  // than its declared covariance can only make it more suspicious, never less.
+  //
+  // It is easy to get this backwards: a value ABOVE the receiver's own sigma
+  // inflates the gate's S and lets MORE through. Measured with a 3.24 m receiver,
+  // outlier_sigma_xy=5.0 moved the rejection threshold from 26 m out to 30 m,
+  // which is the opposite of the intent. Hence the guidance to measure it from a
+  // bag rather than guess.
+  const int base = spike_threshold(0.0);
+  ASSERT_GT(base, 0);
+  for (double os : {2.0, 1.0, 0.5}) {
+    EXPECT_LE(spike_threshold(os), base)
+        << "outlier_sigma_xy=" << os << " made the gate looser than the default";
+  }
+}
+
+TEST(GNSSTest, OutlierSigmaStillAcceptsOrdinaryNoise) {
+  // The failure mode that has bitten this project repeatedly is a gate that
+  // rejects good data. Ordinary fix-to-fix noise must survive at every setting.
+  for (double os : {0.0, 2.0, 1.0, 0.5}) {
+    EXPECT_FALSE(spike_rejected(0.5, os)) << "os=" << os;
+    EXPECT_FALSE(spike_rejected(1.0, os)) << "os=" << os;
+    EXPECT_FALSE(spike_rejected(2.0, os)) << "os=" << os;
+  }
+}
+
+TEST(GNSSTest, ChiSquaredGateCannotSeeMetreScaleSpikes) {
+  // Documents a limit rather than a fix, because it is the more important fact.
+  //
+  // A chi2 gate tests the fix against the FILTER, so its scale is set by
+  // S = H P H' + R. With a 3.24 m receiver and a filter carrying metres of
+  // position uncertainty, S is tens of square metres and nothing under about
+  // 20 m looks surprising. Measured on the 2026-09-06 rover log: rejection began
+  // between 29 and 30 m, and an accepted 15 m spike moved position 4.5 m.
+  //
+  // Giving the gate a better R helps but cannot cure it, because P remains. Nor
+  // does fixing heading: a perfect absolute heading halved position sigma from
+  // 7.19 to 3.94 m and moved the threshold the WRONG way, 26 m out to 32 m.
+  //
+  // Catching a metre-scale spike needs a test that does not involve P at all,
+  // comparing a fix against its neighbours rather than against the filter. See
+  // the fix-to-fix continuity proposal.
+  EXPECT_FALSE(spike_rejected(10.0, 0.0))
+      << "if this ever passes, the chi2 gate got sharper and the note above is stale";
+  EXPECT_FALSE(spike_rejected(10.0, 0.5))
+      << "a better gate R alone does not reach 10 m either";
+}
+
+// ─── Fix-to-fix continuity catches what chi2 structurally cannot ─────────────
+//
+// chi2 compares a fix against the FILTER, so its scale is S = H P H' + R. On a
+// consumer receiver that is tens of square metres and nothing under about 25 m
+// looks surprising: measured on the 2026-09-06 rover log, rejection began between
+// 29 and 30 m while an accepted 15 m spike moved position 4.5 m. Neither a better
+// gate R nor a perfect heading fixes it; heading made it slightly worse.
+//
+// Continuity asks whether a fix agrees with the two fixes either side of it,
+// which never involves P. Measured across 2361 fixes from seven field logs, the
+// second difference of a good fix has a median of 0.09 to 0.30 m and a p99 under
+// 2.1 m, so a 3 m limit sits 10 to 30 times above normal. At that setting the
+// only rejections across all seven logs were 5 fixes in one 2026-07 log whose
+// second difference reached 4.42 m, 27 times that log's median, which is an
+// outlier by any definition.
+namespace {
+// Fixes every second along a straight line, with one displaced by `spike`.
+// Returns true if the displaced fix was rejected.
+bool continuity_rejects(double spike, double continuity_max_m) {
+  FusionCoreConfig cfg;
+  cfg.outlier_rejection = true;
+  cfg.gnss.continuity_max_m = continuity_max_m;
+  cfg.gnss_max_speed = 0.0;
+  FusionCore fc(cfg);
+  State s0;
+  fc.init(s0, 0.0);
+  double t = 0.0, x = 0.0;
+  auto feed = [&](double ex) {
+    sensors::GnssFix f;
+    f.x = ex; f.y = 0.0; f.z = 0.0;
+    f.sigma_xy = f.sigma_z = 3.24;
+    f.hdop = f.vdop = 3.24;
+    f.fix_type = sensors::GnssFixType::RTK_FLOAT;
+    f.satellites = 12;
+    return fc.update_gnss(t, f);
+  };
+  for (int i = 0; i < 10; ++i) { t += 1.0; x += 0.4; feed(x); }
+  t += 1.0; x += 0.4;
+  return !feed(x + spike);
+}
+}  // namespace
+
+TEST(GNSSTest, ContinuityDefaultsOff) {
+  EXPECT_FALSE(continuity_rejects(10.0, 0.0))
+      << "zero must change nothing: this ships to existing users";
+}
+
+TEST(GNSSTest, ContinuityCatchesSpikesChi2Misses) {
+  // 10 m is invisible to chi2 on this receiver and obvious here.
+  EXPECT_TRUE(continuity_rejects(10.0, 3.0));
+  EXPECT_TRUE(continuity_rejects(5.0,  3.0));
+}
+
+TEST(GNSSTest, ContinuityAcceptsOrdinaryFixToFixNoise) {
+  // The bar any new gate must clear. Across seven real logs the second difference
+  // of a good fix stayed under 2.2 m, so these must all survive a 3 m limit.
+  EXPECT_FALSE(continuity_rejects(0.2, 3.0));
+  EXPECT_FALSE(continuity_rejects(1.0, 3.0));
+  EXPECT_FALSE(continuity_rejects(2.0, 3.0));
+}
+
+TEST(GNSSTest, ContinuityIgnoresUnevenlySpacedFixes) {
+  // Across a gap the second difference is legitimately large, and rejecting the
+  // first fix after an outage is exactly the failure gnss_coast_min_gap_s exists
+  // to avoid. Two fixes a second apart then one eight seconds later: the robot
+  // has really travelled, and that must not read as a discontinuity.
+  FusionCoreConfig cfg;
+  cfg.outlier_rejection = true;
+  cfg.gnss.continuity_max_m = 3.0;
+  cfg.gnss_max_speed = 0.0;
+  FusionCore fc(cfg);
+  State s0;
+  fc.init(s0, 0.0);
+  auto feed = [&](double t, double ex) {
+    sensors::GnssFix f;
+    f.x = ex; f.y = 0.0; f.z = 0.0;
+    f.sigma_xy = f.sigma_z = 3.24;
+    f.hdop = f.vdop = 3.24;
+    f.fix_type = sensors::GnssFixType::RTK_FLOAT;
+    f.satellites = 12;
+    return fc.update_gnss(t, f);
+  };
+  feed(1.0, 0.4);
+  feed(2.0, 0.8);
+  EXPECT_TRUE(feed(10.0, 4.0))
+      << "a fix after an 8 s gap must not be rejected for breaking continuity";
+}
