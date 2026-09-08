@@ -149,7 +149,11 @@ void FusionCore::init(const State& initial_state, double timestamp_seconds) {
 
   // Reset observability state
   gnss_debug_                    = GnssFixDebug{};
+  mag_debug_                     = MagnetometerDebug{};
   last_gnss_rejection_reason_    = GnssRejectionReason::NOT_PROCESSED;
+  gnss_tally_.fill(OutcomeTally{});
+  mag_tally_.fill(OutcomeTally{});
+  last_mag_rejection_reason_     = MagRejectionReason::NOT_PROCESSED;
   last_gnss_innovation_norm_     = 0.0;
   last_imu_innovation_norm_      = 0.0;
   last_encoder_innovation_norm_  = 0.0;
@@ -196,7 +200,11 @@ void FusionCore::reset() {
   ukf_.set_gyro_bias_noise_scale(1.0);
 
   gnss_debug_                   = GnssFixDebug{};
+  mag_debug_                    = MagnetometerDebug{};
   last_gnss_rejection_reason_   = GnssRejectionReason::NOT_PROCESSED;
+  gnss_tally_.fill(OutcomeTally{});
+  mag_tally_.fill(OutcomeTally{});
+  last_mag_rejection_reason_    = MagRejectionReason::NOT_PROCESSED;
   last_gnss_innovation_norm_    = 0.0;
   last_imu_innovation_norm_     = 0.0;
   last_encoder_innovation_norm_ = 0.0;
@@ -503,6 +511,9 @@ void FusionCore::update_imu(
   if (reject_stale_from_skew(timestamp_seconds, last_imu_raw_stamp_, imu_stale_rejects_))
     return;
 
+  yaw_sign_imu_wz_    = wz;
+  yaw_sign_imu_stamp_ = timestamp_seconds;
+
   predict_to(timestamp_seconds);
 
   sensors::ImuMeasurement z;
@@ -680,6 +691,8 @@ void FusionCore::update_encoder(
   if (reject_stale_from_skew(timestamp_seconds, last_enc_raw_stamp_, enc_stale_rejects_))
     return;
 
+  note_yaw_rate_sign(timestamp_seconds, wz);
+
   predict_to(timestamp_seconds);
 
   sensors::EncoderMeasurement z;
@@ -817,6 +830,38 @@ void FusionCore::update_zupt(double timestamp_seconds, double noise_sigma) {
   ukf_.update<sensors::ENCODER_DIM>(z, sensors::zupt_measurement_function, R);
 }
 
+
+// Record the outcome currently in gnss_debug_ and stamp it. See OutcomeTally in
+// fusioncore.hpp for why a single "last reason" field was not enough.
+void FusionCore::note_gnss_outcome(double timestamp_seconds)
+{
+  // last_gnss_rejection_reason_ is documented as sticky: it names the most
+  // recent REJECTED fix and survives later accepted ones, so a user who finds
+  // GPS quiet can still see what dropped it. An accepted fix must not wipe it.
+  // The tally below counts ACCEPTED anyway, which is how "the gate never fired"
+  // stays distinguishable from "no fix ever arrived".
+  if (gnss_debug_.reason != GnssRejectionReason::ACCEPTED)
+    last_gnss_rejection_reason_ = gnss_debug_.reason;
+  const int i = static_cast<int>(gnss_debug_.reason);
+  if (i < 0 || i >= GNSS_REJECTION_REASON_COUNT) return;
+  OutcomeTally& t = gnss_tally_[i];
+  if (t.count == 0) t.first_seen = timestamp_seconds;
+  t.last_seen = timestamp_seconds;
+  ++t.count;
+}
+
+void FusionCore::note_mag_outcome(double timestamp_seconds)
+{
+  if (mag_debug_.reason != MagRejectionReason::ACCEPTED)
+    last_mag_rejection_reason_ = mag_debug_.reason;
+  const int i = static_cast<int>(mag_debug_.reason);
+  if (i < 0 || i >= MAG_REJECTION_REASON_COUNT) return;
+  OutcomeTally& t = mag_tally_[i];
+  if (t.count == 0) t.first_seen = timestamp_seconds;
+  t.last_seen = timestamp_seconds;
+  ++t.count;
+}
+
 bool FusionCore::update_gnss(
   double timestamp_seconds,
   const sensors::GnssFix& fix
@@ -856,7 +901,7 @@ bool FusionCore::update_gnss(
       gnss_debug_.reason = GnssRejectionReason::VDOP_HIGH;
     else
       gnss_debug_.reason = GnssRejectionReason::MIN_SATS;
-    last_gnss_rejection_reason_ = gnss_debug_.reason;
+    note_gnss_outcome(timestamp_seconds);
     return false;
   }
 
@@ -874,13 +919,13 @@ bool FusionCore::update_gnss(
       gnss_fused = apply_gnss_update(timestamp_seconds, fix);
     });
     if (!applied) {
+      // apply_delayed_measurement only returns false before running the update,
+      // so this is the one rejection apply_gnss_update never got to record.
       gnss_debug_.accepted = false;
       gnss_debug_.reason   = GnssRejectionReason::DELAY_TOO_LARGE;
+      note_gnss_outcome(timestamp_seconds);
     }
-    if (!applied || !gnss_fused) {
-      last_gnss_rejection_reason_ = gnss_debug_.reason;
-      return false;
-    }
+    if (!applied || !gnss_fused) return false;
     update_distance_traveled(fix.x, fix.y, pre_update_speed_delayed);
     last_gnss_time_ = timestamp_seconds;
     ++update_count_;
@@ -891,10 +936,7 @@ bool FusionCore::update_gnss(
   double pre_update_speed = std::sqrt(
     ukf_.state().x[VX] * ukf_.state().x[VX] +
     ukf_.state().x[VY] * ukf_.state().x[VY]);
-  if (!apply_gnss_update(timestamp_seconds, fix)) {
-    last_gnss_rejection_reason_ = gnss_debug_.reason;
-    return false;
-  }
+  if (!apply_gnss_update(timestamp_seconds, fix)) return false;
   update_distance_traveled(fix.x, fix.y, pre_update_speed);
   last_gnss_time_ = timestamp_seconds;
   ++update_count_;
@@ -961,10 +1003,52 @@ bool FusionCore::apply_gnss_update(
     : std::function<sensors::GnssPosMeasurement(const StateVector&)>(
         sensors::gnss_pos_measurement_function);
 
+  // Fix-to-fix continuity, checked BEFORE chi2 because it is the test that can
+  // actually see a metre-scale spike. chi2 compares a fix against the filter, so
+  // its scale is S = H P H' + R and nothing under about 25 m looks surprising on
+  // a consumer receiver. This compares a fix against the two before it, which
+  // never involves P at all. See GnssParams::continuity_max_m.
+  if (config_.gnss.continuity_max_m > 0.0 && cont_t2_ >= 0.0) {
+    const double dt1 = cont_t1_ - cont_t2_;
+    const double dt2 = timestamp_seconds - cont_t1_;
+    // Only when the three fixes are evenly spaced. Across a gap the second
+    // difference is legitimately large, and rejecting the first fix after an
+    // outage is exactly the failure gnss_coast_min_gap_s exists to avoid.
+    if (dt1 > 1e-6 && dt2 > 1e-6 && dt2 <= 2.0 * dt1 && dt2 >= 0.5 * dt1) {
+      const double r = dt2 / dt1;
+      // Where the fix should be if the receiver kept moving as it was.
+      const double px = cont_x1_ + (cont_x1_ - cont_x2_) * r;
+      const double py = cont_y1_ + (cont_y1_ - cont_y2_) * r;
+      const double resid = std::hypot(fix.x - px, fix.y - py);
+      if (resid > config_.gnss.continuity_max_m) {
+        gnss_debug_.accepted = false;
+        gnss_debug_.reason   = GnssRejectionReason::CONTINUITY_BREAK;
+        note_gnss_outcome(timestamp_seconds);
+        ++gnss_outliers_;
+        ++gnss_consecutive_rejects_;
+        return false;
+      }
+    }
+  }
+
   if (config_.outlier_rejection) {
     sensors::GnssPosMeasurement innovation_pre;
     sensors::GnssPosNoiseMatrix S;
-    ukf_.predict_measurement<sensors::GNSS_POS_DIM>(z, h_gnss, R, innovation_pre, S);
+    // Gate on SHORT-TERM consistency when the user has measured it, not on the
+    // receiver's absolute accuracy. See GnssParams::outlier_sigma_xy for why the
+    // two differ by a factor of tens and what that costs. The update below still
+    // uses the full R: only the gate's view of the world changes here.
+    sensors::GnssPosNoiseMatrix R_gate = R;
+    if (config_.gnss.outlier_sigma_xy > 0.0) {
+      const double v = config_.gnss.outlier_sigma_xy * config_.gnss.outlier_sigma_xy;
+      R_gate.setZero();
+      R_gate(0, 0) = v;
+      R_gate(1, 1) = v;
+      // Vertical is left on the receiver's own figure: height error is genuinely
+      // worse than horizontal and is not what a multipath jump shows up in.
+      R_gate(2, 2) = R(2, 2);
+    }
+    ukf_.predict_measurement<sensors::GNSS_POS_DIM>(z, h_gnss, R_gate, innovation_pre, S);
 
     // Compute Mahalanobis distance squared inline so it can be surfaced for observability.
     // This avoids calling is_outlier() which would run a second LDLT internally.
@@ -1017,7 +1101,7 @@ bool FusionCore::apply_gnss_update(
         // initial value, so a user watching gnss_last_reject_reason sees a fix
         // vanish for no stated reason. On the 2026-08-03 field run this hid 158
         // rejections behind a meaningless label while the outlier counter rose.
-        last_gnss_rejection_reason_ = gnss_debug_.reason;
+        note_gnss_outcome(timestamp_seconds);
         return false;  // do not touch the coast counters: an outlier must not relax the gate
       }
     }
@@ -1026,7 +1110,7 @@ bool FusionCore::apply_gnss_update(
       ++gnss_outliers_;
       gnss_debug_.accepted = false;
       gnss_debug_.reason   = GnssRejectionReason::CHI2_FAILED;
-      last_gnss_rejection_reason_ = gnss_debug_.reason;
+      note_gnss_outcome(timestamp_seconds);
 
       if (config_.gnss_coast_n > 0) {
         // At the start of a rejection sequence, decide whether GPS was
@@ -1063,6 +1147,11 @@ bool FusionCore::apply_gnss_update(
     gnss_debug_.mahalanobis_sq = -1.0;
   }
 
+  // Only accepted fixes become the continuity reference, so a rejected spike can
+  // never poison the baseline that judges the next fix.
+  cont_x2_ = cont_x1_; cont_y2_ = cont_y1_; cont_t2_ = cont_t1_;
+  cont_x1_ = fix.x;    cont_y1_ = fix.y;    cont_t1_ = timestamp_seconds;
+
   // GPS accepted normally: exit coast mode and reset counter
   if (gnss_in_coast_) {
     gnss_in_coast_ = false;
@@ -1077,6 +1166,7 @@ bool FusionCore::apply_gnss_update(
   // Update observability state for accepted fix
   gnss_debug_.accepted           = true;
   gnss_debug_.reason             = GnssRejectionReason::ACCEPTED;
+  note_gnss_outcome(timestamp_seconds);
   gnss_debug_.in_coast_mode      = false;
   gnss_debug_.consecutive_rejects = 0;
   last_gnss_innovation_norm_     = innovation.norm();
@@ -1118,6 +1208,15 @@ bool FusionCore::apply_gnss_update(
   gnss_debug_.track_heading_skipped_motion          =
       !have_stronger_heading && !motion_suits_track_heading;
 
+  gnss_debug_.track_heading_sigma_rad = -1.0;
+  if (!config_.gps_track_heading_enabled) {
+    gnss_debug_.track_heading_state = TrackHeadingState::NOT_ATTEMPTED;
+  } else if (have_stronger_heading) {
+    gnss_debug_.track_heading_state = TrackHeadingState::STRONGER_SOURCE;
+  } else if (!motion_suits_track_heading) {
+    gnss_debug_.track_heading_state = TrackHeadingState::MOTION_UNSUITABLE;
+  }
+
   if (config_.gps_track_heading_enabled &&
       !have_stronger_heading &&
       motion_suits_track_heading) {
@@ -1131,9 +1230,20 @@ bool FusionCore::apply_gnss_update(
       double dy   = fix.y - last_hdg_fix_y_;
       double dist = std::sqrt(dx*dx + dy*dy);
 
+      gnss_debug_.track_heading_baseline_m = dist;
+
+      if (dist < config_.gps_track_heading_min_dist) {
+        gnss_debug_.track_heading_state = TrackHeadingState::BASELINE_SHORT;
+      }
+
       if (dist >= config_.gps_track_heading_min_dist) {
         double sigma_xy  = std::sqrt((R_meas(0,0) + R_meas(1,1)) * 0.5);
         double sigma_hdg = sigma_xy / dist;
+        gnss_debug_.track_heading_sigma_rad = sigma_hdg;
+
+        if (sigma_hdg > config_.gps_track_heading_max_sigma) {
+          gnss_debug_.track_heading_state = TrackHeadingState::SIGMA_HIGH;
+        }
 
         if (sigma_hdg <= config_.gps_track_heading_max_sigma) {
           sensors::GnssHdgMeasurement z_hdg;
@@ -1158,6 +1268,9 @@ bool FusionCore::apply_gnss_update(
               z_hdg, sensors::gnss_hdg_measurement_function, R_hdg, innov_pre, S_pre, HDG_ANGLE_DIMS);
             fuse = !is_outlier<sensors::GNSS_HDG_DIM>(innov_pre, S_pre, config_.outlier_threshold_hdg);
           }
+
+          gnss_debug_.track_heading_state =
+            fuse ? TrackHeadingState::FUSED : TrackHeadingState::CHI2_FAILED;
 
           if (fuse) {
             ukf_.update<sensors::GNSS_HDG_DIM>(
@@ -1238,6 +1351,48 @@ const State& FusionCore::get_state() const {
   return ukf_.state();
 }
 
+
+// Watch whether the IMU and the wheel encoders agree about which way the robot is
+// turning. See the members in fusioncore.hpp for why this exists.
+//
+// Counts votes rather than requiring a continuous stretch of disagreement. A
+// hand-driven rover corrects constantly, so its yaw rate crosses zero all the
+// time: measured on the 2026-09-06 log, the longest unbroken interval with both
+// sensors above even 0.05 rad/s was 0.9 s. A continuity rule would never fire on
+// real driving, which is exactly the case this needs to catch.
+//
+// 0.08 rad/s (4.6 deg/s) is clear of gyro noise and of the phantom yaw a straight
+// driving differential rover fabricates from wheel scale mismatch, while still
+// admitting 44 percent of that log's samples, so votes accumulate quickly. A
+// genuine direction change makes the two disagree briefly as one leads the other,
+// which is why a supermajority over many samples is required rather than a streak.
+void FusionCore::note_yaw_rate_sign(double stamp, double enc_wz)
+{
+  constexpr double TURNING_RAD_S  = 0.08;
+  constexpr int    MIN_VOTES      = 200;
+  constexpr double DISAGREE_RATIO = 0.80;
+  constexpr double IMU_FRESH_SECS = 0.5;
+
+  if (yaw_sign_conflict_) return;                       // latched, say it once
+  if (yaw_sign_imu_stamp_ < 0.0) return;
+  if (stamp - yaw_sign_imu_stamp_ > IMU_FRESH_SECS) return;
+
+  const double imu_wz = yaw_sign_imu_wz_;
+  // Both must agree the robot IS turning before their signs mean anything.
+  if (std::fabs(imu_wz) < TURNING_RAD_S || std::fabs(enc_wz) < TURNING_RAD_S) return;
+
+  ++yaw_sign_votes_;
+  if ((imu_wz > 0.0) != (enc_wz > 0.0)) {
+    ++yaw_sign_disagree_;
+    yaw_sign_imu_sum_ += imu_wz;
+    yaw_sign_enc_sum_ += enc_wz;
+  }
+
+  if (yaw_sign_votes_ >= MIN_VOTES &&
+      static_cast<double>(yaw_sign_disagree_) / yaw_sign_votes_ >= DISAGREE_RATIO)
+    yaw_sign_conflict_ = true;
+}
+
 FusionCoreStatus FusionCore::get_status() const {
   FusionCoreStatus status;
   status.initialized  = initialized_;
@@ -1267,6 +1422,15 @@ FusionCoreStatus FusionCore::get_status() const {
 
   // Heading observability
   status.heading_validated = heading_validated_;
+  status.yaw_rate_sign_conflict = yaw_sign_conflict_;
+  status.yaw_rate_turn_samples = yaw_sign_votes_;
+  if (yaw_sign_votes_ > 0)
+    status.yaw_rate_disagree_frac =
+      static_cast<double>(yaw_sign_disagree_) / yaw_sign_votes_;
+  if (yaw_sign_disagree_ > 0) {
+    status.yaw_rate_imu_mean     = yaw_sign_imu_sum_ / yaw_sign_disagree_;
+    status.yaw_rate_encoder_mean = yaw_sign_enc_sum_ / yaw_sign_disagree_;
+  }
   status.heading_source    = heading_source_;
   status.distance_traveled = distance_traveled_;
 
@@ -1302,6 +1466,7 @@ FusionCoreStatus FusionCore::get_status() const {
   status.gnss_in_coast           = gnss_in_coast_;
   status.gnss_consecutive_rejects = gnss_consecutive_rejects_;
   status.gnss_last_rejection_reason = last_gnss_rejection_reason_;
+  status.mag_last_rejection_reason = last_mag_rejection_reason_;
 
   // Inter-sensor clock-skew rejections
   status.imu_stale_rejects     = imu_stale_rejects_;
@@ -1407,6 +1572,12 @@ bool FusionCore::update_magnetometer(
   if (!initialized_)
     throw std::runtime_error("FusionCore: update_magnetometer() called before init()");
 
+  mag_debug_ = MagnetometerDebug{};
+  mag_debug_.chi2_threshold = config_.mag.chi2_threshold;
+  const Eigen::Vector3d corrected_field =
+    config_.mag.soft_iron * (Eigen::Vector3d(mx, my, mz) - config_.mag.hard_iron);
+  mag_debug_.measured_field = corrected_field.norm();
+
   if (reject_stale_from_skew(timestamp_seconds, last_mag_raw_stamp_, mag_stale_rejects_))
     return false;
 
@@ -1418,6 +1589,8 @@ bool FusionCore::update_magnetometer(
   // catch. See sensors::mag_field_disturbed. Disabled when field_strength <= 0.
   if (sensors::mag_field_disturbed(mx, my, mz, config_.mag)) {
     ++mag_outliers_;
+    mag_debug_.reason = MagRejectionReason::FIELD_MAGNITUDE;
+    note_mag_outcome(timestamp_seconds);
     return false;
   }
 
@@ -1445,8 +1618,12 @@ bool FusionCore::update_magnetometer(
     sensors::GnssHdgNoiseMatrix S;
     ukf_.predict_measurement<sensors::GNSS_HDG_DIM>(
       z, sensors::gnss_hdg_measurement_function, R, innov_pre, S, MAG_ANGLE_DIMS);
-    if (is_outlier<sensors::GNSS_HDG_DIM>(innov_pre, S, config_.mag.chi2_threshold)) {
+    const double mahalanobis_sq = innov_pre.dot(S.ldlt().solve(innov_pre));
+    mag_debug_.mahalanobis_sq = mahalanobis_sq;
+    if (mahalanobis_sq > config_.mag.chi2_threshold) {
       ++mag_outliers_;
+      mag_debug_.reason = MagRejectionReason::CHI2_FAILED;
+      note_mag_outcome(timestamp_seconds);
       return false;
     }
   }
@@ -1466,6 +1643,9 @@ bool FusionCore::update_magnetometer(
 
   last_mag_time_ = timestamp_seconds;
   ++update_count_;
+  mag_debug_.accepted = true;
+  mag_debug_.reason = MagRejectionReason::ACCEPTED;
+  note_mag_outcome(timestamp_seconds);
   return true;
 }
 
