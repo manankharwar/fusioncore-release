@@ -39,6 +39,8 @@
 #include <sstream>
 #include <proj.h>
 
+#include "fusioncore_ros/gnss_dop_gate_warning.hpp"
+
 using namespace std::chrono_literals;
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
 
@@ -189,7 +191,11 @@ public:
     // re-acquires: measured 4.4 m recovery with the gate off versus 358 m and
     // climbing with it on, on NCLT 2013-04-05.
     declare_parameter("gnss.max_speed_drift_k", 3.0);
+    declare_parameter("gnss.min_sigma_xy",   0.02);
+    declare_parameter("gnss.min_sigma_z",    0.05);
     declare_parameter("gnss.max_sigma_xy",   25.0);
+    declare_parameter("gnss.outlier_sigma_xy", 0.0);
+    declare_parameter("gnss.continuity_max_m", 0.0);
     declare_parameter("gnss.max_sigma_z",    50.0);
     declare_parameter("gnss.min_satellites", 4);
     // Minimum fix type for GNSS fusion: 1=GPS, 2=DGPS, 3=RTK_FLOAT, 4=RTK_FIXED
@@ -293,6 +299,19 @@ public:
     declare_parameter("gnss.recovery_rejection_n",  0);
     declare_parameter("gnss.p_inflate_sigma",       50.0);
     declare_parameter("gnss.recovery_timeout_s",    0.0);
+    // How far the robot must travel before heading is declared observable and
+    // heading_validated flips true. This was hardcoded at 5.0 and unreachable
+    // from YAML: setting gnss.track_heading_min_dist looked like it controlled
+    // this but gates only whether track heading is FUSED, so a config asking for
+    // 15 m still validated at 5. Measured on a rover 2026-09-05: validated at
+    // 5.04 m carrying 48.6 degrees of heading uncertainty, because track heading
+    // is a bearing between two fixes and its error is roughly
+    // (GPS sigma / distance). At 6 m sigma over a 5 m baseline that is radians.
+    //
+    // Default stays 5.0 so no existing setup changes behaviour. Raise it when
+    // your GPS sigma is large: 15 m of travel against 6 m sigma is about
+    // 23 degrees, which is a heading worth believing.
+    declare_parameter("gnss.heading_observable_distance", 5.0);
     declare_parameter("gnss.track_heading_enabled",   true);
     declare_parameter("gnss.track_heading_min_dist",  5.0);
     declare_parameter("gnss.track_heading_max_sigma", 0.4);
@@ -471,7 +490,13 @@ public:
     config.gnss.heading_noise  = get_parameter("gnss.heading_noise").as_double();
     config.gnss.max_hdop       = get_parameter("gnss.max_hdop").as_double();
     config.gnss.max_vdop       = get_parameter("gnss.max_vdop").as_double();
+    max_hdop_                  = config.gnss.max_hdop;
+    max_vdop_                  = config.gnss.max_vdop;
+    gnss_min_sigma_xy_         = get_parameter("gnss.min_sigma_xy").as_double();
+    gnss_min_sigma_z_          = get_parameter("gnss.min_sigma_z").as_double();
     config.gnss.max_sigma_xy   = get_parameter("gnss.max_sigma_xy").as_double();
+    config.gnss.outlier_sigma_xy = get_parameter("gnss.outlier_sigma_xy").as_double();
+    config.gnss.continuity_max_m = get_parameter("gnss.continuity_max_m").as_double();
     config.gnss.max_sigma_z    = get_parameter("gnss.max_sigma_z").as_double();
     max_sigma_xy_              = config.gnss.max_sigma_xy;
     max_sigma_z_               = config.gnss.max_sigma_z;
@@ -492,6 +517,12 @@ public:
       RCLCPP_INFO(get_logger(),
         "GNSS lever arm will be applied pre-heading-validation "
         "(gnss.apply_lever_arm_pre_heading=true)");
+    }
+    apply_lever_arm_pre_heading_ = config.gnss.apply_lever_arm_pre_heading;
+    if (apply_lever_arm_pre_heading_) {
+      // This flag makes the correction live from the first accepted fix, so an
+      // unmeasured offset bites immediately rather than waiting for heading.
+      warn_if_lever_arm_unset("gnss.apply_lever_arm_pre_heading is true");
     }
 
     gnss_lever_arm2_.x = get_parameter("gnss.lever_arm2_x").as_double();
@@ -560,6 +591,7 @@ public:
     config.gnss_recovery_rejection_n  = get_parameter("gnss.recovery_rejection_n").as_int();
     config.gnss_p_inflate_sigma       = get_parameter("gnss.p_inflate_sigma").as_double();
     config.gnss_recovery_timeout_s    = get_parameter("gnss.recovery_timeout_s").as_double();
+    config.heading_observable_distance     = get_parameter("gnss.heading_observable_distance").as_double();
     config.gps_track_heading_enabled       = get_parameter("gnss.track_heading_enabled").as_bool();
     config.gps_track_heading_min_dist      = get_parameter("gnss.track_heading_min_dist").as_double();
     config.gps_track_heading_max_sigma     = get_parameter("gnss.track_heading_max_sigma").as_double();
@@ -655,6 +687,8 @@ public:
     }
 
     fc_ = std::make_unique<fusioncore::FusionCore>(config);
+    gnss_no_fix_tally_[0] = fusioncore::OutcomeTally{};
+    gnss_no_fix_tally_[1] = fusioncore::OutcomeTally{};
 
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_clock());
@@ -1439,10 +1473,19 @@ private:
         }
         imu_lever_arm_tf_resolved_ = true;
       } catch (const tf2::TransformException &ex) {
-        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-          "IMU lever arm auto-resolve failed (%s -> %s): %s. "
-          "Leaving lever arm at zero; set imu.lever_arm_x/y/z explicitly to override.",
-          base_frame_.c_str(), imu_frame.c_str(), ex.what());
+        // A missing TF does not fix itself. This is a CONFIGURATION message, not
+        // a transient one, so say it a few times early (in case the TF is merely
+        // slow to publish) and then stop. At the old 5 s throttle it printed
+        // roughly 700 times in an hour-long run and became wallpaper, which is
+        // how a genuinely new fault gets lost in a field log.
+        if (report_lever_arm_tf_failure(imu_la_warns_, imu_la_last_warn_)) {
+          RCLCPP_WARN(get_logger(),
+            "IMU lever arm auto-resolve failed (%s -> %s): %s. "
+            "Leaving lever arm at zero; set imu.lever_arm_x/y/z explicitly to "
+            "override.%s",
+            base_frame_.c_str(), imu_frame.c_str(), ex.what(),
+            imu_la_warns_ >= kLeverArmTfMaxWarns ? "  Not reporting this again." : "");
+        }
       }
     }
 
@@ -1929,13 +1972,30 @@ private:
 
   // ─── GNSS position callback ────────────────────────────────────────────────
 
+  void warn_if_dop_gate_bypassed(bool covariance_gate_active)
+  {
+    if (!dop_gate_warning_.should_warn(covariance_gate_active, max_hdop_, max_vdop_)) {
+      return;
+    }
+
+    RCLCPP_WARN(get_logger(),
+      "This receiver reports position covariance, so the sigma gate runs "
+      "(gnss.max_sigma_xy=%.1f m, gnss.max_sigma_z=%.1f m). "
+      "gnss.max_hdop=%.1f and gnss.max_vdop=%.1f will not be consulted on this run; "
+      "the DOP path is only used for fixes without covariance.",
+      max_sigma_xy_, max_sigma_z_, max_hdop_, max_vdop_);
+  }
+
   void gnss_callback(const sensor_msgs::msg::NavSatFix::SharedPtr msg, int source_id = 0)
   {
     if (source_id == 0) mark_sensor_received("GNSS");
     else                mark_sensor_received("GNSS2");
     if (!fc_->is_initialized()) return;
 
-    if (msg->status.status < 0) return;
+    if (msg->status.status < 0) {
+      note_gnss_no_fix(source_id, rclcpp::Time(msg->header.stamp).seconds());
+      return;
+    }
 
     double t = rclcpp::Time(msg->header.stamp).seconds();
 
@@ -1963,10 +2023,14 @@ private:
           }
           gnss_lever_arm_tf_resolved_ = true;
         } catch (const tf2::TransformException &ex) {
-          RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-            "GNSS lever arm auto-resolve failed (%s -> %s): %s. "
-            "Leaving lever arm at zero; set gnss.lever_arm_x/y/z explicitly to override.",
-            base_frame_.c_str(), msg->header.frame_id.c_str(), ex.what());
+          if (report_lever_arm_tf_failure(gnss_la_warns_, gnss_la_last_warn_)) {
+            RCLCPP_WARN(get_logger(),
+              "GNSS lever arm auto-resolve failed (%s -> %s): %s. "
+              "Leaving lever arm at zero; set gnss.lever_arm_x/y/z explicitly to "
+              "override.%s",
+              base_frame_.c_str(), msg->header.frame_id.c_str(), ex.what(),
+              gnss_la_warns_ >= kLeverArmTfMaxWarns ? "  Not reporting this again." : "");
+          }
         }
       } else {
         // Empty frame_id or same as base: nothing to resolve, mark done.
@@ -2047,8 +2111,15 @@ private:
     // wheel/IMU drift >~1 cm between fixes then fails the chi² outlier gate
     // (16.27 at 3 DoF). Floor σxy = 2 cm, σz = 5 cm so small integration
     // drift stays inside the gate while still benefitting from RTK precision.
-    constexpr double kMinVarXY = 4e-4;    // σ = 0.02 m
-    constexpr double kMinVarZ  = 2.5e-3;  // σ = 0.05 m
+    // Floor is configurable because 2 cm only suits a receiver that is honest
+    // about being that good. A u-blox M9N in SBAS mode on 2026-09-07 reported
+    // sigma_xy 0.076 m while sitting still and scattering 1.03 m over 75 s, over
+    // confident by 13.6x. R is built from this number and the chi2 gate judges
+    // every fix against that same R, so an over-confident receiver both drags
+    // position and can turn the gate hyperactive. Set gnss.min_sigma_xy to the
+    // scatter you have actually measured standing still.
+    const double kMinVarXY = gnss_min_sigma_xy_ * gnss_min_sigma_xy_;
+    const double kMinVarZ  = gnss_min_sigma_z_  * gnss_min_sigma_z_;
     if (msg->position_covariance_type == 3) {
       // Full 3x3 covariance available: use it directly including off-diagonals
       Eigen::Matrix3d cov;
@@ -2101,6 +2172,8 @@ private:
       fix.satellites = 4;  // Fix 10
     }
 
+    warn_if_dop_gate_bypassed(msg->position_covariance_type >= 1 && fix.has_sigma());
+
     bool accepted = fc_->update_gnss(t, fix);
     const auto& dbg = fc_->get_gnss_debug();
 
@@ -2130,6 +2203,7 @@ private:
     publish_gnss_status(rclcpp::Time(msg->header.stamp));
 
     auto fc_status = fc_->get_status();
+    announce_heading_validated(fc_status);
     if (!fc_status.heading_validated) {
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
         "Heading not yet validated: lever arm inactive. "
@@ -2140,6 +2214,82 @@ private:
         // old value was still in force, which reads exactly like a config that
         // failed to load. Cost a real debugging session on the rover.
         get_parameter("gnss.track_heading_min_dist").as_double());
+    }
+  }
+
+
+  // Announce heading validation ONCE, with the uncertainty that came with it.
+  //
+  // heading_validated flips on distance travelled alone, so it means "far enough
+  // that heading could be observable", not "heading is known". Measured on the
+  // rover 2026-09-05: the flag went true at 5.04 m carrying 48.6 deg of
+  // uncertainty, and on 2026-09-06 the whole run reported validated at a yaw
+  // 1-sigma of 101 deg. Nothing in the log said so either time, and anything
+  // reading the flag as "trustworthy" was being told something optimistic.
+  //
+  // The error is geometric: GPS track heading is the bearing between two fixes,
+  // so it is roughly (GNSS sigma / distance travelled). At a 6 m sigma, 5 m of
+  // travel is more than a radian. The number was always available; it was just
+  // never surfaced at the one moment a user would look.
+  void announce_heading_validated(const fusioncore::FusionCoreStatus& st)
+  {
+    // Same place, same once-only shape: the IMU and the encoders disagreeing about
+    // which way the robot is turning means one of them has a frame convention
+    // wrong, and it is worth interrupting for.
+    if (st.yaw_rate_sign_conflict && !yaw_sign_announced_) {
+      yaw_sign_announced_ = true;
+      RCLCPP_ERROR(get_logger(),
+        "IMU and encoder yaw rates DISAGREE IN SIGN on %.0f%% of the %d samples "
+        "where both said the robot was turning (imu mean %+.3f rad/s, encoder mean "
+        "%+.3f rad/s). One of them has a frame "
+        "convention wrong, and because imu.gyro_noise is tighter than "
+        "encoder.yaw_noise the filter is leaning on the gyro. Turning the robot "
+        "LEFT by hand must give a POSITIVE angular_velocity.z under REP-103. A "
+        "BNO085 in UART-RVC mode reports yaw increasing CLOCKWISE and needs its "
+        "sign flipped in the driver.",
+        100.0 * st.yaw_rate_disagree_frac, st.yaw_rate_turn_samples,
+        st.yaw_rate_imu_mean, st.yaw_rate_encoder_mean);
+    }
+
+    if (!st.heading_validated || heading_announced_) return;
+    heading_announced_ = true;
+    const double sig = compute_heading_sigma_deg(fc_->get_state());
+    const double lever_max = get_parameter("gnss.lever_arm_max_heading_sigma_deg").as_double();
+    if (sig > lever_max) {
+      RCLCPP_WARN(get_logger(),
+        "Heading VALIDATED at %.1f m, but the uncertainty is %.1f deg, over the "
+        "%.1f deg the GNSS lever arm needs, so the antenna offset stays disabled. "
+        "'Validated' only means the robot has travelled far enough for heading to "
+        "be observable, not that it is known. Bearing error is roughly "
+        "(GNSS sigma / distance), so a noisy receiver needs a longer baseline: "
+        "raise gnss.track_heading_min_dist, or provide an absolute heading source.",
+        st.distance_traveled, sig, lever_max);
+    } else {
+      const char* src = "GPS_TRACK";
+      switch (st.heading_source) {
+        case fusioncore::HeadingSource::DUAL_ANTENNA:    src = "DUAL_ANTENNA"; break;
+        case fusioncore::HeadingSource::MAGNETOMETER:    src = "MAGNETOMETER"; break;
+        case fusioncore::HeadingSource::IMU_ORIENTATION: src = "IMU_ORIENTATION"; break;
+        case fusioncore::HeadingSource::GPS_TRACK:       src = "GPS_TRACK"; break;
+        case fusioncore::HeadingSource::NONE:            src = "NONE"; break;
+      }
+      RCLCPP_INFO(get_logger(),
+        "Heading validated at %.1f m with %.1f deg 1-sigma (source %s).",
+        st.distance_traveled, sig, src);
+
+      // Heading is now good enough that the antenna offset correction is live.
+      // If it is still all zeros, that is almost certainly unconfigured rather
+      // than deliberate, and it is silent: the startup log only prints the
+      // lever arm when it is non-zero, so an unset one produces no output at
+      // all. Announce it here, at the moment it starts mattering, rather than
+      // at configure time when we cannot yet know heading will validate.
+      //
+      // Zeros mean no correction is applied, so the filter treats the antenna
+      // position as base_link. The error is the true offset rotated by heading:
+      // on flat ground the vertical part drops out and the horizontal part
+      // sweeps around as the robot turns, which reads as a cross-track bias
+      // that flips sign when the robot reverses direction.
+      warn_if_lever_arm_unset("heading just validated");
     }
   }
 
@@ -2157,7 +2307,10 @@ private:
     else                mark_sensor_received("GNSS2");
     if (!fc_->is_initialized()) return;
 
-    if (msg->status.status < 0) return;
+    if (msg->status.status < 0) {
+      note_gnss_no_fix(source_id, rclcpp::Time(msg->header.stamp).seconds());
+      return;
+    }
 
     double t = rclcpp::Time(msg->header.stamp).seconds();
 
@@ -2233,8 +2386,8 @@ private:
     //   4. Receiver hdop/vdop: actual DOP values, scale with base_noise in the core
     //   5. Defaults
 
-    constexpr double kMinVarXY = 4e-4;   // sigma = 0.02 m
-    constexpr double kMinVarZ  = 2.5e-3; // sigma = 0.05 m
+    const double kMinVarXY = gnss_min_sigma_xy_ * gnss_min_sigma_xy_;
+    const double kMinVarZ  = gnss_min_sigma_z_  * gnss_min_sigma_z_;
 
     if (msg->position_covariance_type == gps_msgs::msg::GPSFix::COVARIANCE_TYPE_KNOWN) {
       Eigen::Matrix3d cov;
@@ -2299,6 +2452,10 @@ private:
       fix.vdop = 2.0;
     }
 
+    warn_if_dop_gate_bypassed(
+      msg->position_covariance_type >= gps_msgs::msg::GPSFix::COVARIANCE_TYPE_APPROXIMATED &&
+      fix.has_sigma());
+
     bool accepted = fc_->update_gnss(t, fix);
     const auto& dbg = fc_->get_gnss_debug();
 
@@ -2314,6 +2471,7 @@ private:
     publish_gnss_status(rclcpp::Time(msg->header.stamp));
 
     auto fc_status = fc_->get_status();
+    announce_heading_validated(fc_status);
     if (!fc_status.heading_validated) {
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
         "Heading not yet validated: lever arm inactive. "
@@ -2462,12 +2620,68 @@ private:
       msg->magnetic_field.y,
       msg->magnetic_field.z);
     if (!accepted) {
+      const auto& debug = fc_->get_magnetometer_debug();
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-        "Magnetometer heading update rejected (chi2 gate)");
+        "Magnetometer heading update rejected (%s)",
+        mag_reason_str(debug.reason).c_str());
     }
   }
 
   // ─── Observability helpers ────────────────────────────────────────────────
+
+  // A fix the receiver marks NO_FIX is dropped here and never reaches the
+  // filter, so none of the core's counters can see it. Left unrecorded it is
+  // the most invisible failure there is: on filter_health a receiver that has
+  // lost fix looks exactly like one that is working, since the outlier count
+  // stays 0 and no rejection reason is ever set. Count it so the health topic,
+  // and any bag that recorded it, still says what happened to those fixes.
+  void note_gnss_no_fix(int source_id, double t)
+  {
+    const int i = (source_id == 0) ? 0 : 1;
+    fusioncore::OutcomeTally& tally = gnss_no_fix_tally_[i];
+    if (tally.count == 0) tally.first_seen = t;
+    tally.last_seen = t;
+    ++tally.count;
+  }
+
+  // Should a lever-arm TF failure be reported this time? Allows the first
+  // report immediately, then one every 10 s, up to kLeverArmTfMaxWarns total.
+  static constexpr int kLeverArmTfMaxWarns = 3;
+  bool report_lever_arm_tf_failure(int & count, rclcpp::Time & last)
+  {
+    if (count >= kLeverArmTfMaxWarns) return false;
+    const auto now = get_clock()->now();
+    if (count > 0 && (now - last).seconds() < 10.0) return false;
+    ++count;
+    last = now;
+    return true;
+  }
+
+  // One-shot warning for an antenna offset that was never measured.
+  //
+  // An antenna is essentially never at base_link, so all-zero is the one value
+  // that is almost certainly wrong, and it is the only value FusionCore says
+  // nothing about. Reported by the Sowbot stack, whose fusioncore.yaml carried
+  // `# measured TODO` placeholders next to a dual-antenna heading source: their
+  // heading validated at about 1 degree, so the correction went live with zeros
+  // and nothing in the log mentioned it.
+  void warn_if_lever_arm_unset(const char * when)
+  {
+    if (lever_arm_warned_) return;
+    if (!gnss_lever_arm_.is_zero()) return;
+    lever_arm_warned_ = true;
+    RCLCPP_WARN(get_logger(),
+      "GNSS antenna offset is 0,0,0 and the lever arm correction is now active "
+      "(%s). Zeros mean NO correction: the filter treats the antenna's position "
+      "as base_link's. Your position will carry an error equal to the real "
+      "offset, rotated by heading, which on flat ground shows up as a "
+      "cross-track bias that flips sign when the robot turns around. Measure "
+      "from base_link to the antenna's phase centre (the middle of the patch, "
+      "not the housing) in the body frame, x forward, y left, z up, and set "
+      "gnss.lever_arm_x/y/z. The x and y terms are what move cross-track error; "
+      "z only matters when tilted. If base_link really is at the antenna, this "
+      "warning is expected and can be ignored.", when);
+  }
 
   // Converts a GnssRejectionReason enum to the string stored in the message.
   static std::string gnss_reason_str(fusioncore::GnssRejectionReason r)
@@ -2486,8 +2700,35 @@ private:
       // so did our own live_monitor.py during the 2026-08-03 field run.
       case fusioncore::GnssRejectionReason::IMPLAUSIBLE_JUMP: return "IMPLAUSIBLE_JUMP";
       case fusioncore::GnssRejectionReason::SIGMA_XY_HIGH:   return "SIGMA_XY_HIGH";
+      case fusioncore::GnssRejectionReason::CONTINUITY_BREAK: return "CONTINUITY_BREAK";
       case fusioncore::GnssRejectionReason::SIGMA_Z_HIGH:    return "SIGMA_Z_HIGH";
       case fusioncore::GnssRejectionReason::NOT_PROCESSED:   return "NOT_PROCESSED";
+    }
+    return "NOT_PROCESSED";
+  }
+
+  // Converts a TrackHeadingState enum to the string stored in the message.
+  static std::string track_heading_state_str(fusioncore::TrackHeadingState s)
+  {
+    switch (s) {
+      case fusioncore::TrackHeadingState::NOT_ATTEMPTED:     return "NOT_ATTEMPTED";
+      case fusioncore::TrackHeadingState::FUSED:             return "FUSED";
+      case fusioncore::TrackHeadingState::STRONGER_SOURCE:   return "STRONGER_SOURCE";
+      case fusioncore::TrackHeadingState::MOTION_UNSUITABLE: return "MOTION_UNSUITABLE";
+      case fusioncore::TrackHeadingState::BASELINE_SHORT:    return "BASELINE_SHORT";
+      case fusioncore::TrackHeadingState::SIGMA_HIGH:        return "SIGMA_HIGH";
+      case fusioncore::TrackHeadingState::CHI2_FAILED:       return "CHI2_FAILED";
+    }
+    return "NOT_ATTEMPTED";
+  }
+
+  static std::string mag_reason_str(fusioncore::MagRejectionReason r)
+  {
+    switch (r) {
+      case fusioncore::MagRejectionReason::CHI2_FAILED:     return "CHI2_FAILED";
+      case fusioncore::MagRejectionReason::FIELD_MAGNITUDE: return "FIELD_MAGNITUDE";
+      case fusioncore::MagRejectionReason::NOT_PROCESSED:   return "NOT_PROCESSED";
+      case fusioncore::MagRejectionReason::ACCEPTED:        return "ACCEPTED";
     }
     return "NOT_PROCESSED";
   }
@@ -2516,11 +2757,17 @@ private:
     msg.position_sigma_y = d.position_sigma_y;
     msg.lever_arm_used   = d.lever_arm_used;
     msg.heading_sigma_deg = d.heading_sigma_deg;
+    msg.track_heading_state       = track_heading_state_str(d.track_heading_state);
+    msg.track_heading_baseline_m  = d.track_heading_baseline_m;
+    msg.track_heading_sigma_rad   = d.track_heading_sigma_rad;
 
     gnss_status_pub_->publish(msg);
   }
 
   // Extracts heading 1-sigma in degrees from the filter covariance via quaternion Jacobian.
+  bool heading_announced_ = false;
+  bool yaw_sign_announced_ = false;
+
   double compute_heading_sigma_deg(const fusioncore::State& s) const
   {
     const double qw = s.x[fusioncore::QW];
@@ -2816,23 +3063,6 @@ private:
       return "Unknown";
     };
 
-    auto gnss_reject_str = [](fusioncore::GnssRejectionReason r) -> std::string {
-      switch (r) {
-        case fusioncore::GnssRejectionReason::NOT_PROCESSED:    return "";
-        case fusioncore::GnssRejectionReason::ACCEPTED:         return "";
-        case fusioncore::GnssRejectionReason::FIX_TYPE_LOW:     return "FIX_TYPE_LOW";
-        case fusioncore::GnssRejectionReason::HDOP_HIGH:        return "HDOP_HIGH";
-        case fusioncore::GnssRejectionReason::VDOP_HIGH:        return "VDOP_HIGH";
-        case fusioncore::GnssRejectionReason::MIN_SATS:         return "MIN_SATS";
-        case fusioncore::GnssRejectionReason::CHI2_FAILED:      return "CHI2_FAILED";
-        case fusioncore::GnssRejectionReason::DELAY_TOO_LARGE:  return "DELAY_TOO_LARGE";
-        case fusioncore::GnssRejectionReason::IMPLAUSIBLE_JUMP: return "IMPLAUSIBLE_JUMP";
-        case fusioncore::GnssRejectionReason::SIGMA_XY_HIGH:    return "SIGMA_XY_HIGH";
-        case fusioncore::GnssRejectionReason::SIGMA_Z_HIGH:     return "SIGMA_Z_HIGH";
-      }
-      return "";
-    };
-
     uint8_t filter_level = diagnostic_msgs::msg::DiagnosticStatus::OK;
     std::string filter_msg = "Running";
     if (!status.heading_validated) {
@@ -2874,7 +3104,45 @@ private:
 
       fh.gnss_in_coast           = status.gnss_in_coast;
       fh.gnss_consecutive_rejects = status.gnss_consecutive_rejects;
-      fh.gnss_last_reject_reason = gnss_reject_str(status.gnss_last_rejection_reason);
+      // gnss_reason_str is the single table for these names. A local copy of it
+      // here had gone stale and published an empty string for the three newest
+      // reasons, which is worse than a wrong name because it reads as "no
+      // rejection has happened".
+      fh.gnss_last_reject_reason = gnss_reason_str(status.gnss_last_rejection_reason);
+      if (status.gnss_last_rejection_reason == fusioncore::GnssRejectionReason::NOT_PROCESSED ||
+          status.gnss_last_rejection_reason == fusioncore::GnssRejectionReason::ACCEPTED) {
+        fh.gnss_last_reject_reason.clear();
+      }
+      fh.mag_last_reject_reason = mag_reason_str(status.mag_last_rejection_reason);
+      if (status.mag_last_rejection_reason == fusioncore::MagRejectionReason::NOT_PROCESSED ||
+          status.mag_last_rejection_reason == fusioncore::MagRejectionReason::ACCEPTED) {
+        fh.mag_last_reject_reason.clear();
+      }
+
+      fh.outcome_names.clear();
+      fh.outcome_counts.clear();
+      fh.outcome_first_seen.clear();
+      fh.outcome_last_seen.clear();
+      auto append_tally = [&fh](const std::string& prefix, const std::string& name,
+                                const fusioncore::OutcomeTally& t) {
+        if (t.count == 0) return;
+        fh.outcome_names.push_back(prefix + name);
+        fh.outcome_counts.push_back(t.count);
+        fh.outcome_first_seen.push_back(t.first_seen);
+        fh.outcome_last_seen.push_back(t.last_seen);
+      };
+      const auto& gnss_tally = fc_->gnss_outcome_tally();
+      for (int i = 0; i < fusioncore::GNSS_REJECTION_REASON_COUNT; ++i) {
+        append_tally("gnss:", gnss_reason_str(
+          static_cast<fusioncore::GnssRejectionReason>(i)), gnss_tally[i]);
+      }
+      const auto& mag_tally = fc_->mag_outcome_tally();
+      for (int i = 0; i < fusioncore::MAG_REJECTION_REASON_COUNT; ++i) {
+        append_tally("mag:", mag_reason_str(
+          static_cast<fusioncore::MagRejectionReason>(i)), mag_tally[i]);
+      }
+      append_tally("gnss:",  "NO_FIX_REPORTED", gnss_no_fix_tally_[0]);
+      append_tally("gnss2:", "NO_FIX_REPORTED", gnss_no_fix_tally_[1]);
 
       fh.distance_traveled_m = status.distance_traveled;
 
@@ -3032,7 +3300,18 @@ private:
 
   // ─── Members ──────────────────────────────────────────────────────────────
 
+  bool   lever_arm_warned_  = false;
+  int    imu_la_warns_      = 0;
+  int    gnss_la_warns_     = 0;
+  rclcpp::Time imu_la_last_warn_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time gnss_la_last_warn_{0, 0, RCL_ROS_TIME};
+  bool   apply_lever_arm_pre_heading_ = false;
+  double gnss_min_sigma_xy_ = 0.02;   // metres: floor on the receiver's reported sigma
+  double gnss_min_sigma_z_  = 0.05;
   std::unique_ptr<fusioncore::FusionCore>        fc_;
+  // Indexed by source_id: [0] primary receiver, [1] secondary. Cleared when the
+  // core is rebuilt in on_configure, so it covers the same run the core does.
+  fusioncore::OutcomeTally                      gnss_no_fix_tally_[2];
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   std::shared_ptr<tf2_ros::Buffer>               tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener>    tf_listener_;
@@ -3085,8 +3364,11 @@ private:
   double      enc2_yaw_noise_ = 0.02;
   // Cached so the GNSS rejection warning can name the limit it failed against.
   // Defaults mirror the declare_parameter values.
+  double      max_hdop_     = 4.0;
+  double      max_vdop_     = 6.0;
   double      max_sigma_xy_ = 25.0;
   double      max_sigma_z_  = 50.0;
+  fusioncore_ros::GnssDopGateWarning dop_gate_warning_;
   std::string vslam_topic_;
   std::string vslam_frame_override_;
   // VSLAM map-to-odom frame offset: applied to every VSLAM measurement.

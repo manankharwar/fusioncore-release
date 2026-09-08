@@ -16,6 +16,11 @@ float64 position_sigma_z
 float64 heading_sigma_deg
 
 # Heading observability
+# True once heading COULD be observable, which is not the same as known: it is set
+# on distance travelled alone (gnss.heading_observable_distance), without checking
+# that any heading measurement was ever fused. Read heading_sigma_deg above to find
+# out whether heading is actually known. A run on 2026-09-06 reported
+# heading_validated true with a yaw 1-sigma of 101 degrees for its whole duration.
 bool   heading_validated
 string heading_source  # NONE | GPS_TRACK | IMU_ORIENTATION | DUAL_ANTENNA | MAGNETOMETER
 
@@ -28,6 +33,10 @@ int32 gnss_consecutive_rejects
 # IMPLAUSIBLE_JUMP. Quality-gate and delay rejects do NOT count toward
 # gnss_outlier_count, so this is the only field that reveals why a fix was dropped.
 string gnss_last_reject_reason
+
+# Reason the most recent magnetometer reading was rejected (empty until the first reading):
+# CHI2_FAILED | FIELD_MAGNITUDE
+string mag_last_reject_reason
 
 # Distance traveled since init (meters): heading observable above 5m
 float64 distance_traveled_m
@@ -45,3 +54,20 @@ int32 mag_outlier_count
 # These are not outliers: the data may be perfect, the timestamps disagree.
 int32 imu_stale_reject_count
 int32 encoder_stale_reject_count
+
+# Every gate outcome that has occurred since init, as four parallel arrays.
+# A name appears only once it has happened at least once, so an absent name
+# means that gate has never fired. ACCEPTED is included, which is what makes
+# "the gate never fired" distinguishable from "no fix ever arrived": if
+# gnss:ACCEPTED is missing too, nothing was fed to the filter at all.
+# Names are prefixed gnss:, gnss2: or mag: and match the *_last_reject_reason
+# strings, plus gnss:NO_FIX_REPORTED for fixes the receiver marked NO_FIX. Those
+# are dropped before the filter sees them, so they appear in no other counter.
+# Timestamps are the measurement stamps of the first and last occurrence, in
+# the same clock the filter is driven with, so a reason can be located in a bag
+# without replaying it. Establishing that the chi2 gate had never fired on the
+# 2026-09-06 run took a day of replaying because only a "last reason" existed.
+string[]  outcome_names
+int32[]   outcome_counts
+float64[] outcome_first_seen
+float64[] outcome_last_seen
