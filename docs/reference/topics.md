@@ -100,6 +100,20 @@ mahalanobis_sq: 847.3         # d^2 = nu^T * S^-1 * nu
                               # -1.0 means the quality gate failed before chi2 was computed
 
 chi2_threshold: 16.27         # the acceptance boundary (configured outlier_threshold_gnss)
+
+track_heading_state: FUSED    # why GPS track heading did or did not update yaw:
+                              #   NOT_ATTEMPTED     feature disabled
+                              #   FUSED             a heading was applied
+                              #   STRONGER_SOURCE   dual antenna / mag / IMU owns heading
+                              #   MOTION_UNSUITABLE too slow, or turning too fast
+                              #   BASELINE_SHORT    not far enough since the reference fix
+                              #   SIGMA_HIGH        bearing too uncertain for the baseline
+                              #   CHI2_FAILED       bearing computed but rejected
+                              # On a rover with no magnetometer and no dual antenna
+                              # this is the ONLY thing bounding yaw, and when it
+                              # silently declines the whole filter degrades behind it
+track_heading_baseline_m: 6.2 # displacement since the reference fix
+track_heading_sigma_rad: 0.18 # sigma_xy / baseline; -1.0 if it was not computed
                               # if mahalanobis_sq > chi2_threshold the fix is rejected
 
 hdop: 1.2                     # from the GPS message
@@ -126,6 +140,9 @@ position_sigma_y: 2.4         # how uncertain the filter was about position righ
 | `CHI2_FAILED` | Passed quality gates but Mahalanobis distance too large | GPS jump, multipath, or filter drift |
 | `DELAY_TOO_LARGE` | Fix arrived more than `max_measurement_delay` seconds late | Network or driver latency |
 | `IMPLAUSIBLE_JUMP` | Fix farther from the prediction than `gnss.max_speed` allows | Impossible GPS jump (only when `gnss.max_speed` > 0) |
+| `SIGMA_XY_HIGH` | Reported horizontal 1-sigma exceeded `gnss.max_sigma_xy` (metres) | Receiver itself says the fix is poor |
+| `SIGMA_Z_HIGH` | Reported vertical 1-sigma exceeded `gnss.max_sigma_z` (metres) | Same, and height is usually the worse axis |
+| `CONTINUITY_BREAK` | Fix disagreed with the two fixes before it by more than `gnss.continuity_max_m` | A GPS jump too small for `CHI2_FAILED` to see (only when `gnss.continuity_max_m` > 0) |
 
 **Reading `mahalanobis_sq`:**
 
@@ -161,12 +178,32 @@ position_sigma_y: 1.4           # meters: north uncertainty
 position_sigma_z: 2.1           # meters: altitude uncertainty
 
 # Heading uncertainty in degrees (propagated from quaternion covariance via Jacobian)
-# Shrinks as GPS heading fuses. Grows during long straight runs without heading updates.
+# Shrinks as heading actually fuses. Grows during long straight runs without one.
+# This is the field to trust, not heading_validated below.
 heading_sigma_deg: 3.2
 
 # Heading observability
-heading_validated: true
+heading_validated: true         # CAREFUL: this means "the robot has driven far
+                                # enough that heading COULD be observable", not
+                                # "heading is known". It is set on distance
+                                # travelled alone. A rover reported true here for
+                                # a whole run at heading_sigma_deg 101. Read the
+                                # sigma above.
 heading_source: GPS_TRACK       # NONE | GPS_TRACK | IMU_ORIENTATION | DUAL_ANTENNA
+                                # | MAGNETOMETER
+
+# Why the most recent REJECTED measurement was rejected. Both fields are empty
+# until something is rejected, and both are sticky: once set they name the last
+# rejection and a later accepted measurement does not clear them. They answer
+# "what dropped it", not "is it happening now". For how often and when, read the
+# outcome arrays at the bottom of this message.
+#   CHI2_FAILED      disagreed with the filter by more than the chi2 threshold
+#   FIELD_MAGNITUDE  (mag) corrected field magnitude outside
+#                    magnetometer.field_strength +- field_tolerance, so
+#                    something magnetic is nearby
+# The GNSS field takes the same values as rejection_reason above.
+gnss_last_reject_reason: CHI2_FAILED
+mag_last_reject_reason: FIELD_MAGNITUDE
 
 # GPS coast mode: entered when GPS goes quiet or consecutively rejects
 gnss_in_coast: false
@@ -180,14 +217,33 @@ distance_traveled_m: 47.3
 gnss_outlier_count: 3
 imu_outlier_count: 0
 encoder_outlier_count: 0
+
+# Every gate outcome since init, as four parallel arrays. A name is present only
+# once it has happened, so an absent name means that gate has never fired. This
+# is what the single "last reason" fields above cannot tell you: how often, and
+# when. ACCEPTED is counted too, which is the part that makes an empty result
+# readable: if gnss:ACCEPTED is missing as well, no fix ever reached the filter,
+# which is a different problem from a gate rejecting them.
+#
+# gnss:NO_FIX_REPORTED counts fixes the receiver itself marked NO_FIX. Those are
+# dropped before the filter sees them, so they appear in no other counter, and a
+# receiver that has lost fix otherwise looks identical to one that is working.
+#
+# Timestamps are measurement stamps in the filter's own clock, so a reason can be
+# located in a recorded bag without replaying it.
+outcome_names:      [gnss:ACCEPTED, gnss:CHI2_FAILED, mag:FIELD_MAGNITUDE]
+outcome_counts:     [1420, 37, 8]
+outcome_first_seen: [1788816069.3, 1788816194.1, 1788816070.5]
+outcome_last_seen:  [1788816351.7, 1788816221.9, 1788816072.0]
 ```
 
 **What healthy looks like in a plot:**
 
 - `position_sigma_x/y` starts high (large initial uncertainty) then drops rapidly as GPS fixes arrive, then slowly grows during GPS outages and drops again on recovery
 - `gnss_innovation_norm` stays roughly constant when GPS is stable, spikes on multipath, then drops back
-- `heading_sigma_deg` drops from large to small once 5 m of travel validates heading from GPS track geometry
+- `heading_sigma_deg` is the number to read, NOT `heading_validated`. The flag goes true on distance travelled alone, once the robot has covered `gnss.heading_observable_distance`, without checking that any heading was ever measured. It means "far enough that heading could be observable", not "heading is known". A rover run on 2026-09-06 reported `heading_validated: true` for its entire duration at a yaw 1-sigma of 101 degrees. Watch this number instead, and note that the GNSS lever arm switches itself off above `gnss.lever_arm_max_heading_sigma_deg` (20 by default)
 - `gnss_in_coast` goes true during tunnels or urban canyons, false when GPS resumes
+- the `outcome_*` arrays are the first thing to read on a bag you did not watch live. A gate that never appears never fired, which is worth knowing before you spend a day assuming it did
 
 **How to view these in Foxglove:**
 
