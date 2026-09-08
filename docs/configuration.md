@@ -101,6 +101,20 @@ fusioncore:
     # Quality gate. Which pair applies depends on what your receiver publishes,
     # and getting this wrong is silent: rejected fixes leave the filter dead
     # reckoning with nothing but a throttled log line to say so.
+    gnss.min_sigma_xy: 0.02     # m. FLOOR on the receiver's reported sigma before
+                                # it becomes R. Raise it when your receiver is
+                                # over-confident: a u-blox M9N in SBAS mode was
+                                # measured declaring 0.076 m while scattering
+                                # 1.03 m standing still, 13.6x optimistic. R is
+                                # built from this and the chi2 gate is judged
+                                # against the same R, so believing it drags
+                                # position and can make the gate reject good
+                                # fixes. Measure your own scatter parked, and
+                                # floor it there. A floor in metres is correct
+                                # where a multiplier is not: it fixes the
+                                # over-confident mode and leaves an honest one
+                                # untouched.
+    gnss.min_sigma_z: 0.05      # m. Same, vertical.
     gnss.max_sigma_xy: 25.0     # m of reported 1-sigma. THIS is the gate that runs
     gnss.max_sigma_z: 50.0      # for sensor_msgs/NavSatFix, which carries no DOP.
                                 # A standalone receiver reports 2-8 m horizontal and
@@ -342,6 +356,68 @@ fusioncore:
     # Scaled by the RECEIVER's sigma deliberately, never by the filter's own
     # covariance: chi2 is already the covariance-scaled test, and this gate exists
     # precisely to catch what a coast-inflated chi2 lets through.
+
+    gnss.continuity_max_m: 0.0
+    # Rejects a fix that disagrees with the two accepted fixes before it, by more
+    # than this many metres. 0.0 = disabled. This is the gate that can actually
+    # see a small GPS spike.
+    #
+    # The chi2 gate above cannot. It tests a fix against the FILTER, so its scale
+    # is S = H P H' + R, and on a consumer receiver that is tens of square metres.
+    # Measured on a u-blox at 1 Hz reporting 3.24 m sigma, by injecting a single
+    # displaced fix into a real log and replaying it:
+    #
+    #     spike     chi2 verdict   position step it caused
+    #      5 m      accepted       1.40 m
+    #     10 m      accepted       3.55 m
+    #     15 m      accepted       4.53 m
+    #     25 m      accepted       6.21 m
+    #     30 m      REJECTED
+    #
+    # A 15 m multipath spike, ordinary beside a building or under tree cover, is
+    # accepted and moves position 4.5 m. Analysis agrees with the experiment:
+    # sqrt(16.27 * (5.25^2 + 3.24^2)) = 24.9 m. Fixing heading does NOT help; a
+    # perfect absolute heading halved position sigma and made the gate LOOSER.
+    #
+    # Continuity asks a different question that never involves P: does this fix
+    # agree with the fixes either side of it? With continuity at 3.0 m the same
+    # spikes are rejected from 2 m upward.
+    #
+    # HOW TO SET IT. Measure, do not guess. tools/nis_from_bag.py reports your
+    # receiver's fix-to-fix second difference. Across 2361 fixes from seven field
+    # logs on one rover, a good fix had a median second difference of 0.09 to
+    # 0.30 m and a p99 under 2.1 m, so 3.0 sat 10 to 30 times above normal and
+    # rejected nothing that should have been kept. Dropping to 2.0 began rejecting
+    # good fixes. Err generous: rejecting good data is the more expensive mistake.
+    #
+    # It catches JUMPS, not sustained bias. Multipath that shifts the solution and
+    # holds it there breaks continuity once and then looks continuous at the new
+    # offset. chi2 and coast mode still own that case, which is why this is added
+    # alongside them rather than instead.
+    #
+    # The check is skipped unless three consecutive accepted fixes are evenly
+    # spaced (within a factor of two on the interval). Across a real outage the
+    # second difference is legitimately large, and rejecting the first fix after
+    # one is exactly the failure gnss_coast_min_gap_s exists to prevent.
+
+    gnss.outlier_sigma_xy: 0.0
+    # Short-term consistency of the receiver in metres, used ONLY by the chi2 gate
+    # above. 0.0 = gate on the same R the update uses, which is the old behaviour.
+    #
+    # A receiver's reported covariance describes ABSOLUTE accuracy: multipath and
+    # ionospheric error that moves slowly. Consecutive fixes are far more
+    # consistent than that figure implies. Measured on that same log, 3.24 m
+    # declared against a 0.171 m median second difference, a factor of 55.
+    #
+    # The update wants the absolute figure, or the filter believes GPS to
+    # centimetres it has not earned and tracks that slow bias rigidly. The gate
+    # wants the short-term figure, because an outlier IS a break in short-term
+    # consistency. Setting this moved the chi2 rejection threshold from 30 m to
+    # 15 m with no false rejections, but it cannot go further because the filter's
+    # own P remains in S. Prefer gnss.continuity_max_m for spike rejection.
+    #
+    # A value ABOVE the receiver's own sigma makes the gate LOOSER, not tighter:
+    # 5.0 on a 3.24 m receiver moved the threshold from 26 m out to 30 m.
 
     # ── Adaptive noise ────────────────────────────────────────────────────────
     adaptive.imu: true
