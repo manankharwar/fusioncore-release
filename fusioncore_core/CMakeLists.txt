@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fusioncore_core VERSION 0.3.8)
+project(fusioncore_core VERSION 0.3.9)
 
 # Default to Release when the caller has not chosen. A plain "colcon build" sets
 # no build type, which means no optimisation flags at all, and Eigen without
@@ -76,6 +76,12 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_consistency tests/test_consistency.cpp TIMEOUT 600)
   target_link_libraries(test_consistency fusioncore_core Eigen3::Eigen)
+
+  ament_add_gtest(test_heading_observable_distance tests/test_heading_observable_distance.cpp TIMEOUT 300)
+  target_link_libraries(test_heading_observable_distance fusioncore_core Eigen3::Eigen)
+
+  ament_add_gtest(test_outcome_tally tests/test_outcome_tally.cpp TIMEOUT 300)
+  target_link_libraries(test_outcome_tally fusioncore_core Eigen3::Eigen)
 endif()
 
 ament_export_targets(fusioncore_core_targets HAS_LIBRARY_TARGET)
