@@ -155,6 +155,10 @@ TEST(MagnetometerTest, Chi2GateRejectsOutlier) {
   // Filter is at yaw=0. Feed a pi/2 reading with noise_rad=0.001: huge outlier.
   bool accepted = fc.update_magnetometer(0.01, 1.0, 0.0, 0.0);  // yaw=pi/2
   EXPECT_FALSE(accepted);
+  EXPECT_EQ(fc.get_magnetometer_debug().reason, MagRejectionReason::CHI2_FAILED);
+  EXPECT_GT(fc.get_magnetometer_debug().mahalanobis_sq,
+            fc.get_magnetometer_debug().chi2_threshold);
+  EXPECT_EQ(fc.get_status().mag_last_rejection_reason, MagRejectionReason::CHI2_FAILED);
 }
 
 // ─── Test 10: heading_source set to MAGNETOMETER after first update ───────────
@@ -251,6 +255,9 @@ TEST(MagnetometerTest, DisturbedFieldRejected) {
 
   EXPECT_TRUE (fc.update_magnetometer(0.01, 0.0, 1.0, 0.0));  // clean, accepted
   EXPECT_FALSE(fc.update_magnetometer(0.02, 0.0, 1.6, 0.0));  // 60% high, rejected
+  EXPECT_EQ(fc.get_magnetometer_debug().reason, MagRejectionReason::FIELD_MAGNITUDE);
+  EXPECT_NEAR(fc.get_magnetometer_debug().measured_field, 1.6, 1e-9);
+  EXPECT_EQ(fc.get_status().mag_last_rejection_reason, MagRejectionReason::FIELD_MAGNITUDE);
 }
 
 // ─── Test 15: magnetometer bounds heading drift from wheel slip in a blackout ─
@@ -312,4 +319,47 @@ TEST(MagnetometerTest, BoundsHeadingDriftFromSlipDuringBlackout) {
   EXPECT_LT(err_mag,    0.1);                  // magnetometer: bounded (<~6 deg)
   EXPECT_LT(err_mag,    err_no_mag * 0.2)      // mag cuts the heading error by >80%
       << "mag err " << err_mag << " vs no-mag " << err_no_mag;
+}
+
+// The reported measured_field and the gate's own decision are computed in two
+// different places (fusioncore.cpp builds the vector for the debug struct,
+// sensors::mag_field_disturbed builds it again to decide). They agree today.
+// Nothing pinned them together, so a later edit to one could silently make the
+// published number describe something the gate never tested. Calibration that
+// is neither zero nor identity separates the two: a raw-magnitude version of
+// either would give a visibly different answer here.
+TEST(MagnetometerTest, ReportedFieldIsTheOneTheGateTested) {
+  FusionCoreConfig cfg;
+  cfg.outlier_rejection   = true;
+  cfg.mag.noise_rad       = 0.05;
+  cfg.mag.chi2_threshold  = 10.83;
+  cfg.mag.field_strength  = 1.0;
+  cfg.mag.field_tolerance = 0.2;
+  cfg.mag.hard_iron       = Eigen::Vector3d(1.0, 0.0, 0.0);
+  cfg.mag.soft_iron       = Eigen::Vector3d(0.5, 1.0, 1.0).asDiagonal();
+
+  FusionCore fc(cfg);
+  State s0;
+  s0.P(QW, QW) = 0.5;
+  s0.P(QZ, QZ) = 0.5;
+  fc.init(s0, 0.0);
+  fc.update_imu(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.80665);
+
+  // Corrected: diag(0.5,1,1) * ((1,1,0) - (1,0,0)) = (0,1,0), magnitude 1.0, on
+  // target. The raw magnitude is 1.414, which the same gate would have rejected,
+  // so accepting this proves the gate ran on the calibrated vector.
+  EXPECT_TRUE(fc.update_magnetometer(0.01, 1.0, 1.0, 0.0));
+  EXPECT_EQ  (fc.get_magnetometer_debug().reason, MagRejectionReason::ACCEPTED);
+  EXPECT_NEAR(fc.get_magnetometer_debug().measured_field, 1.0, 1e-9);
+
+  // Corrected: (0,1.6,0), magnitude 1.6, 60% high and rejected. The raw
+  // magnitude here is 1.887, so measured_field reading 1.6 proves the published
+  // number is the calibrated one too, not the raw one.
+  EXPECT_FALSE(fc.update_magnetometer(0.02, 1.0, 1.6, 0.0));
+  EXPECT_EQ  (fc.get_magnetometer_debug().reason, MagRejectionReason::FIELD_MAGNITUDE);
+  EXPECT_NEAR(fc.get_magnetometer_debug().measured_field, 1.6, 1e-9);
+
+  // The field gate returns before the chi2 gate runs, so there is no distance to
+  // report. -1 is the sentinel for that, and it must not read as a passing 0.
+  EXPECT_LT(fc.get_magnetometer_debug().mahalanobis_sq, 0.0);
 }
