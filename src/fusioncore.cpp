@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <cmath>
 #include <limits>
+#include <algorithm>
 
 namespace fusioncore {
 
@@ -134,6 +135,20 @@ void FusionCore::init(const State& initial_state, double timestamp_seconds) {
   last_hdg_fix_x_       = 0.0;
   last_hdg_fix_y_       = 0.0;
   gps_track_hdg_fused_  = false;
+  hdg_window_had_turn_  = false;
+  xchk_ref_set_         = false;
+  acc_n_                = 0;
+  acc_i_                = 0;
+  zupt_blocked_by_imu_  = false;
+  post_outage_unconfirmed_ = false;
+  gnss_consecutive_accepts_ = 0;
+  encoder_reason_       = EncoderRejectionReason::NOT_PROCESSED;
+  encoder_chi2_         = -1.0;
+  cont_learn_max_       = 0.0;
+  cont_learn_n_         = 0;
+  cont_learned_m_       = 0.0;
+  xchk_n_               = 0;
+  xchk_i_               = 0;
 
   // Reset snapshot buffer
   snapshot_buffer_.clear();
@@ -153,6 +168,14 @@ void FusionCore::init(const State& initial_state, double timestamp_seconds) {
   last_gnss_rejection_reason_    = GnssRejectionReason::NOT_PROCESSED;
   gnss_tally_.fill(OutcomeTally{});
   mag_tally_.fill(OutcomeTally{});
+  zupt_holds_pos_noise_ = false;
+  gnss_chi2_max_ = -1.0;
+  gnss_chi2_samples_ = 0;
+  imu_rate_observed_sum_ = 0.0;
+  imu_rate_observed_n_ = 0;
+  imu_rate_prev_stamp_ = -1.0;
+  reset_parked_gnss_evidence();
+  cont_n_ = 0;
   last_mag_rejection_reason_     = MagRejectionReason::NOT_PROCESSED;
   last_gnss_innovation_norm_     = 0.0;
   last_imu_innovation_norm_      = 0.0;
@@ -173,6 +196,21 @@ void FusionCore::init(const State& initial_state, double timestamp_seconds) {
   init_adaptive_R();
 }
 
+void FusionCore::reset_parked_gnss_evidence() {
+  parked_fix_n_ = 0.0;
+  parked_fix_s_.fill(0.0);
+  parked_fix_ss_.fill(0.0);
+  parked_fix_slag_.fill(0.0);
+  parked_fix_prev_.fill(0.0);
+  parked_fix_has_prev_ = false;
+  gnss_parked_sigma_observed_ = -1.0;
+  gnss_parked_sigma_declared_ = -1.0;
+  gnss_parked_correlation_    = 0.0;
+  gnss_parked_inflation_      = 1.0;
+  parked_ref_x_ = parked_ref_y_ = 0.0;
+  parked_path_len_ = 0.0;
+}
+
 void FusionCore::reset() {
   initialized_       = false;
   last_timestamp_    = 0.0;
@@ -190,6 +228,20 @@ void FusionCore::reset() {
   last_hdg_fix_x_       = 0.0;
   last_hdg_fix_y_       = 0.0;
   gps_track_hdg_fused_  = false;
+  hdg_window_had_turn_  = false;
+  xchk_ref_set_         = false;
+  acc_n_                = 0;
+  acc_i_                = 0;
+  zupt_blocked_by_imu_  = false;
+  post_outage_unconfirmed_ = false;
+  gnss_consecutive_accepts_ = 0;
+  encoder_reason_       = EncoderRejectionReason::NOT_PROCESSED;
+  encoder_chi2_         = -1.0;
+  cont_learn_max_       = 0.0;
+  cont_learn_n_         = 0;
+  cont_learned_m_       = 0.0;
+  xchk_n_               = 0;
+  xchk_i_               = 0;
   snapshot_buffer_.clear();
   imu_buffer_.clear();
   gnss_consecutive_rejects_ = 0;
@@ -204,6 +256,14 @@ void FusionCore::reset() {
   last_gnss_rejection_reason_   = GnssRejectionReason::NOT_PROCESSED;
   gnss_tally_.fill(OutcomeTally{});
   mag_tally_.fill(OutcomeTally{});
+  zupt_holds_pos_noise_ = false;
+  gnss_chi2_max_ = -1.0;
+  gnss_chi2_samples_ = 0;
+  imu_rate_observed_sum_ = 0.0;
+  imu_rate_observed_n_ = 0;
+  imu_rate_prev_stamp_ = -1.0;
+  reset_parked_gnss_evidence();
+  cont_n_ = 0;
   last_mag_rejection_reason_    = MagRejectionReason::NOT_PROCESSED;
   last_gnss_innovation_norm_    = 0.0;
   last_imu_innovation_norm_     = 0.0;
@@ -456,6 +516,15 @@ void FusionCore::predict_to(double timestamp_seconds) {
 }
 
 void FusionCore::update_distance_traveled(double x, double y, double pre_update_speed) {
+  // Turn detection for the GPS-track heading fusion's displacement window
+  // (see hdg_window_had_turn_ declaration). Checked unconditionally, before
+  // the MIN_STEP early-return below: an in-place spin barely moves the GNSS
+  // antenna (dist stays near zero), so gating this on dist would miss
+  // exactly the case it exists to catch.
+  if (std::abs(ukf_.state().x[WZ]) > config_.gps_track_heading_max_yaw_rate) {
+    hdg_window_had_turn_ = true;
+  }
+
   if (!gnss_pos_set_) {
     last_gnss_x_  = x;
     last_gnss_y_  = y;
@@ -508,13 +577,50 @@ void FusionCore::update_imu(
   if (!initialized_)
     throw std::runtime_error("FusionCore: update_imu() called before init()");
 
+  // Observe the real arrival rate BEFORE the stale gate, because a wrong
+  // nominal rate is exactly what makes the clock run away from the stamps and
+  // start rejecting IMU messages. Measuring only survivors would bias the very
+  // number that is supposed to detect the problem.
+  if (imu_rate_prev_stamp_ >= 0.0) {
+    const double observed = timestamp_seconds - imu_rate_prev_stamp_;
+    if (observed > 0.0 && observed < 1.0) {
+      imu_rate_observed_sum_ += observed;
+      ++imu_rate_observed_n_;
+    }
+  }
+  imu_rate_prev_stamp_ = timestamp_seconds;
+
   if (reject_stale_from_skew(timestamp_seconds, last_imu_raw_stamp_, imu_stale_rejects_))
     return;
 
   yaw_sign_imu_wz_    = wz;
   yaw_sign_imu_stamp_ = timestamp_seconds;
 
-  predict_to(timestamp_seconds);
+  // Nominal dt: advance by exactly 1/rate rather than by the gap between two
+  // stamps, so stamp jitter cannot reach the integrator. Track what the stamps
+  // actually say anyway, because a configured rate that does not match reality
+  // makes this systematically wrong rather than merely noisy.
+  if (config_.imu_fixed_rate_hz > 0.0) {
+    // Nominal on EVERY step including the first. Letting the first message
+    // through on its raw stamp seeded a small difference that this filter's
+    // yaw amplified to 76 degrees over 20 s in test_fixed_dt, which is the same
+    // sensitivity that made a 1 microsecond stamp shift move yaw by 109 degrees.
+    // Partial immunity is not immunity.
+    const double nominal = 1.0 / config_.imu_fixed_rate_hz;
+    // The filter clock stays ON the nominal grid, it is not re-based to the
+    // incoming stamp. Re-basing looks harmless but is not: last_timestamp_ then
+    // carries the jitter, (last_timestamp_ + nominal) - last_timestamp_ rounds
+    // differently every step, and this filter is chaotic enough that ANY
+    // nonzero difference saturates. Measured: re-basing left 2.4 degrees of
+    // jitter sensitivity where staying on the grid leaves none.
+    //
+    // The cost is that the clock drifts from real time at exactly the rate
+    // error, which is why imu_fixed_rate_mismatch exists: at a correct rate
+    // there is no drift, and at a wrong one you are told.
+    predict_to(last_timestamp_ + nominal);
+  } else {
+    predict_to(timestamp_seconds);
+  }
 
   sensors::ImuMeasurement z;
   z[0] = wx; z[1] = wy; z[2] = wz;
@@ -573,6 +679,30 @@ void FusionCore::update_imu(
   imu_buffer_.push_back(entry);
   while ((int)imu_buffer_.size() > config_.imu_buffer_size)
     imu_buffer_.pop_front();
+
+  // Turn detection for the GPS-track heading window, sampled HERE because this
+  // is where the yaw rate actually arrives.
+  //
+  // It used to be checked only inside update_distance_traveled(), which on a
+  // GNSS-only robot runs once per fix. That is 1 Hz on most receivers, so a turn
+  // that started and finished between two fixes was invisible and the bearing
+  // was then measured straight across the corner. Reproduced in
+  // TurnBetweenTwoFixesIsStillCaught: 0.8 rad/s for 0.6 s inside a 1 s gap turns
+  // the robot 27.5 degrees, and the window was not discarded.
+  //
+  // Read from the filtered state rather than the raw gyro argument, so the
+  // threshold still compares against an estimated, bias-corrected rate exactly
+  // as the fix-rate check does. That check stays where it is: it also covers the
+  // VSLAM pose path, which never reaches this function.
+  if (std::abs(ukf_.state().x[WZ]) > config_.gps_track_heading_max_yaw_rate)
+    hdg_window_had_turn_ = true;
+
+  // Accelerometer magnitude for the ZUPT stationarity check. Magnitude rather
+  // than per-axis so it works whether or not gravity has been removed, and the
+  // standard deviation removes the DC term either way.
+  acc_mag_[acc_i_] = std::sqrt(ax * ax + ay * ay + az * az);
+  acc_i_ = (acc_i_ + 1) % ACC_WIN;
+  if (acc_n_ < ACC_WIN) ++acc_n_;
 
   last_imu_time_ = timestamp_seconds;
   ++update_count_;
@@ -688,6 +818,17 @@ void FusionCore::update_encoder(
   if (!initialized_)
     throw std::runtime_error("FusionCore: update_encoder() called before init()");
 
+  // Moving again: hand the position noise scale back. Only ever undoes what
+  // update_zupt set, so a coast-inflated scale is left alone.
+  if (zupt_holds_pos_noise_ &&
+      std::sqrt(vx * vx + vy * vy) > config_.zupt_velocity_threshold) {
+    ukf_.set_position_noise_scale(1.0);
+    zupt_holds_pos_noise_ = false;
+    // Clear the parked-fix evidence: those samples described a stationary
+    // receiver and say nothing about a moving one.
+    reset_parked_gnss_evidence();
+  }
+
   if (reject_stale_from_skew(timestamp_seconds, last_enc_raw_stamp_, enc_stale_rejects_))
     return;
 
@@ -709,12 +850,18 @@ void FusionCore::update_encoder(
     sensors::EncoderMeasurement innovation_pre;
     sensors::EncoderNoiseMatrix S;
     ukf_.predict_measurement<sensors::ENCODER_DIM>(z, sensors::encoder_measurement_function, R, innovation_pre, S);
-    if (is_outlier<sensors::ENCODER_DIM>(innovation_pre, S, config_.outlier_threshold_enc)) {
+    // Same quantity is_outlier() tests, computed once here so the number can be
+    // published rather than only compared. Without it a user sees a rejection
+    // count and has no way to tell a marginal reject from a wild one.
+    encoder_chi2_ = innovation_pre.dot(S.ldlt().solve(innovation_pre));
+    if (encoder_chi2_ > config_.outlier_threshold_enc) {
       ++enc_outliers_;
+      encoder_reason_ = EncoderRejectionReason::CHI2_FAILED;
       last_encoder_time_ = timestamp_seconds;
       return;
     }
   }
+  encoder_reason_ = EncoderRejectionReason::ACCEPTED;
 
   auto innovation = ukf_.update<sensors::ENCODER_DIM>(z, sensors::encoder_measurement_function, R);
 
@@ -806,6 +953,25 @@ void FusionCore::update_ground_constraint(double timestamp_seconds) {
 void FusionCore::update_zupt(double timestamp_seconds, double noise_sigma) {
   if (!initialized_) return;
 
+  // Once the GNSS has caught the wheels lying (see zupt_parked_motion_m), stop
+  // believing them at all. Releasing the covariance suppression alone is not
+  // enough: ZUPT itself pins velocity to zero, so it keeps fighting the GNSS
+  // that is trying to pull the estimate along. Measured on a synthetic dead
+  // encoder driving 20 m, releasing only the suppression recovered 7.4 m of it.
+  if (parked_moving_detected_) return;
+
+  // The wheels saying stopped is not evidence the robot is stopped. Ask the
+  // accelerometer, which cannot be fooled by a dead encoder. See
+  // zupt_accel_std_threshold for the measured separation and its limits.
+  zupt_blocked_by_imu_ = false;
+  if (config_.zupt_accel_std_threshold > 0.0) {
+    const double astd = accel_magnitude_std();
+    if (astd >= 0.0 && astd > config_.zupt_accel_std_threshold) {
+      zupt_blocked_by_imu_ = true;
+      return;
+    }
+  }
+
   // ZUPT is an opportunistic pseudo-measurement triggered by another sensor's
   // stamp. If that stamp lags the filter clock (inter-sensor skew), skip it
   // rather than let predict_to re-base the clock backward.
@@ -828,8 +994,120 @@ void FusionCore::update_zupt(double timestamp_seconds, double noise_sigma) {
   R(2,2) = var;
 
   ukf_.update<sensors::ENCODER_DIM>(z, sensors::zupt_measurement_function, R);
+
+  // Hold the position covariance down while the robot is known to be still.
+  // Deliberately NOT applied while coasting: coast inflation exists so the
+  // filter can re-admit GNSS after a blackout, and quietly cancelling it here
+  // would change a behaviour this function has nothing to do with.
+  if (config_.zupt_position_noise_scale != 1.0 && !gnss_in_coast_) {
+    ukf_.set_position_noise_scale(config_.zupt_position_noise_scale);
+    zupt_holds_pos_noise_ = true;
+  }
 }
 
+
+// Standard deviation of accelerometer magnitude over the last second, or -1
+// while the window is still filling. See zupt_accel_std_threshold.
+double FusionCore::accel_magnitude_std() const {
+  if (acc_n_ < ACC_WIN) return -1.0;
+  double mean = 0.0;
+  for (int i = 0; i < acc_n_; ++i) mean += acc_mag_[i];
+  mean /= acc_n_;
+  double ss = 0.0;
+  for (int i = 0; i < acc_n_; ++i) {
+    const double d = acc_mag_[i] - mean;
+    ss += d * d;
+  }
+  return std::sqrt(ss / (acc_n_ - 1));
+}
+
+// Median of the recent (filter yaw - GPS track bearing) samples, in degrees.
+// Median rather than mean: one bearing taken over a slightly curved stretch is a
+// large outlier, and the whole point is to report a SUSTAINED disagreement.
+double FusionCore::xchk_median_deg() const {
+  if (xchk_n_ <= 0) return 0.0;
+  double v[XCHK_HISTORY];
+  for (int i = 0; i < xchk_n_; ++i) v[i] = xchk_diff_deg_[i];
+  std::sort(v, v + xchk_n_);
+  return (xchk_n_ % 2) ? v[xchk_n_ / 2]
+                       : 0.5 * (v[xchk_n_ / 2 - 1] + v[xchk_n_ / 2]);
+}
+
+// Re-admit GNSS after the filter has dead-reckoned far enough that its own
+// estimate, not the receiver, is the thing that is wrong.
+//
+// Called from EVERY gate that counts a rejection, not just chi2. It used to live
+// inside the chi2 branch, which meant any gate running earlier returned first and
+// the counter climbed past every trigger while the code that acts on it was
+// unreachable. Measured on NCLT 2012-06-15 with the continuity gate armed: the
+// rejection sequence after the blackout ran 7 IMPLAUSIBLE_JUMP, 5 CHI2_FAILED,
+// then 18 CONTINUITY_BREAK to the end of the run, and the filter finished 112 m
+// out instead of 13 m. See issue #120.
+//
+// IMPLAUSIBLE_JUMP deliberately does NOT call this: that gate rejects on physics
+// and must never be able to inflate P, or an outlier could talk its way in.
+void FusionCore::maybe_inflate_for_recovery(
+  const sensors::GnssPosMeasurement& innovation_pre)
+{
+  if (!reject_after_gap_) return;
+  if (config_.gnss_recovery_rejection_n <= 0) return;
+  if (gnss_consecutive_rejects_ % config_.gnss_recovery_rejection_n != 0) return;
+
+  // Size the inflation from what the receiver is actually saying rather than
+  // from a fixed constant. After a blackout the filter's error is whatever its
+  // dead reckoning accumulated, and no constant brackets that: the old fixed
+  // 50 m covers a short outage and does nothing after several minutes, which is
+  // the case this exists for. Measured against 379 m of drift, the 50 m
+  // inflation changed nothing and 1501 consecutive fixes were rejected.
+  //
+  // The vertical term is sized separately, because the gate is 3-DOF and an
+  // altitude error the inflation never reaches can hold it shut on its own.
+  const double innov_xy = std::hypot(innovation_pre[0], innovation_pre[1]);
+  const double s2 = std::max(
+      config_.gnss_p_inflate_sigma * config_.gnss_p_inflate_sigma,
+      innov_xy * innov_xy);
+  const double innov_z = std::abs(innovation_pre[2]);
+  ukf_.inflate_position_covariance(s2, innov_z * innov_z);
+}
+
+// At the start of a rejection sequence, decide whether GNSS was continuous (a
+// persistent outlier like a multipath spike) or is returning after a gap (the
+// filter may have dead-reckoned away from truth while blind). Only the latter
+// justifies relaxing anything: see gnss_coast_min_gap_s. last_gnss_time_ is the
+// last ACCEPTED fix, so the gap to it is small during a continuous spike and
+// large after an outage. No-op once a cascade is already running, so the
+// decision is made on its first fix and not revised by later ones.
+void FusionCore::note_rejection_cascade_start(double timestamp_seconds) {
+  if (gnss_consecutive_rejects_ != 0) return;
+  const double gap = (last_gnss_time_ < 0.0)
+                       ? std::numeric_limits<double>::infinity()
+                       : (timestamp_seconds - last_gnss_time_);
+
+  // The threshold has to be relative to how fast this receiver actually
+  // publishes, not an absolute number of seconds. "A gap" means the receiver
+  // missed an epoch it owed us, and at 1 Hz the healthy spacing between fixes IS
+  // gnss_coast_min_gap_s, so an absolute 1.0 s test calls every single fix "after
+  // a gap" and the protection it provides disappears exactly where it is needed.
+  //
+  // That is not a hypothetical rate. Six 2026-09 rover logs all run at a median
+  // 1.00 s with no dropouts, and measured in SustainedSpikeAtOneHertz, a 120 s
+  // sustained 300 m spike is rejected 600 times out of 600 at 5 Hz and dragged
+  // the filter 301 m off at 1 Hz.
+  //
+  // cont_t_ holds the last few ACCEPTED fixes and is maintained whatever the
+  // continuity gate is set to, so it is a clean reference: during a spike nothing
+  // is accepted, so it still describes the cadence from before the trouble began.
+  double min_gap = config_.gnss_coast_min_gap_s;
+  if (cont_n_ >= 2) {
+    const double mean_dt = (cont_t_[cont_n_ - 1] - cont_t_[0]) / (cont_n_ - 1);
+    if (mean_dt > 1e-6) min_gap = std::max(min_gap, 2.0 * mean_dt);
+  }
+  const bool after_gap = (gap >= min_gap);
+  if (after_gap) post_outage_unconfirmed_ = true;
+  // Latched: an outage counts as ongoing until GNSS is demonstrably back, not
+  // merely until one fix slipped through. See post_outage_unconfirmed_.
+  reject_after_gap_ = after_gap || post_outage_unconfirmed_;
+}
 
 // Record the outcome currently in gnss_debug_ and stamp it. See OutcomeTally in
 // fusioncore.hpp for why a single "last reason" field was not enough.
@@ -887,7 +1165,9 @@ bool FusionCore::update_gnss(
     // Order matches is_valid() so the reported reason is the gate that
     // actually fired. Naming the wrong gate sends people tuning a parameter
     // that was never involved, which is what happened on issue #73.
-    if (fix.fix_type < config_.gnss.min_fix_type)
+    if (!fix.is_finite())
+      gnss_debug_.reason = GnssRejectionReason::NOT_FINITE;
+    else if (fix.fix_type < config_.gnss.min_fix_type)
       gnss_debug_.reason = GnssRejectionReason::FIX_TYPE_LOW;
     else if (fix.satellites < config_.gnss.min_satellites)
       gnss_debug_.reason = GnssRejectionReason::MIN_SATS;
@@ -895,12 +1175,19 @@ bool FusionCore::update_gnss(
       gnss_debug_.reason = GnssRejectionReason::SIGMA_XY_HIGH;
     else if (fix.has_sigma() && fix.sigma_z > config_.gnss.max_sigma_z)
       gnss_debug_.reason = GnssRejectionReason::SIGMA_Z_HIGH;
-    else if (!fix.has_sigma() && fix.hdop > config_.gnss.max_hdop)
+    // Skip the DOP branch when the DOP was invented rather than reported: see
+    // GnssFix::dop_is_synthetic. Gating on a constant cannot separate a good fix
+    // from a bad one, it can only reject all of them or none of them.
+    else if (!fix.has_sigma() && !fix.dop_is_synthetic && fix.hdop > config_.gnss.max_hdop)
       gnss_debug_.reason = GnssRejectionReason::HDOP_HIGH;
-    else if (!fix.has_sigma() && fix.vdop > config_.gnss.max_vdop)
+    else if (!fix.has_sigma() && !fix.dop_is_synthetic && fix.vdop > config_.gnss.max_vdop)
       gnss_debug_.reason = GnssRejectionReason::VDOP_HIGH;
     else
-      gnss_debug_.reason = GnssRejectionReason::MIN_SATS;
+      // is_valid() refused it and none of the branches above matched, which
+      // means this chain has drifted out of step with is_valid(). Reporting
+      // MIN_SATS here, as it used to, sends the user to tune a parameter that
+      // was never involved: the exact failure the comment above warns about.
+      gnss_debug_.reason = GnssRejectionReason::QUALITY_OTHER;
     note_gnss_outcome(timestamp_seconds);
     return false;
   }
@@ -975,6 +1262,103 @@ bool FusionCore::apply_gnss_update(
       R(i,i) = std::max(R(i,i), R_gnss_(i,i));
   }
 
+  // While the wheels say the robot is parked, measure what the receiver actually
+  // is and correct R by that, per axis. See zupt_gnss_noise_scale in the header
+  // for why there are two factors and why the correlation one usually dominates.
+  //
+  // Applied to the update only, never to R_meas, so the GPS track-heading gate
+  // keeps judging geometry on the receiver's real reported noise.
+  // Is the robot actually parked, or has the wheel odometry died?
+  //
+  // Encoders that lose power report ZERO, not silence, so ZUPT fires and the
+  // suppression below kicks in while the robot drives away. Net displacement
+  // alone cannot separate the two: a genuinely parked receiver wandered 12.85 m
+  // over 57 s on the 2026-09-07 log. Straightness can. That window measured
+  // 0.37, because a parked receiver wanders and comes back, while a driving
+  // robot goes one way and approaches 1.0.
+  if (zupt_holds_pos_noise_ && config_.zupt_parked_motion_m > 0.0 &&
+      !parked_moving_detected_) {
+    if (!parked_fix_has_prev_) {
+      parked_ref_x_ = fix.x; parked_ref_y_ = fix.y; parked_path_len_ = 0.0;
+    } else {
+      parked_path_len_ += std::hypot(fix.x - parked_fix_prev_[0],
+                                     fix.y - parked_fix_prev_[1]);
+    }
+    const double disp = std::hypot(fix.x - parked_ref_x_, fix.y - parked_ref_y_);
+    gnss_parked_straightness_ =
+      (parked_path_len_ > 1e-6) ? disp / parked_path_len_ : 0.0;
+
+    if (disp >= config_.zupt_parked_motion_m &&
+        gnss_parked_straightness_ >= config_.zupt_parked_motion_straightness) {
+      // The wheels are lying. Hand back everything the ZUPT suppression took so
+      // GNSS can pull the estimate along instead of being drowned out.
+      parked_moving_detected_ = true;
+      ukf_.set_position_noise_scale(1.0);
+      zupt_holds_pos_noise_ = false;
+      reset_parked_gnss_evidence();
+    }
+  }
+
+  if (zupt_holds_pos_noise_ && config_.zupt_gnss_noise_scale > 1.0) {
+    const std::array<double, 3> z{fix.x, fix.y, fix.z};
+    parked_fix_n_ += 1.0;
+    for (int k = 0; k < 3; ++k) {
+      parked_fix_s_[k]  += z[k];
+      parked_fix_ss_[k] += z[k] * z[k];
+      if (parked_fix_has_prev_) parked_fix_slag_[k] += z[k] * parked_fix_prev_[k];
+      parked_fix_prev_[k] = z[k];
+    }
+    parked_fix_has_prev_ = true;
+
+    const double n = parked_fix_n_;
+    if (n >= std::max(config_.zupt_gnss_min_samples, 3) ) {
+      std::array<double, 3> scale{1.0, 1.0, 1.0};
+      double obs_xy = 0.0, decl_xy = 0.0, corr_xy = 0.0;
+
+      for (int k = 0; k < 3; ++k) {
+        const double mean = parked_fix_s_[k] / n;
+        // Bessel-corrected: at 5 samples the naive variance is 20% low and would
+        // systematically under-correct a receiver that deserves correcting.
+        const double var =
+          std::max(parked_fix_ss_[k] - parked_fix_s_[k] * mean, 0.0) / (n - 1.0);
+        const double observed = std::sqrt(var);
+        const double declared = std::sqrt(std::max(R_meas(k, k), 1e-12));
+
+        // How much worse the receiver measurably is than it says it is.
+        const double ratio     = observed / declared;
+        const double magnitude = std::max(ratio * ratio, 1.0);
+
+        // How much of each fix the previous fix already told us. Clamped below
+        // at 0 because a negative sample correlation on a short window is noise,
+        // not evidence that the receiver is better than white, and above at 0.99
+        // so a near-frozen receiver produces a large number rather than infinity.
+        double correlation = 1.0;
+        if (var > 1e-12) {
+          const double r = std::clamp(
+            (parked_fix_slag_[k] / (n - 1.0) - mean * mean) / var, 0.0, 0.99);
+          correlation = (1.0 + r) / (1.0 - r);
+          if (k < 2) corr_xy += 0.5 * r;
+        }
+
+        scale[k] = std::clamp(magnitude * correlation,
+                              1.0, config_.zupt_gnss_noise_scale);
+        if (k < 2) { obs_xy += 0.5 * observed; decl_xy += 0.5 * declared; }
+      }
+
+      // R' = D R D with D = diag(sqrt(scale)) inflates each axis by its own
+      // evidence while preserving the receiver's reported X/Y correlation, which
+      // a single scalar multiply would also do but a per-axis one would not.
+      const Eigen::Vector3d d(std::sqrt(scale[0]), std::sqrt(scale[1]),
+                              std::sqrt(scale[2]));
+      R = d.asDiagonal() * R * d.asDiagonal();
+
+      gnss_parked_sigma_observed_ = obs_xy;
+      gnss_parked_sigma_declared_ = decl_xy;
+      gnss_parked_correlation_    = corr_xy;
+      gnss_parked_inflation_      = 0.5 * (scale[0] + scale[1]);
+    }
+  }
+
   // Captured BEFORE the position update, because the GPS track-heading gates
   // below must judge the motion the robot was actually doing over the baseline,
   // not the velocity that this very fix just corrected. Same reasoning as Fix 8
@@ -1008,25 +1392,106 @@ bool FusionCore::apply_gnss_update(
   // its scale is S = H P H' + R and nothing under about 25 m looks surprising on
   // a consumer receiver. This compares a fix against the two before it, which
   // never involves P at all. See GnssParams::continuity_max_m.
-  if (config_.gnss.continuity_max_m > 0.0 && cont_t2_ >= 0.0) {
-    const double dt1 = cont_t1_ - cont_t2_;
-    const double dt2 = timestamp_seconds - cont_t1_;
-    // Only when the three fixes are evenly spaced. Across a gap the second
-    // difference is legitimately large, and rejecting the first fix after an
-    // outage is exactly the failure gnss_coast_min_gap_s exists to avoid.
-    if (dt1 > 1e-6 && dt2 > 1e-6 && dt2 <= 2.0 * dt1 && dt2 >= 0.5 * dt1) {
-      const double r = dt2 / dt1;
-      // Where the fix should be if the receiver kept moving as it was.
-      const double px = cont_x1_ + (cont_x1_ - cont_x2_) * r;
-      const double py = cont_y1_ + (cont_y1_ - cont_y2_) * r;
-      const double resid = std::hypot(fix.x - px, fix.y - py);
-      if (resid > config_.gnss.continuity_max_m) {
-        gnss_debug_.accepted = false;
-        gnss_debug_.reason   = GnssRejectionReason::CONTINUITY_BREAK;
-        note_gnss_outcome(timestamp_seconds);
-        ++gnss_outliers_;
-        ++gnss_consecutive_rejects_;
-        return false;
+  const bool cont_explicit = (config_.gnss.continuity_max_m > 0.0);
+  const bool cont_learning  = (!cont_explicit && config_.gnss.continuity_auto &&
+                               cont_learned_m_ <= 0.0);
+  const double cont_limit   = cont_explicit ? config_.gnss.continuity_max_m
+                                            : cont_learned_m_;
+  if ((cont_explicit || config_.gnss.continuity_auto) && cont_n_ == CONT_HISTORY) {
+    const double span = cont_t_[CONT_HISTORY - 1] - cont_t_[0];
+    const double mean_dt = span / (CONT_HISTORY - 1);
+    const double dt_new  = timestamp_seconds - cont_t_[CONT_HISTORY - 1];
+    // Only while the fixes keep their cadence. Across a gap the receiver has
+    // really travelled, and rejecting the first fix after an outage is exactly
+    // the failure gnss_coast_min_gap_s exists to avoid.
+    if (mean_dt > 1e-6 && dt_new > 1e-6 &&
+        dt_new <= 2.0 * mean_dt && dt_new >= 0.5 * mean_dt) {
+      // Least-squares line through the history, evaluated at the new stamp.
+      // Time is measured from the history mean so the normal equations stay
+      // well conditioned whatever the epoch.
+      double t_bar = 0.0;
+      for (int i = 0; i < CONT_HISTORY; ++i) t_bar += cont_t_[i];
+      t_bar /= CONT_HISTORY;
+
+      double sxx = 0.0, sx_x = 0.0, sx_y = 0.0, mx = 0.0, my = 0.0;
+      for (int i = 0; i < CONT_HISTORY; ++i) {
+        const double d = cont_t_[i] - t_bar;
+        sxx  += d * d;
+        sx_x += d * cont_x_[i];
+        sx_y += d * cont_y_[i];
+        mx   += cont_x_[i];
+        my   += cont_y_[i];
+      }
+      mx /= CONT_HISTORY;
+      my /= CONT_HISTORY;
+
+      if (sxx > 1e-12) {
+        const double d  = timestamp_seconds - t_bar;
+        const double px = mx + (sx_x / sxx) * d;
+        const double py = my + (sx_y / sxx) * d;
+        const double resid = std::hypot(fix.x - px, fix.y - py);
+
+        // Learn the receiver's own fix-to-fix scatter before gating on it.
+        //
+        // The alternative was shipping this off, which is what it did, and the
+        // out-of-box filter then had no gate capable of seeing a metre-scale
+        // spike at all: chi2 tests a fix against the FILTER, so its scale is
+        // S = HPH' + R, and on the 2026-09-06 rover log a spike had to exceed
+        // 29 m before it was rejected. The right threshold is a property of the
+        // receiver, the receiver is right here, so measure it instead of asking
+        // the user to read a header and run a tool over a bag.
+        //
+        // Margin: 1.5x the largest residual seen while learning. On the six
+        // 2026-09 rover logs the largest residual across 1287 fixes was 3.81 m,
+        // so this lands near 5.7 m, which would have rejected NOTHING on that
+        // clean data. A hand-picked 4.0 caught injected spikes from 4 m up; this
+        // is deliberately looser than that, because rejecting good fixes is the
+        // failure that has cost this project most and an accepted 3 m spike
+        // moves the trajectory about 0.25 m.
+        //
+        // Learned once and then held. A sliding estimate would be dragged upward
+        // by exactly the spike train it is supposed to catch. The cost is that a
+        // receiver calibrated under open sky carries that threshold into canopy,
+        // where its honest scatter is larger; the 1.5x margin is the headroom for
+        // that, and a run that starts rejecting shows up in the outcome tally.
+        if (cont_learning) {
+          if (resid > cont_learn_max_) cont_learn_max_ = resid;
+          if (++cont_learn_n_ >= CONT_LEARN_N) {
+            cont_learned_m_ = std::min(std::max(1.5 * cont_learn_max_, 2.0), 25.0);
+          }
+        } else if (cont_limit > 0.0 && resid > cont_limit) {
+          gnss_debug_.accepted = false;
+          gnss_debug_.reason   = GnssRejectionReason::CONTINUITY_BREAK;
+          note_gnss_outcome(timestamp_seconds);
+          ++gnss_outliers_;
+          // This path increments the same counter the chi2 path uses to decide
+          // whether a rejection sequence is a returning receiver or a spike, so
+          // it has to answer that question too. Without this the chi2 block
+          // below sees a non-zero counter, skips its own evaluation, and reuses
+          // whatever reject_after_gap_ was left from an earlier cascade: a spike
+          // during normal driving could inherit "this follows a gap" from a
+          // genuine outage minutes earlier and unlock the recovery inflation.
+          // A continuity rejection can only happen while fixes keep their
+          // cadence (see the dt_new test above), so the answer here is normally
+          // false, which is exactly the protection wanted.
+          note_rejection_cascade_start(timestamp_seconds);
+          gnss_consecutive_accepts_ = 0;
+          ++gnss_consecutive_rejects_;
+          // This gate runs BEFORE chi2 and returns, so without reaching the
+          // recovery decision here a continuity cascade counts its way past every
+          // trigger while nothing acts on it (#120). The innovation is not
+          // computed yet on this path, so compute it, and only when the trigger
+          // is actually due rather than on every rejection.
+          if (reject_after_gap_ && config_.gnss_recovery_rejection_n > 0 &&
+              gnss_consecutive_rejects_ % config_.gnss_recovery_rejection_n == 0) {
+            sensors::GnssPosMeasurement innov_c;
+            sensors::GnssPosNoiseMatrix S_c;
+            ukf_.predict_measurement<sensors::GNSS_POS_DIM>(
+              z, h_gnss, R, innov_c, S_c);
+            maybe_inflate_for_recovery(innov_c);
+          }
+          return false;
+        }
       }
     }
   }
@@ -1054,6 +1519,13 @@ bool FusionCore::apply_gnss_update(
     // This avoids calling is_outlier() which would run a second LDLT internally.
     double d2 = innovation_pre.dot(S.ldlt().solve(innovation_pre));
     gnss_debug_.mahalanobis_sq = d2;
+    // Running maximum, so a whole run can be judged rather than a single fix.
+    // A gate whose LARGEST innovation all run sits far below its threshold has
+    // not been passing fixes, it has been unable to reject any. On a 2026-09-06
+    // rover log the biggest of 222 fixes was 39x below firing while every fix
+    // reported ACCEPTED, which reads exactly like a healthy run.
+    if (d2 > gnss_chi2_max_) gnss_chi2_max_ = d2;
+    ++gnss_chi2_samples_;
 
     // Physical plausibility gate: the fix cannot be farther from the predicted
     // position than the robot could have moved or drifted since the last accepted
@@ -1119,12 +1591,8 @@ bool FusionCore::apply_gnss_update(
         // latter justifies inflating P to re-admit GPS. last_gnss_time_ is the
         // last ACCEPTED fix, so the gap to it is small during a continuous
         // spike and large after an outage.
-        if (gnss_consecutive_rejects_ == 0) {
-          double gap = (last_gnss_time_ < 0.0)
-                         ? std::numeric_limits<double>::infinity()
-                         : (timestamp_seconds - last_gnss_time_);
-          reject_after_gap_ = (gap >= config_.gnss_coast_min_gap_s);
-        }
+        note_rejection_cascade_start(timestamp_seconds);
+        gnss_consecutive_accepts_ = 0;
         ++gnss_consecutive_rejects_;
         gnss_debug_.consecutive_rejects = gnss_consecutive_rejects_;
         if (reject_after_gap_ &&
@@ -1134,12 +1602,7 @@ bool FusionCore::apply_gnss_update(
           ukf_.set_position_noise_scale(config_.gnss_coast_q_factor);
           ukf_.set_gyro_bias_noise_scale(config_.gnss_coast_q_bias_factor);
         }
-        if (reject_after_gap_ &&
-            config_.gnss_recovery_rejection_n > 0 &&
-            gnss_consecutive_rejects_ == config_.gnss_recovery_rejection_n) {
-          double s2 = config_.gnss_p_inflate_sigma * config_.gnss_p_inflate_sigma;
-          ukf_.inflate_position_covariance(s2);
-        }
+        maybe_inflate_for_recovery(innovation_pre);
       }
       return false;
     }
@@ -1149,8 +1612,42 @@ bool FusionCore::apply_gnss_update(
 
   // Only accepted fixes become the continuity reference, so a rejected spike can
   // never poison the baseline that judges the next fix.
-  cont_x2_ = cont_x1_; cont_y2_ = cont_y1_; cont_t2_ = cont_t1_;
-  cont_x1_ = fix.x;    cont_y1_ = fix.y;    cont_t1_ = timestamp_seconds;
+  // Newest at the end, oldest dropped off the front once it is full.
+  // Never let the history span a GNSS gap. If it does, every statistic drawn
+  // from it is nonsense, including the one used to decide whether it is
+  // trustworthy: mean_dt becomes the average of a two-minute hole, the cadence
+  // guard then accepts an equally huge dt_new as "normal", and the gate runs a
+  // least-squares fit through the outage.
+  //
+  // Measured on NCLT 2012-06-15 with the gate armed, from the rejection itself:
+  //   resid=236.3  limit=2.0  span=462.38  dt_new=144.79  mean_dt=115.60
+  // 0.5*115.6 = 57.8 and 2.0*115.6 = 231.2, so dt_new=144.8 sat inside the
+  // window and the check ran. 607 consecutive rejections, and since only
+  // ACCEPTED fixes refresh the history it could never clear itself.
+  if (cont_n_ >= 2) {
+    const double buf_mean_dt =
+        (cont_t_[cont_n_ - 1] - cont_t_[0]) / (cont_n_ - 1);
+    if (buf_mean_dt > 1e-6 &&
+        (timestamp_seconds - cont_t_[cont_n_ - 1]) > 2.0 * buf_mean_dt) {
+      cont_n_ = 0;   // start a fresh track from this fix
+    }
+  }
+
+  if (cont_n_ < CONT_HISTORY) {
+    cont_x_[cont_n_] = fix.x;
+    cont_y_[cont_n_] = fix.y;
+    cont_t_[cont_n_] = timestamp_seconds;
+    ++cont_n_;
+  } else {
+    for (int i = 0; i + 1 < CONT_HISTORY; ++i) {
+      cont_x_[i] = cont_x_[i + 1];
+      cont_y_[i] = cont_y_[i + 1];
+      cont_t_[i] = cont_t_[i + 1];
+    }
+    cont_x_[CONT_HISTORY - 1] = fix.x;
+    cont_y_[CONT_HISTORY - 1] = fix.y;
+    cont_t_[CONT_HISTORY - 1] = timestamp_seconds;
+  }
 
   // GPS accepted normally: exit coast mode and reset counter
   if (gnss_in_coast_) {
@@ -1159,6 +1656,11 @@ bool FusionCore::apply_gnss_update(
     ukf_.set_gyro_bias_noise_scale(1.0);
   }
   gnss_consecutive_rejects_ = 0;
+  // Several in a row, not one. One fix landing near a drifted estimate proves
+  // nothing, so the outage stays latched until the receiver has demonstrably
+  // come back (see post_outage_unconfirmed_).
+  if (++gnss_consecutive_accepts_ >= kAcceptsToConfirmReacquisition)
+    post_outage_unconfirmed_ = false;
 
   Eigen::Matrix<double, sensors::GNSS_POS_DIM, 1> innovation =
     ukf_.update<sensors::GNSS_POS_DIM>(z, h_gnss, R);
@@ -1217,6 +1719,49 @@ bool FusionCore::apply_gnss_update(
     gnss_debug_.track_heading_state = TrackHeadingState::MOTION_UNSUITABLE;
   }
 
+  // An absolute heading source is in charge, so track heading does not fuse.
+  // Check it anyway. The bearing between two accepted fixes is an independent
+  // measurement of where the robot actually went, and it is the only thing here
+  // capable of catching an absolute source that is confidently wrong. See
+  // gps_track_heading_cross_check_deg for the case that prompted this.
+  if (config_.gps_track_heading_enabled &&
+      have_stronger_heading &&
+      config_.gps_track_heading_cross_check_deg > 0.0) {
+    if (!xchk_ref_set_) {
+      xchk_ref_x_ = fix.x;
+      xchk_ref_y_ = fix.y;
+      xchk_ref_set_ = true;
+      hdg_window_had_turn_ = false;
+    } else if (!motion_suits_track_heading || hdg_window_had_turn_) {
+      // Same admissibility rules the fusion path uses. A bearing measured across
+      // a turn, or at a crawl, describes the path and not the heading, so it
+      // would manufacture a disagreement that is not there. Restart the window.
+      xchk_ref_x_ = fix.x;
+      xchk_ref_y_ = fix.y;
+      hdg_window_had_turn_ = false;
+    } else {
+      const double dx = fix.x - xchk_ref_x_;
+      const double dy = fix.y - xchk_ref_y_;
+      const double dist = std::hypot(dx, dy);
+      if (dist >= config_.gps_track_heading_min_dist) {
+        const double sigma_xy = std::sqrt((R_meas(0,0) + R_meas(1,1)) * 0.5);
+        if (sigma_xy / dist <= config_.gps_track_heading_max_sigma) {
+          double roll_s, pitch_s, yaw_s;
+          const auto& st = ukf_.state();
+          quat_to_euler(st.x[QW], st.x[QX], st.x[QY], st.x[QZ], roll_s, pitch_s, yaw_s);
+          double d = yaw_s - std::atan2(dy, dx);
+          while (d >  M_PI) d -= 2.0 * M_PI;
+          while (d < -M_PI) d += 2.0 * M_PI;
+          xchk_diff_deg_[xchk_i_] = d * 180.0 / M_PI;
+          xchk_i_ = (xchk_i_ + 1) % XCHK_HISTORY;
+          if (xchk_n_ < XCHK_HISTORY) ++xchk_n_;
+        }
+        xchk_ref_x_ = fix.x;
+        xchk_ref_y_ = fix.y;
+      }
+    }
+  }
+
   if (config_.gps_track_heading_enabled &&
       !have_stronger_heading &&
       motion_suits_track_heading) {
@@ -1225,6 +1770,27 @@ bool FusionCore::apply_gnss_update(
       last_hdg_fix_x_ = fix.x;
       last_hdg_fix_y_ = fix.y;
       hdg_fix_set_    = true;
+    } else if (hdg_window_had_turn_) {
+      // A turn happened somewhere between last_hdg_fix_x_/y_ and this fix.
+      // atan2(dy, dx) over that displacement would return the chord direction
+      // across the turn, not the robot's actual heading -- and since
+      // sigma_hdg below only reflects GPS noise vs. distance (not path
+      // curvature), that wrong bearing could still look "confident" enough
+      // to collapse the filter's own yaw covariance onto it (see
+      // hdg_window_had_turn_'s declaration). Discard this window instead of
+      // fusing: reset the reference to the current fix and start accumulating
+      // a fresh, hopefully-straight baseline from here.
+      // Publish it. Without this the branch assigns nothing, and because
+      // gnss_debug_ is only cleared in init() and reset(), both fields carry the
+      // previous fix's values into the bag: a discard reads as whatever gate
+      // spoke last, with a baseline measured somewhere else entirely. The one
+      // question this field exists to answer is then exactly the one it cannot.
+      gnss_debug_.track_heading_state = TrackHeadingState::WINDOW_HAD_TURN;
+      gnss_debug_.track_heading_baseline_m =
+          std::hypot(fix.x - last_hdg_fix_x_, fix.y - last_hdg_fix_y_);
+      last_hdg_fix_x_      = fix.x;
+      last_hdg_fix_y_      = fix.y;
+      hdg_window_had_turn_ = false;
     } else {
       double dx   = fix.x - last_hdg_fix_x_;
       double dy   = fix.y - last_hdg_fix_y_;
@@ -1432,6 +1998,16 @@ FusionCoreStatus FusionCore::get_status() const {
     status.yaw_rate_encoder_mean = yaw_sign_enc_sum_ / yaw_sign_disagree_;
   }
   status.heading_source    = heading_source_;
+  status.continuity_limit_m   = (config_.gnss.continuity_max_m > 0.0)
+                                  ? config_.gnss.continuity_max_m : cont_learned_m_;
+  status.continuity_learned   = (config_.gnss.continuity_max_m <= 0.0 && cont_learned_m_ > 0.0);
+  status.encoder_reason          = encoder_reason_;
+  status.encoder_chi2            = encoder_chi2_;
+  status.encoder_chi2_threshold  = config_.outlier_threshold_enc;
+  status.zupt_accel_std       = accel_magnitude_std();
+  status.zupt_blocked_by_imu  = zupt_blocked_by_imu_;
+  status.heading_vs_track_deg = xchk_median_deg();
+  status.heading_vs_track_n   = xchk_n_;
   status.distance_traveled = distance_traveled_;
 
   status.vslam_health =
@@ -1465,6 +2041,23 @@ FusionCoreStatus FusionCore::get_status() const {
   // GPS coast mode
   status.gnss_in_coast           = gnss_in_coast_;
   status.gnss_consecutive_rejects = gnss_consecutive_rejects_;
+  if (imu_rate_observed_n_ > 200) {
+    status.imu_rate_observed_hz =
+      static_cast<double>(imu_rate_observed_n_) / imu_rate_observed_sum_;
+    if (config_.imu_fixed_rate_hz > 0.0) {
+      const double ratio = status.imu_rate_observed_hz / config_.imu_fixed_rate_hz;
+      status.imu_fixed_rate_mismatch = (ratio < 0.98 || ratio > 1.02);
+    }
+  }
+  status.gnss_parked_sigma_observed = gnss_parked_sigma_observed_;
+  status.gnss_parked_sigma_declared = gnss_parked_sigma_declared_;
+  status.gnss_parked_correlation    = gnss_parked_correlation_;
+  status.zupt_parked_but_moving     = parked_moving_detected_;
+  status.zupt_parked_straightness   = gnss_parked_straightness_;
+  status.gnss_parked_inflation      = gnss_parked_inflation_;
+  status.gnss_chi2_max       = gnss_chi2_max_;
+  status.gnss_chi2_threshold = config_.outlier_threshold_gnss;
+  status.gnss_chi2_samples   = gnss_chi2_samples_;
   status.gnss_last_rejection_reason = last_gnss_rejection_reason_;
   status.mag_last_rejection_reason = last_mag_rejection_reason_;
 

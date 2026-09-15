@@ -93,16 +93,64 @@ struct GnssParams {
   // perfect heading fixes that: heading actually made it slightly worse.
   //
   // Continuity asks a different question, one that never touches P: does this fix
-  // agree with the two fixes either side of it? A spike breaks that badly.
-  // Measured on the same log, the median second difference of a good fix is
-  // 0.171 m, so a 10 m spike is roughly 58 times the normal scale. Invisible to
-  // chi2, unmissable here.
+  // agree with where the last few put it? A least-squares line through the last
+  // five accepted fixes predicts the next one, and a spike breaks that badly.
+  // Measured on the same log, the median residual of a good fix is 0.171 m, so a
+  // 10 m spike is roughly 58 times the normal scale. Invisible to chi2,
+  // unmissable here.
   //
-  // Set it WELL above the figure tools/nis_from_bag.py reports, because the second
-  // difference also contains real acceleration and the cost of being wrong is
-  // rejecting good fixes, which is the failure that has cost this project most.
-  // On a 0.171 m receiver, 2.0 to 3.0 is generous and still catches a 10 m spike.
+  // WHY FIVE POINTS AND NOT TWO. A two-point extrapolation puts an error in the
+  // newest reference point into the prediction multiplied by about two, so a
+  // spike small enough to pass this limit threw the NEXT good fix over it: the
+  // gate kept the bad sample and rejected the good one, which is worse than not
+  // gating. Over five points the weight on the newest is 0.8, so a spike that
+  // passes can only move the next prediction by 0.8 of itself and can never
+  // reach the limit, whatever the limit is set to.
+  //
+  // HOW TO SET IT. Above the p99 of the residual your own receiver produces, not
+  // by feel. The cost of being wrong is rejecting good fixes, which is the
+  // failure that has cost this project most, and an accepted spike of a few
+  // metres does very little damage anyway: measured on the 2026-09-07 log, an
+  // accepted 3 m spike moved the trajectory 0.25 m while an accepted 60 m spike
+  // moved it 15.73 m. The gate earns its keep in the tail, so set it to catch
+  // the tail and leave ordinary noise alone.
+  //
+  // Measured across 1287 fixes from six 2026-09 rover logs: median residual 0.18
+  // to 0.59 m, p99 0.95 to 3.00 m, largest 3.81 m. At 4.0 there were no
+  // rejections at all on clean data and every injected spike from 4 m up was
+  // caught, so 4.0 is the right number FOR THAT RECEIVER. Measure yours.
   double continuity_max_m = 0.0;
+
+  // When continuity_max_m is left at 0, measure the threshold from this
+  // receiver instead of leaving the gate off.
+  //
+  // Off was the old behaviour and it meant the out-of-box filter could not see a
+  // metre-scale spike at all, because chi2 is the only other gate and it tests
+  // against the filter's own covariance: measured on the 2026-09-06 rover log, a
+  // spike had to exceed 29 m before chi2 rejected it, while an accepted 15 m
+  // spike moved position 4.5 m. Meanwhile the right threshold was sitting in the
+  // data the whole time, since it is a property of the receiver.
+  //
+  // The filter watches the first CONT_LEARN_N admissible fixes, takes the
+  // largest prediction residual it sees, and sets the limit to 1.5x that,
+  // clamped to [2, 25] m. An explicit continuity_max_m always wins and skips
+  // learning entirely. The value chosen is logged and published.
+  //
+  // ON by default as of the continuity-buffer fix. It was off while the gate
+  // cancelled post-blackout re-acquisition, which turned out to be the buffer
+  // being allowed to span a GNSS outage: mean_dt then became the average of a
+  // two-minute hole, the cadence guard accepted an equally huge dt_new as
+  // normal, and the gate ran a least-squares fit through the gap. Measured on
+  // NCLT 2012-06-15, error 300 s after a 461 s blackout:
+  //
+  //     no recovery at all           277 m
+  //     recovery, this gate OFF       13 m
+  //     recovery, this gate ON       112 m   <- the defect
+  //     after the buffer fix          13 m   <- and 20 m at t+60s, the fastest yet
+  //
+  // Continuity rejections after the blackout went from 18-20 running to the end
+  // of the run down to 1.
+  bool continuity_auto = true;
 
   double base_noise_xy = 1.0;
   double base_noise_z  = 2.0;
@@ -140,7 +188,7 @@ struct GnssParams {
 
   // Normally the lever arm is only applied after heading_validated_ flips
   // true (dock compass, dual-GNSS, or 5 m of straight GPS track). Setting
-  // this to true applies the lever arm from the very first fix — which lets
+  // this to true applies the lever arm from the very first fix, which lets
   // GPS position innovations actively observe yaw from startup, instead of
   // having to wait for the straight-line accumulation. Safe when Mahalanobis
   // gating is on AND either (a) initial yaw is roughly known (dock compass
@@ -196,17 +244,52 @@ struct GnssFix {
   // (correlated X/Y errors). When has_full_covariance is true, this
   // matrix is used directly instead of the diagonal HDOP/VDOP estimate.
   bool has_full_covariance = false;
+
+  // True when hdop/vdop were INVENTED by the wrapper because the message could
+  // not carry them, rather than reported by a receiver. A gate cannot learn
+  // anything from a constant: with a synthetic DOP the quality check either
+  // never fires or fires on every fix forever, depending purely on which side of
+  // the invented value the threshold happens to sit. See #123, and #115 for the
+  // same defect on the satellite count. Quality gates must skip a synthetic
+  // field rather than pretend to judge it.
+  //
+  // hdop stays populated regardless, because the core also uses it as a noise
+  // scale (sigma_xy = base_noise_xy * hdop), so the field is doing two jobs.
+  bool dop_is_synthetic = false;
   Eigen::Matrix3d full_covariance = Eigen::Matrix3d::Identity();
 
   // True when the fix reported a covariance, so the quality gate has metres to
   // work with and must not compare them against the DOP thresholds.
   bool has_sigma() const { return sigma_xy > 0.0 && sigma_z > 0.0; }
 
+  // A fix carrying NaN or infinity. Checked before anything else because every
+  // comparison below silently answers false against a NaN, so a garbage fix
+  // would pass every gate it was tested against rather than failing them.
+  //
+  // Nothing recovers from this one. A NaN reaching the state or the covariance
+  // propagates through the sigma points on the next predict and every value the
+  // filter reports afterwards is NaN, for the rest of the run, with no way back.
+  // That makes it worth a check even though a well-behaved driver never sends
+  // one: seen on a 2026-09-05 rover log, 17 of 246 fixes had NaN latitude and
+  // longitude. All 17 also carried status -1, so min_fix_type happened to stop
+  // them, but that is the driver being tidy rather than the filter being safe.
+  bool is_finite() const {
+    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z) &&
+           std::isfinite(sigma_xy) && std::isfinite(sigma_z) &&
+           std::isfinite(hdop) && std::isfinite(vdop) &&
+           (!has_full_covariance || full_covariance.allFinite());
+  }
+
   bool is_valid(const GnssParams& p) const {
+    if (!is_finite())                   return false;
     if (fix_type < p.min_fix_type)      return false;
     if (satellites < p.min_satellites)  return false;
     if (has_sigma())
       return sigma_xy <= p.max_sigma_xy && sigma_z <= p.max_sigma_z;
+    // No reported uncertainty of any kind. If the DOP was invented too there is
+    // nothing here to judge, so judging it means rejecting every fix or none
+    // depending on where the threshold sits. See dop_is_synthetic.
+    if (dop_is_synthetic) return true;
     return hdop <= p.max_hdop && vdop <= p.max_vdop;
   }
 };
