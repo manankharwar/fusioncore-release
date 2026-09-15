@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fusioncore_core VERSION 0.3.9)
+project(fusioncore_core VERSION 0.4.0)
 
 # Default to Release when the caller has not chosen. A plain "colcon build" sets
 # no build type, which means no optimisation flags at all, and Eigen without
@@ -71,6 +71,15 @@ if(BUILD_TESTING)
   ament_add_gtest(test_gnss_coast tests/test_gnss_coast.cpp TIMEOUT 600)
   target_link_libraries(test_gnss_coast fusioncore_core Eigen3::Eigen)
 
+  ament_add_gtest(test_gnss_reacquire tests/test_gnss_reacquire.cpp TIMEOUT 600)
+  target_link_libraries(test_gnss_reacquire fusioncore_core Eigen3::Eigen)
+
+  ament_add_gtest(test_heading_cross_check tests/test_heading_cross_check.cpp TIMEOUT 300)
+  target_link_libraries(test_heading_cross_check fusioncore_core Eigen3::Eigen)
+
+  ament_add_gtest(test_continuity_auto tests/test_continuity_auto.cpp TIMEOUT 300)
+  target_link_libraries(test_continuity_auto fusioncore_core Eigen3::Eigen)
+
   ament_add_gtest(test_clock_skew tests/test_clock_skew.cpp TIMEOUT 300)
   target_link_libraries(test_clock_skew fusioncore_core Eigen3::Eigen)
 
@@ -82,6 +91,12 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_outcome_tally tests/test_outcome_tally.cpp TIMEOUT 300)
   target_link_libraries(test_outcome_tally fusioncore_core Eigen3::Eigen)
+
+  ament_add_gtest(test_idle_drift tests/test_idle_drift.cpp TIMEOUT 300)
+  target_link_libraries(test_idle_drift fusioncore_core Eigen3::Eigen)
+
+  ament_add_gtest(test_fixed_dt tests/test_fixed_dt.cpp TIMEOUT 300)
+  target_link_libraries(test_fixed_dt fusioncore_core Eigen3::Eigen)
 endif()
 
 ament_export_targets(fusioncore_core_targets HAS_LIBRARY_TARGET)
