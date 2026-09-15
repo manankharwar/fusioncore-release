@@ -6,9 +6,324 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [0.4.0]: 2026-09-14
+
+This is the 0.4.0 candidate rather than a patch release. Two public fields were
+removed from `FusionCoreConfig`, so code that sets them directly against
+`fusioncore_core` stops compiling, and four defaults now change behaviour for an
+existing user who upgrades without touching their config. Read the Changed
+section before upgrading; nothing else in the release needs action.
+
+### Changed
+
+- **Four defaults now do something they previously did not.** Each is covered in
+  detail below; the table is here so nobody has to find them.
+
+  | setting | was | now | effect |
+  |---|---|---|---|
+  | `gnss.recovery_rejection_n` | 0, off | 15 | post-blackout P inflation fires |
+  | `gnss.continuity_auto` | new | `true` | fix-to-fix gate arms itself after 100 fixes |
+  | `zupt.accel_std_threshold` | new | 0.5 | the IMU can veto a ZUPT |
+  | `gnss.gps_track_heading_cross_check_deg` | new | 15.0 | a disagreeing GPS track heading is refused |
+
+  All four were shipped on deliberately. The two GNSS ones close failure modes
+  that make a filter look healthy while being unrecoverable, which is not a
+  condition to leave opt-in. If you need the previous behaviour, set each to 0.
+
+### Removed
+
+- **Two `FusionCoreConfig` fields nothing read.** `gnss_recovery_timeout_s` was
+  declared, documented with a description of behaviour that did not exist, set in
+  a shipped config, and never read by the filter. `encoder_nhc_vy_sigma` was
+  written by the node into a field nothing consumed, while the parameter that
+  feeds it reached `encoder.vel_noise_y` by a second assignment that did work, so
+  anyone reading the struct to find out how the non-holonomic constraint is
+  applied picked the wrong field.
+
+  The ROS parameter `gnss.recovery_timeout_s` is still **declared**, so existing
+  configs keep loading, and the node now warns once if it is set to anything but
+  zero rather than silently doing nothing. Direct users of `fusioncore_core` who
+  set either struct field will need to delete those lines. Closes #114.
+
+### Added
+
+- **CI now catches a ROS parameter that never reaches the filter.** A parameter can
+  be declared, documented, set in a shipped config and silently do nothing: the node
+  accepts it, `ros2 param get` echoes it back, and no code reads it. Two had already
+  slipped through that way (#114). `tools/check_config_wiring.py` extracts every
+  `config.<field> = ... get_parameter("<name>")` pair from `fusion_node.cpp` and fails
+  if the field is never read by `fusioncore_core`, matching on the field rather than the
+  parameter name so a deliberately renamed mapping is handled. Comments are stripped
+  before counting, or a field named in its own doc comment would look used. Run against
+  the tree immediately before #114 it reports exactly the two dead mappings removed there,
+  which is what makes it trustworthy rather than merely green. It reports its own scope
+  honestly: 76 of 141 declared parameters map into `FusionCoreConfig`, and the 65 that
+  reach the node directly are not covered (#131 tracks that half). Contributed by
+  Rayan-and-beyond. Closes #127.
+
+- **Post-blackout GNSS re-acquisition.** The largest behavioural change in this
+  release and the reason for the version bump. See Fixed below for the mechanism
+  and the numbers; the short version is that a filter which had dead-reckoned
+  through a multi-minute GNSS outage previously never recovered, and now does.
+
+- **`gnss.continuity_auto`: the fix-to-fix gate measures its own threshold.** The
+  continuity gate is the only outlier test that can see a metre-scale spike, because
+  chi2 judges a fix against the filter and its scale is `S = HPH' + R`: on a
+  2026-09-06 rover log a spike had to exceed 29 m before chi2 would reject it. The
+  gate existed but shipped off, because the right threshold is a property of the
+  receiver and asking a user to read a header and run a tool over a bag meant
+  nobody would.
+
+  So it measures instead. For the first 100 gated fixes it records the largest
+  residual against a least-squares line through the last five accepted fixes, then
+  holds `clamp(1.5 * max_residual, 2.0, 25.0)` for the rest of the run. Across
+  1287 fixes from six rover logs the largest residual was 3.81 m, which lands the
+  threshold near 5.7 m and would have rejected nothing on that clean data, while a
+  hand-picked 4.0 caught injected spikes from 4 m up. Deliberately looser than the
+  hand-picked value, because rejecting good fixes is the failure that has cost this
+  project most and an accepted 3 m spike moves the trajectory about 0.25 m.
+
+  Learned once and then held: a sliding estimate would be dragged upward by exactly
+  the spike train it is there to catch. The cost is that a receiver calibrated under
+  open sky carries that threshold into canopy where its honest scatter is larger,
+  which the 1.5x margin is the headroom for, and a run that starts rejecting shows
+  up in the outcome tally. `gnss.continuity_max_m` above zero still overrides it
+  with a fixed number. Closes #116.
+
+- **`gnss.gps_track_heading_cross_check_deg`: refuse a GPS track heading that
+  disagrees with the heading you already have.** Course over ground is not body
+  heading. On any curved path the two differ by a real bias, and a biased
+  measurement pulls the estimate wrong no matter how honest its covariance is. The
+  check is the median of recent disagreements rather than a single sample, so one
+  bad bearing cannot veto a good source and a persistent bias cannot hide behind
+  one good one. Default 15 degrees, 0 disables. Closes #118.
+
+- **`zupt.accel_std_threshold`: ask the accelerometer before believing the wheels
+  are stopped.** Wheels reporting zero is not the same thing as a stationary robot.
+  An encoder that dies mid-run keeps publishing zero while the robot drives; ZUPT
+  then pins velocity to zero, the filter holds position noise down, and it spends
+  the rest of the run refusing to let GNSS move it. On the run that found this the
+  estimate recovered about 7 m of 20 m actually driven.
+
+  The accelerometer is the one sensor a dead encoder cannot fool, so the standard
+  deviation of accelerometer magnitude over the last 100 samples is checked before
+  ZUPT fires. Measured on this project's rover: **1.69 to 2.25 m/s^2 driving against
+  0.013 to 0.021 m/s^2 parked**, two orders of magnitude apart, so the 0.5 default
+  sits nowhere near either population. `FusionCoreStatus::zupt_blocked_by_imu` says
+  when the guard is why ZUPT is not firing, which matters on a high-vibration
+  platform where the honest answer is to raise it. Three tests including a negative
+  control that fails without the guard. Closes #130.
+
+- **`gnss.min_satellites` can no longer silently reject every fix.** A `NavSatFix`
+  carries no satellite count. Setting `min_satellites` above zero while subscribing
+  to `NavSatFix` therefore rejected 100% of fixes, forever, with no error: the node
+  accepted the parameter, `ros2 param get` echoed it back, and the filter published
+  a dead-reckoned pose that looked plausible. The node now refuses the combination
+  at configure time and says which of the two settings to change. Extracted as
+  `min_satellites_gate.hpp` so the predicate is testable without a live node.
+  Closes #115.
+
+- **Encoder rejections say why, and how surprising they were.** The encoder path
+  had the same defect the GNSS path was fixed for in 0.3.9: a rejected update was
+  indistinguishable from an update that never arrived.
+  `FusionCoreStatus::encoder_rejection_reason` and `encoder_chi2` now name the
+  cause and the Mahalanobis distance behind it. #124.
+
+- **A predicted yaw channel for radar and GNSS velocity inputs.** Both measure
+  translation and neither measures yaw rate, so fusing them with a fabricated zero
+  pulled the yaw estimate toward zero on every update. They now substitute the
+  filter's own predicted yaw rate for the channel they cannot observe, which is
+  the same treatment the encoder's ignored channels already got. Closes #113.
+
+- **A reference config for BNO085 + F9P + PMW3901 on a tracked base**, plus the 19
+  parameters that were missing from the reference config entirely, plus a pointer
+  in all four GPS configs to how to measure their own spike-gate threshold instead
+  of copying one. #107.
+
+- **A secondary twist source can declare which channels it actually measures**, and
+  the encoder WZ bias is now added when predicting a yaw channel that source does
+  not provide. Closes #108.
+
+- **`imu.fixed_rate_hz`: propagate by a nominal dt instead of trusting stamp differences.** Anything downstream of an integrator amplifies timestamp error. On one recorded run, shifting every IMU stamp by a single microsecond and changing nothing else moved final yaw by 109 degrees. Most of that is an unbounded quaternion covariance rather than the stamps, but the sensitivity is real, and Martin Pecka noted on ROS Discourse that his team never computes dt in fusion from IMU timestamps at all, assuming the configured rate instead.
+
+  Set above zero and the propagation step no longer depends on stamp jitter. Getting that to be true rather than nearly true took two attempts: letting only the first message through on its raw stamp left 76 degrees of sensitivity, and re-basing the clock to each incoming stamp left 2.4 degrees, because `(t + nominal) - t` rounds differently for every `t` and this filter is chaotic enough that any nonzero difference saturates. The clock now stays on the nominal grid and the sensitivity is gone.
+
+  **The hazard is documented and detected**, because a wrong rate is systematic rather than noisy: the filter integrates the wrong amount of time on every step. `FusionCoreStatus::imu_fixed_rate_mismatch` flags a disagreement above 2%, measured from the raw stamps *before* the stale gate, since a wrong rate is exactly what starts getting IMU messages rejected and measuring only survivors would bias the detector. That rejection is itself pinned by a test: a 9% rate error eventually pushes the clock past `max_measurement_delay` and the IMU starts being discarded, which is a far more visible symptom than a slightly wrong dt. Default is 0, so nothing changes for anyone.
+
+- **`filter_health` now says when the GNSS outlier gate cannot fire.** Three fields, `gnss_chi2_max`, `gnss_chi2_threshold` and `gnss_chi2_samples`: the largest Mahalanobis distance the chi2 gate has seen all run, what it is judged against, and how many fixes are behind that. A single small innovation is normal and healthy, so no per-fix field can show this. It is the *largest* across a whole run staying far below the threshold that means the gate has not been passing good fixes, it has been incapable of rejecting a bad one. On a rover log from 2026-09-06 the biggest of 222 fixes sat **39x below firing** while every fix reported `ACCEPTED`, which reads exactly like a clean run.
+
+  The node also warns once, after at least 100 fixes, when the ratio falls under 0.1, and the message points at the two things that cause it: an uncertain filter (the gate scales with `P`, so check `heading_sigma_deg`) or a receiver reporting a covariance far larger than its actual fix-to-fix noise. It names `gnss.continuity_max_m` as the gate that judges a fix against its neighbours instead and does not scale with `P`. Closes #97.
+
+- **`zupt.position_noise_scale`: stop a parked robot chasing its own GPS.** ZUPT fuses `[VX=0, VY=0, WZ=0]`, which pins velocity and says nothing about position. So a stationary robot's position covariance kept growing between fixes, the Kalman gain stayed near 0.75, and every incoming fix dragged the estimate. Measured on a u-blox M9N parked for 57 seconds with wheel encoders confirming stillness: the receiver's reported position moved 9.76 m and the fused position followed it for **10.16 m**, on a robot that did not move at all.
+
+  Setting the scale below 1.0 holds the position covariance down while the wheels say the robot is still, so it decays as fixes arrive and consecutive fixes are averaged rather than followed. Measured at 0.001 across **11 parked windows from six field runs**, mean excursion falls from 3.49 m to **1.64 m**, whole-run loop closure is unchanged within noise, and no additional fixes are rejected. It gets no further on its own, and `zupt.gnss_noise_scale` below is the reason why. Not applied while GNSS coast is active, since coast inflation exists to re-admit GNSS after a blackout and cancelling it here would change an unrelated behaviour. The scale is handed back as soon as the encoders report motion.
+
+  The default stays at 1.0, so nothing changes for anyone: this is measured on one robot with one receiver, which is not enough to move a default. `test_idle_drift.cpp` pins the behaviour, including that motion restores the scale, because a robot that parked once and stayed over-confident afterwards would be a worse bug than the one being fixed.
+
+  Prompted by Martin Pecka on ROS Discourse, who described a parked robot's estimate not drifting toward the GNSS mean as the property that matters for GNSS integration. FusionCore failed that test; this is the measurement and the fix.
+
 
 ---
+
+- **`zupt.gnss_noise_scale`: measure the receiver while the robot is parked, rather than trusting or distrusting it by a fixed amount.** Suppressing position process noise stops the covariance growing, but it does not touch the other half of the problem. A Kalman filter assumes measurement errors are white, so sixty parked fixes of a fixed point shrink its uncertainty by about sqrt(60). GNSS error is not white over a minute: multipath, ionosphere and satellite geometry drift slowly, so consecutive fixes are largely the same error repeated. The filter ends up far more confident than the geometry supports and carries that into the next leg of the run.
+
+  Standing still is the one moment in a run where this is checkable, because every fix is then sampling the same physical point. Two things are measured from the parked fixes, per axis: the **magnitude** of their spread against the sigma the receiver declares, squared; and their **lag-1 autocorrelation** `r`, where the honest effective sample size is `N(1-r)/(1+r)` so the noise must carry a factor `(1+r)/(1-r)`. The applied inflation is the product, capped by this setting. So the number bounds how far one bad parked window can push the filter and does **not** decide the amount, and there is nothing to retune per environment or per receiver.
+
+  Which term dominates was the surprise. On the 57 s window the magnitude term stayed at exactly 1.0 throughout: the receiver declared 21 to 45 m while actually spreading 0.4 to 3.3 m, so it was not over-confident, it was pessimistic. The entire correction came from the correlation term, measured at 0.63 rising to 0.985, an effective-sample factor of 5 rising past the 100 cap. That window went from 10.16 m of drift to **0.10 m**. Across all 11 windows: 3.49 m with neither measure, 1.64 m with process noise alone, **0.74 m** with both, helping in 8 and hurting in none.
+
+  The correlation term fires for an honest receiver too, and it should: an RTK unit correctly reporting 2 cm still has errors correlated over minutes, so a filter that parks for a minute and averages sixty of them is wrong about how much it knows even though every covariance it was handed was accurate. That is a general defect, not a bad-receiver defect. `filter_health` publishes what was measured (`gnss_parked_sigma_observed`, `_declared`, `_correlation`, `_inflation`), and `AnHonestReceiverEarnsNoInflation` pins the property that a white, correctly-declared receiver is left alone even with the cap set to 1000. Default is 1.0, which disables it.
+
+  **The cost is real:** a robot parked for a long time cannot re-acquire if it was genuinely lost before it stopped. For a stop of tens of seconds that does not matter; for one parked overnight it does. The evidence is dropped the moment the encoders report motion. Prompted, like `zupt.position_noise_scale`, by Martin Pecka's phase-lock explanation on ROS Discourse.
+
+### Fixed
+
+- **A filter that dead-reckoned through a GNSS outage now comes back.** This was
+  the single worst behaviour in the library and it took five separate defects to
+  clear. On NCLT 2012-06-15, aligned on the pre-blackout segment, error 300 s after
+  fixes returned went from **277 m to 13 m**. On a log with gaps of 275, 129, 65
+  and 55 s, error 300 s after the 129 s gap went from **746 m to 78 m**. On NCLT
+  2013-04-05, ATE went from 277.6 m to **189.7 m**, a 31.7% improvement reproduced
+  twice against two pre-fix runs.
+
+  The mechanism, in the order the pieces were found:
+
+  1. **The inflation had no size that could work.** After minutes of dead reckoning
+     the filter's error is far larger than its own `P`, so every returning fix looks
+     like a gross outlier to chi2 and is rejected forever. The inflation is now
+     sized from the rejected innovation itself, because the innovation *is* the
+     measurement of how far off the filter is and no fixed constant brackets
+     arbitrary drift. `gnss.p_inflate_sigma` is now a floor rather than the value.
+  2. **Only chi2 could arm it.** Recovery was decided inside the chi2 branch, so a
+     cascade that began at the continuity gate never armed it, which is most of
+     them. The decision moved to whichever gate rejects first. Closes #120.
+  3. **A 3-DOF gate cannot be opened by moving two of its axes.** The GNSS position
+     gate includes Z, so inflating only X and Y left it shut. The vertical term is
+     now sized from the vertical innovation.
+  4. **The gap test was in absolute seconds.** At 1 Hz the healthy spacing between
+     fixes *is* `gnss_coast_min_gap_s`, so an absolute 1.0 s test called every
+     single fix "after a gap" and the spike protection disappeared exactly where it
+     was needed. Measured against six rover logs all running a median 1.00 s with no
+     dropouts, and a 120 s sustained 300 m spike that was rejected 600 of 600 times
+     at 5 Hz dragged the filter 301 m off at 1 Hz. The threshold is now relative to
+     the receiver's own measured cadence.
+  5. **The continuity history was allowed to span the gap.** This was the one that
+     hid the rest. The history is also where the fix cadence is derived, so a buffer
+     spanning an outage produced a mean spacing of 115 s instead of 0.2. Everything
+     downstream inherited it: "have we just had an outage" became "was the gap longer
+     than 231 seconds", so every outage shorter than that stopped being recognised as
+     an outage at all and the recovery path never armed. The gate itself was healthy
+     by every measure you could take from outside: sensible rejection rate, rejecting
+     genuine outliers, threshold nowhere near unreachable. What was broken was a
+     statistic it exported to something else. The history now starts fresh whenever
+     the incoming fix is more than twice the buffer's own mean spacing away.
+
+  One accepted fix is also no longer enough to call an outage over. A fix landing
+  near a badly drifted estimate passes, corrects nothing, and used to disarm
+  recovery for the rest of the run: on one log, 1 accepted against 1999 rejected
+  and 690 m out. Recovery now stays armed until several fixes in a row are accepted.
+
+- **A GNSS blackout no longer disables spike rejection for the rest of the run.**
+  `post_outage_unconfirmed_` is a latch: the first rejection cascade following a real
+  gap sets it, and it should clear once several fixes in a row are accepted. The code
+  that cleared it sat inside `reset()`, eleven lines below the line zeroing its own
+  counter, so it never ran on an accepted fix and the latch never cleared. Every later
+  cascade then counted as "this follows a gap" even when the receiver had never left,
+  which unlocks the recovery inflation on a continuous outlier: exactly what
+  `gnss.coast_min_gap_s` exists to prevent, re-opened by an outage minutes earlier.
+
+  Measured on a blackout, clean recovery to 0.04 m, then a sustained 300 m offset with
+  the fix cadence never interrupted. Before, the filter rejected 15 and then accepted
+  the remaining **586 of 601**, ending **299.97 m** out, sitting on the spike. After,
+  it rejects **601 of 601** and ends 25.39 m out, which is dead reckoning for the 120 s
+  window. In plain terms: driving under a bridge used to disable the defence against
+  multipath off a building for the rest of that run. `BlackoutDoesNotUnlockRecoveryForALaterSpike`
+  pins it and fails by 299.97 m without the fix. Closes #132.
+
+- **No more inventing a DOP in order to gate on it, and no more blaming
+  `min_satellites` for rejections it did not cause.** When a driver supplies no DOP,
+  one was synthesised from the covariance and then compared against DOP thresholds,
+  which is comparing metres to a unitless ratio. Synthetic DOP is now marked as such
+  and skipped by the gate. Separately, any fix refused by `is_valid()` for a reason
+  with no specific branch was reported as `MIN_SATS`, which sent at least one
+  investigation in the wrong direction; a `QUALITY_OTHER` catch-all now says
+  honestly that the fix was refused and the reason is not one of the named ones.
+  Both reason values are appended, so no existing published code shifts.
+  Closes #123.
+
+- **The GPS track-heading turn guard is sampled at IMU rate**, not at fix rate,
+  because a turn that starts and finishes between two fixes was invisible to it.
+  The discard reason is now published rather than inferred. Closes #111, closes #112.
+
+- **The parked-motion straightness bar is 0.85, not 0.70.** Measured against real
+  parked windows, which reach 0.72, so the old value false-positived on a genuinely
+  stationary robot. Straightness is displacement divided by path length: a parked
+  receiver wanders and returns so its path length accumulates while its displacement
+  does not, measured at 0.37 to 0.72, while a robot actually going somewhere climbs
+  toward 1.0. Displacement alone cannot separate them, a parked window in these logs
+  reached 12.85 m of displacement.
+
+- **A turn inside the GPS track-heading baseline no longer collapses the yaw covariance.** Contributed by Ignacio Villanua (#109), found on a real UGV running low-rate GPS with noisy IMU and encoders.
+
+  Two yaw-rate gates already existed and neither closed this hole. One stops distance ACCUMULATING while turning; the other stops heading FUSING when the yaw rate is high at the instant of the fix. Between them a robot can drive straight, turn, then drive straight again, and fuse on the third leg while the reference position is still from before the turn. `atan2(dy, dx)` then returns the chord across an L-shaped path rather than the heading of either leg.
+
+  The damage comes from `sigma_hdg = sigma_xy / baseline`: a long baseline makes that wrong bearing look extremely confident, so the filter's own yaw covariance collapses onto it. Confidently wrong, which is the worst failure mode this project has.
+
+  A turn anywhere in the window now discards it and restarts the baseline from the current fix. The detection sits before the `MIN_STEP` early return deliberately, because an in-place spin barely moves the antenna and gating it on distance would miss the case it exists to catch.
+
+  Follow-up on merge: the new flag is also cleared in `init()` and `reset()`, alongside the heading state it belongs with, and `TurnInsideTheBaselineDiscardsTheWindow` pins it.
+
+- **`gnss.enabled`: a master switch for GNSS.** Contributed by Ignacio Villanua (#110). Defaults to `true`, so nothing changes for anyone. Set it false and no GNSS subscription is created at all, which lets the same stack run indoors without binding to absent topics or logging about fixes that will never arrive.
+
+  Follow-up on merge: the sensor-wait no longer expects a GNSS fix when the switch is off (otherwise an indoor robot blocked for the full timeout on the exact case the feature exists for), and the GNSS Doppler velocity input is covered by the same switch.
+
+- **The filter now notices when its wheel odometry has died mid-run.** ZUPT fires on near-zero encoder velocity, and encoders that lose power report ZERO rather than going silent, which is indistinguishable from a parked robot. With `zupt.position_noise_scale` and `zupt.gnss_noise_scale` enabled that became far worse than it used to be: the filter holds its position covariance down AND distrusts GNSS by up to the cap, so the robot drives away while the estimate sits still, actively ignoring the GPS telling it otherwise. Enabling the idle-drift work turned a sensor dropout into a frozen pose.
+
+  Not hypothetical: on the development rover all four encoders share one breadboard power rail, and it worked loose on 2026-09-11, taking out every wheel at once.
+
+  **Displacement cannot tell the two apart.** A genuinely parked receiver wandered 12.85 m over 57 seconds on the 2026-09-07 log, so any distance threshold that catches a driving robot also fires on real wander. The discriminator is STRAIGHTNESS, net displacement divided by the path length through the fixes: a parked receiver wanders and returns, measured at 0.37 on that same window, while a robot actually driving goes one way and approaches 1.0.
+
+  ```yaml
+  zupt.parked_motion_m: 5.0              # metres of displacement before it can fire, 0 disables
+  zupt.parked_motion_straightness: 0.85  # above this, the displacement is real motion
+  ```
+
+  The 0.85 is measured, not chosen. Checked against three genuinely parked windows in the 2026-09 rover logs, the worst straightness reached at any point past the distance threshold was 0.59, 0.00 and **0.72**. A first attempt at 0.70 fired on that third window, which would have disabled the idle-drift fix on a robot sitting still. A receiver whose error drifts one way under changing satellite geometry looks considerably straighter than intuition suggests.
+
+  When it fires, ZUPT and the parked GNSS suppression are both disabled for the rest of the run and the node logs an error naming the encoder power rail. Disabling ZUPT as well as the suppression is the part that matters: releasing the covariance alone still left ZUPT pinning velocity to zero and fighting the GNSS, which recovered only 7.4 m of a 20 m drive in test. `zupt_parked_but_moving` and `zupt_parked_straightness` are on `filter_health` so a bag shows it.
+
+  Two tests pin both directions: a dead-encoder robot must be caught and must keep tracking GNSS, and a genuinely wandering parked receiver must NOT trip it, since a false positive would disable the idle-drift fix on exactly the runs it exists for.
+
+- **`encoder2.channels`: a secondary twist source can say which channels it actually measures.** A `Twist` message always carries all three of vx, vy and wz, so a source that fills only some of them publishes a zero for the rest. By the time it reaches the callback, that zero is indistinguishable from a measured zero.
+
+  Reported as #107. The PMW3901 optical flow driver never assigns `angular.z`, so it publishes 0.0 on every message and leaves `twist.covariance` at zero. FusionCore fell back to `encoder2.yaw_noise`, whose default is 0.02, so every optical flow sample arrived as a confident "the robot is not rotating right now", roughly 1.1 deg/s of claimed uncertainty, competing with the gyro and the wheel encoder on every turn. The sensor cannot measure yaw rate at all. It reported a zero because the field is a zero, not because it looked.
+
+  ```yaml
+  encoder2.channels: ["vx", "vy"]     # default is all three, so nothing changes
+  ```
+
+  An omitted channel is not fused. The implementation substitutes what the measurement function would predict for it, which makes that channel's innovation exactly zero, so it contributes nothing whatever the gain works out to. Inflating the variance alone would leave a small residual pull toward whatever the message contained, and for an unfilled field that is 0.0. The yaw channel needs the encoder WZ bias added to the prediction, since `encoder_measurement_function` maps it to `WZ + B_EWZ`, and bare `WZ` would leave an innovation of `-B_EWZ` instead of zero.
+
+  Unknown channel names warn rather than fail, and an empty list warns that nothing from that topic will be fused. Same reasoning applies to `encoder`, `imu2` and the radar velocity input, tracked in #108.
+
+- **FusionCore now says something when it is left unconfigured.** It is a lifecycle node, so launching it the way every non-lifecycle ROS node is launched, a plain `Node(...)` in your own launch file or a bare `ros2 run`, leaves it UNCONFIGURED forever: no subscriptions, no publishers, no TF, and not one line of log after `FusionCore node created`. It looks exactly like a node that started cleanly. `autostart` does not save you, because it only covers configure to activate and nothing in the node triggers the configure.
+
+  This is not hypothetical. A public robot repository was found running FusionCore from a hand-written launch file with a plain `Node` and no transitions, in a directory since renamed `OLD_NOT-IN-USE`. Silence is indistinguishable from a broken filter, and the user has no way to tell which they have.
+
+  After 10 seconds in the unconfigured state the node now warns once and names all three fixes: the shipped launch file, a `LifecycleNode` with the transitions emitted, or `ros2 lifecycle set <node> configure` by hand. Ten seconds rather than one because a lifecycle manager legitimately takes time, and the message says to ignore it if one is about to configure the node. It is cancelled the moment `on_configure` runs, so a correctly launched node never prints it.
+
+- **A GNSS fix carrying NaN or infinity is rejected before any other gate sees it.** There is no recovery from this one: a NaN reaching the state or the covariance propagates through the sigma points on the next predict, and every value the filter reports afterwards is NaN for the rest of the run.
+
+  The subtle part is that a NaN does not fail the other gates, it passes them. Every comparison against a NaN is false, so `sigma_xy > max_sigma_xy` is false for a NaN sigma exactly as it is for a good one. A finiteness check placed anywhere but first would therefore never fire, which is where it now sits. Seen on a 2026-09-05 rover log: 17 of 246 fixes carried NaN latitude and longitude. All 17 also had status -1 so `min_fix_type` happened to stop them, but that was the driver being tidy rather than the filter being safe. New rejection reason `NOT_FINITE`, appended so no existing published value shifts.
+
+- **A GNSS spike small enough to pass `gnss.continuity_max_m` no longer gets the NEXT good fix rejected.** The gate shipped in 0.3.9 predicted the next fix by extrapolating from the last two, `px = x1 + (x1 - x2) * r`. That puts an error in the newest reference point into the prediction multiplied by about two, so a spike that passed the limit threw the following good fix over it: the gate kept the bad sample and discarded the good one, which is worse than not gating at all. Measured on a 2026-09-07 rover log at a 3 m limit, a 1.5 m injected spike was accepted and the good fix after it was rejected, while the rejection count read 1, exactly what a log with one spike in it should look like.
+
+  The prediction now comes from a least-squares line over the last five accepted fixes. The weight on the newest point is 0.8 rather than 2.0, so a spike that passes the limit can only move the next prediction by 0.8 of itself and can never reach the limit, at any threshold. That is arithmetic rather than tuning. Affects anyone who set `gnss.continuity_max_m` above zero; the default of 0.0 disables the gate entirely.
+
+  The stiffer predictor costs a little through turns, so re-check the threshold against your own data. Measured across 1287 fixes from six rover logs: median residual 0.18 to 0.59 m, p99 0.95 to 3.00 m, largest 3.81 m. At 4.0 there were no rejections on clean data and every injected spike from 4 m up was caught, always the spike itself rather than its neighbour. At 3.0 it discarded 4 good fixes.
+
+- **One undecodable topic no longer costs you the whole bag.** CDR is not self-describing, so adding a field to a message makes every older recording of it fail to deserialise. `FilterHealth` has gained fields three times, most recently in 96d0207, which meant `tools/nis_from_bag.py` reported field bags recorded days earlier as `could not be read` and the NIS numbers went with them, even though those live on `GnssStatus` and were perfectly intact. Losing an old field is annoying; losing the analysis of a field run you cannot repeat is not.
+
+  The reader now deserialises per message, drops a topic that consistently fails, and says which one and why. `analyze()` reports it as `unreadable_topics`, so the `--json` output carries it too. A run recorded before this change reads cleanly again, with a note naming the skipped topic, and still produces every number that does not depend on it.
 
 ## [0.3.9]: 2026-09-08
 
