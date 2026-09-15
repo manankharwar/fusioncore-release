@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <cmath>
+#include <limits>
 #include "fusioncore/ukf.hpp"
 #include "fusioncore/state.hpp"
 #include "fusioncore/sensors/gnss.hpp"
@@ -789,6 +790,121 @@ TEST(GNSSTest, ContinuityAcceptsOrdinaryFixToFixNoise) {
   EXPECT_FALSE(continuity_rejects(2.0, 3.0));
 }
 
+// ─── A spike small enough to pass must not take the next fix down with it ───
+//
+// This is the defect the least-squares predictor exists to fix. With the old
+// two-point extrapolation px = x1 + (x1 - x2) * r, an error in the newest
+// reference point reached the prediction multiplied by about two, so a spike
+// that passed the limit threw the FOLLOWING good fix over it. Measured on the
+// 2026-09-07 rover log at a 3 m limit: a 1.5 m spike was accepted and the good
+// fix after it was rejected instead, which is worse than not gating at all,
+// because you keep the bad sample and throw away the good one.
+//
+// Over five points the weight on the newest is 0.8, so a spike that passes the
+// limit can only move the next prediction by 0.8 of itself and can never reach
+// the limit. That holds for any threshold, which is why this is arithmetic
+// rather than tuning.
+TEST(GNSSTest, SubThresholdSpikeDoesNotGetTheNextFixRejected) {
+  for (double spike : {0.5, 1.0, 1.5, 2.0, 2.5, 2.9}) {
+    FusionCoreConfig cfg;
+    cfg.outlier_rejection = true;
+    cfg.gnss.continuity_max_m = 3.0;
+    cfg.gnss_max_speed = 0.0;
+    FusionCore fc(cfg);
+    State s0;
+    fc.init(s0, 0.0);
+
+    double t = 0.0, x = 0.0;
+    auto feed = [&](double ex) {
+      sensors::GnssFix f;
+      f.x = ex; f.y = 0.0; f.z = 0.0;
+      f.sigma_xy = f.sigma_z = 3.24;
+      f.hdop = f.vdop = 3.24;
+      f.fix_type = sensors::GnssFixType::RTK_FLOAT;
+      f.satellites = 12;
+      return fc.update_gnss(t, f);
+    };
+
+    for (int i = 0; i < 10; ++i) { t += 1.0; x += 0.4; feed(x); }
+
+    t += 1.0; x += 0.4;
+    EXPECT_TRUE(feed(x + spike))
+      << "a " << spike << " m offset is under the 3 m limit and must be accepted";
+
+    // The good fix that follows. This is the one the old predictor threw away.
+    t += 1.0; x += 0.4;
+    EXPECT_TRUE(feed(x))
+      << "the good fix after a " << spike << " m spike was REJECTED: the gate "
+         "kept the bad sample and discarded the good one";
+  }
+}
+
+// ─── The gate must reject the spike itself, not its neighbour ───────────────
+TEST(GNSSTest, ContinuityRejectsTheSpikeAndThenRecovers) {
+  FusionCoreConfig cfg;
+  cfg.outlier_rejection = true;
+  cfg.gnss.continuity_max_m = 3.0;
+  cfg.gnss_max_speed = 0.0;
+  FusionCore fc(cfg);
+  State s0;
+  fc.init(s0, 0.0);
+
+  double t = 0.0, x = 0.0;
+  auto feed = [&](double ex) {
+    sensors::GnssFix f;
+    f.x = ex; f.y = 0.0; f.z = 0.0;
+    f.sigma_xy = f.sigma_z = 3.24;
+    f.hdop = f.vdop = 3.24;
+    f.fix_type = sensors::GnssFixType::RTK_FLOAT;
+    f.satellites = 12;
+    return fc.update_gnss(t, f);
+  };
+  for (int i = 0; i < 10; ++i) { t += 1.0; x += 0.4; feed(x); }
+
+  t += 1.0; x += 0.4;
+  EXPECT_FALSE(feed(x + 30.0)) << "a 30 m spike must be rejected";
+
+  // A rejected fix never enters the history, so the next good one is judged
+  // against clean references and must come straight back.
+  for (int i = 0; i < 3; ++i) {
+    t += 1.0; x += 0.4;
+    EXPECT_TRUE(feed(x)) << "good fix " << i << " after the spike was rejected";
+  }
+}
+
+TEST(GNSSTest, ContinuityNeedsAFullHistoryBeforeItJudges) {
+  // Five accepted fixes are needed before the fit means anything. Until then the
+  // gate must stay out of the way rather than guess from two points.
+  FusionCoreConfig cfg;
+  cfg.outlier_rejection = true;
+  cfg.gnss.continuity_max_m = 3.0;
+  cfg.gnss_max_speed = 0.0;
+  FusionCore fc(cfg);
+  State s0;
+  fc.init(s0, 0.0);
+  double t = 0.0;
+  auto feed = [&](double ex) {
+    sensors::GnssFix f;
+    f.x = ex; f.y = 0.0; f.z = 0.0;
+    f.sigma_xy = f.sigma_z = 3.24;
+    f.hdop = f.vdop = 3.24;
+    f.fix_type = sensors::GnssFixType::RTK_FLOAT;
+    f.satellites = 12;
+    return fc.update_gnss(t, f);
+  };
+  double x = 0.0;
+  for (int i = 0; i < 4; ++i) { t += 1.0; x += 0.4; EXPECT_TRUE(feed(x)); }
+  t += 1.0;
+  feed(x + 50.0);
+  // Whatever happens to this fix, continuity must not be the gate that decided
+  // it. With four points there is no fit yet, so the question is not answerable
+  // and guessing from a shorter history is what caused the defect above. chi2 is
+  // free to reject it on its own terms, and here it does.
+  EXPECT_NE(fc.get_status().gnss_last_rejection_reason,
+            GnssRejectionReason::CONTINUITY_BREAK)
+    << "continuity judged a fix before it had a full history to judge against";
+}
+
 TEST(GNSSTest, ContinuityIgnoresUnevenlySpacedFixes) {
   // Across a gap the second difference is legitimately large, and rejecting the
   // first fix after an outage is exactly the failure gnss_coast_min_gap_s exists
@@ -814,4 +930,227 @@ TEST(GNSSTest, ContinuityIgnoresUnevenlySpacedFixes) {
   feed(2.0, 0.8);
   EXPECT_TRUE(feed(10.0, 4.0))
       << "a fix after an 8 s gap must not be rejected for breaking continuity";
+}
+
+// ─── A fix carrying NaN must never reach the filter ─────────────────────────
+//
+// This one is worth a test out of proportion to how often it happens, because
+// there is no recovery. A NaN in the state or the covariance propagates through
+// the sigma points on the next predict, and every value the filter reports for
+// the rest of the run is NaN. There is no gate downstream that catches it and
+// no way back short of a reset.
+//
+// The subtle part is that a NaN does not fail the other gates, it passes them.
+// Every comparison against a NaN is false, so `sigma_xy > max_sigma_xy` is false
+// for a NaN sigma exactly as it is for a good one. Checking finiteness last
+// would therefore never fire, which is why is_valid() checks it first.
+TEST(GNSSTest, NonFiniteFixIsRejectedAndNamed) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+
+  for (int field = 0; field < 5; ++field) {
+    FusionCoreConfig cfg;
+    cfg.outlier_rejection = true;
+    cfg.gnss_max_speed = 0.0;
+    FusionCore fc(cfg);
+    State s0;
+    fc.init(s0, 0.0);
+
+    // A fix that is otherwise entirely acceptable.
+    sensors::GnssFix f;
+    f.x = 1.0; f.y = 2.0; f.z = 0.0;
+    f.sigma_xy = f.sigma_z = 1.0;
+    f.hdop = f.vdop = 1.0;
+    f.fix_type = sensors::GnssFixType::RTK_FIXED;
+    f.satellites = 12;
+
+    switch (field) {
+      case 0: f.x = nan; break;
+      case 1: f.y = inf; break;
+      case 2: f.z = nan; break;
+      case 3: f.sigma_xy = nan; break;
+      case 4: f.hdop = nan; break;
+    }
+
+    EXPECT_FALSE(fc.update_gnss(1.0, f)) << "non-finite field " << field
+        << " was accepted; a NaN reaching the state is unrecoverable";
+    EXPECT_EQ(fc.get_status().gnss_last_rejection_reason,
+              GnssRejectionReason::NOT_FINITE)
+        << "field " << field << " was rejected but blamed on the wrong gate, "
+           "which sends people tuning a parameter that was never involved";
+
+    // And the filter must still be usable afterwards.
+    EXPECT_TRUE(std::isfinite(fc.get_state().x[X]));
+    EXPECT_TRUE(std::isfinite(fc.get_state().P(X, X)));
+  }
+}
+
+TEST(GNSSTest, AnOrdinaryFixIsStillAccepted) {
+  // The guard runs on every fix, so pin that it lets a good one through.
+  FusionCoreConfig cfg;
+  cfg.outlier_rejection = true;
+  cfg.gnss_max_speed = 0.0;
+  FusionCore fc(cfg);
+  State s0;
+  fc.init(s0, 0.0);
+  sensors::GnssFix f;
+  f.x = 1.0; f.y = 2.0; f.z = 0.0;
+  f.sigma_xy = f.sigma_z = 1.0;
+  f.hdop = f.vdop = 1.0;
+  f.fix_type = sensors::GnssFixType::RTK_FIXED;
+  f.satellites = 12;
+  EXPECT_TRUE(fc.update_gnss(1.0, f));
+}
+
+// ─── A turn inside the heading baseline must invalidate it (#109) ────────────
+//
+// Contributed by Ignacio Villanua, who found it on a real UGV. Two yaw-rate
+// gates already existed and neither closed this hole: one stops distance
+// ACCUMULATING while turning, the other stops heading FUSING if the yaw rate is
+// high at the instant of the fix. Between them, a robot can drive straight,
+// turn, then drive straight again and fuse on the third leg while the reference
+// position is still from before the turn. atan2 then returns the chord across
+// an L-shaped path rather than the heading.
+//
+// The sting is sigma_hdg = sigma_xy / baseline: a long baseline makes that wrong
+// bearing look extremely confident, so the filter's yaw covariance collapses
+// onto it. Confidently wrong, which is the worst failure this project has.
+TEST(GNSSTest, TurnInsideTheBaselineDiscardsTheWindow) {
+  FusionCoreConfig cfg;
+  cfg.imu_has_magnetometer = false;
+  cfg.motion_model = create_motion_model("DifferentialDrive");
+  cfg.gps_track_heading_max_yaw_rate = 0.3;
+  cfg.gps_track_heading_min_dist     = 5.0;
+  FusionCore fc(cfg);
+  State s0; fc.init(s0, 0.0);
+
+  // Leg one, straight and long enough to build a baseline on its own.
+  drive_arc(fc, 12.0, 1.0, 0.0, /*with_orientation=*/false);
+  // A hard turn. Neither existing gate resets the reference position.
+  drive_arc(fc,  4.0, 1.0, 0.8, /*with_orientation=*/false);
+  // Leg two, straight again, so the instantaneous yaw rate is back under the
+  // limit and the old gates would happily fuse.
+  drive_arc(fc, 12.0, 1.0, 0.0, /*with_orientation=*/false);
+
+  // What it must NOT do is fuse a bearing measured across the corner.
+  const auto d = fc.get_gnss_debug();
+  if (d.track_heading_state == TrackHeadingState::FUSED) {
+    // If it did fuse, the baseline must have been rebuilt AFTER the turn, not
+    // span it. A window spanning the corner shows up as a bearing tens of
+    // degrees from the true heading of either leg.
+    EXPECT_LT(std::abs(d.track_heading_sigma_rad), 1.0)
+      << "fused a heading across a turn with sigma " << d.track_heading_sigma_rad;
+  }
+  SUCCEED() << "track heading state after the corner: "
+            << static_cast<int>(d.track_heading_state);
+}
+
+// A turn that begins and ends between two GNSS fixes.
+//
+// #109 added a guard that discards the track-heading window when the robot turns
+// inside it, but the yaw rate was only inspected from update_distance_traveled(),
+// which on a GNSS-only robot runs once per fix. At 1 Hz a corner taken inside the
+// gap was never seen, and the bearing was measured across it: the reference did
+// not reset, so the baseline kept growing straight through the turn.
+TEST(GNSSTest, TurnBetweenTwoFixesIsStillCaught) {
+  FusionCoreConfig cfg;
+  cfg.imu_has_magnetometer = false;
+  cfg.motion_model = create_motion_model("DifferentialDrive");
+  cfg.gps_track_heading_max_yaw_rate = 0.3;
+  cfg.gps_track_heading_min_dist     = 5.0;
+  FusionCore fc(cfg);
+  State s0; fc.init(s0, 0.0);
+
+  const double dt = 0.01, g = 9.80665;
+  double t = 0.0, x = 0.0, y = 0.0, yaw = 0.0;
+  double baseline_before = 0.0, baseline_after = 0.0, max_state_wz = 0.0;
+  TrackHeadingState state_after = TrackHeadingState::NOT_ATTEMPTED;
+
+  // Fixes land on the second. The corner runs from t=12.0 to t=12.6, entirely
+  // inside the gap between the fixes at t=12 and t=13.
+  for (int i = 0; i < 1800; ++i) {
+    t += dt;
+    const double wz = (t > 12.0 && t <= 12.6) ? 0.8 : 0.0;
+    yaw += wz * dt;
+    x += std::cos(yaw) * dt;
+    y += std::sin(yaw) * dt;
+    fc.update_imu(t, 0, 0, wz, 0, 0, g);
+    if (i % 2 == 0) fc.update_encoder(t, 1.0, 0.0, wz);
+    if (wz != 0.0) max_state_wz = std::max(max_state_wz, std::abs(fc.get_state().x[WZ]));
+    if (static_cast<int>(std::round(t * 100)) % 100 == 0) {
+      GnssFix f;
+      f.x = x; f.y = y; f.z = 0.0;
+      f.hdop = f.sigma_xy = 2.0;
+      f.vdop = f.sigma_z  = 3.0;
+      f.satellites = 10;
+      f.fix_type = GnssFixType::GPS_FIX;
+      fc.update_gnss(t, f);
+      const double b = fc.get_gnss_debug().track_heading_baseline_m;
+      if (std::abs(t - 12.0) < 1e-6) baseline_before = b;
+      if (std::abs(t - 13.0) < 1e-6) {
+        baseline_after = b;
+        state_after    = fc.get_gnss_debug().track_heading_state;
+      }
+    }
+  }
+
+  // Truth turned 27.5 degrees inside that gap, so the window must be discarded
+  // rather than used to measure a bearing straight across the corner.
+  EXPECT_EQ(state_after, TrackHeadingState::WINDOW_HAD_TURN)
+      << "the corner was not detected (peak filtered |WZ| during it was "
+      << max_state_wz << " rad/s against a threshold of "
+      << cfg.gps_track_heading_max_yaw_rate << "), baseline went "
+      << baseline_before << " m to " << baseline_after << " m";
+}
+
+// A quality gate must not judge a number the wrapper invented.
+//
+// #123: a NavSatFix with position_covariance_type 0 carries no uncertainty, so
+// the wrapper substitutes hdop 1.5 / vdop 2.0. Gating on that constant has only
+// two possible behaviours, and neither is the one the parameter promises: above
+// it the gate never fires, at or below it the gate rejects every fix forever.
+TEST(GNSSTest, SyntheticDopIsNotGated) {
+  auto drive = [](bool synthetic, double max_hdop) {
+    FusionCoreConfig cfg;
+    cfg.imu_has_magnetometer = false;
+    cfg.motion_model = create_motion_model("DifferentialDrive");
+    cfg.gnss.max_hdop = max_hdop;
+    FusionCore fc(cfg);
+    State s0; fc.init(s0, 0.0);
+
+    const double dt = 0.01, g = 9.80665;
+    int accepted = 0, rejected_hdop = 0;
+    for (int step = 1; step * dt <= 12.0 + 1e-9; ++step) {
+      const double t = step * dt;
+      fc.update_imu(t, 0, 0, 0, 0, 0, g);
+      if (step % 2 == 0) fc.update_encoder(t, 1.0, 0.0, 0.0);
+      if (step % 20 == 0) {
+        GnssFix f;
+        f.x = 1.0 * t; f.y = 0.0; f.z = 0.0;
+        f.hdop = 1.5; f.vdop = 2.0;        // the wrapper's invented values
+        f.dop_is_synthetic = synthetic;
+        f.satellites = 12;
+        f.fix_type = GnssFixType::GPS_FIX;
+        fc.update_gnss(t, f);
+        const auto d = fc.get_gnss_debug();
+        if (d.accepted) ++accepted;
+        else if (d.reason == GnssRejectionReason::HDOP_HIGH) ++rejected_hdop;
+
+
+      }
+    }
+    return std::make_pair(accepted, rejected_hdop);
+  };
+
+  // A threshold below the invented value used to reject everything, forever.
+  const auto strict_real      = drive(false, 1.0);
+  const auto strict_synthetic = drive(true,  1.0);
+
+  EXPECT_GT(strict_real.second, 0)
+      << "sanity: a REPORTED hdop of 1.5 against a 1.0 limit must be rejected";
+  EXPECT_EQ(strict_synthetic.second, 0)
+      << "an invented hdop was gated: " << strict_synthetic.second
+      << " fixes rejected as HDOP_HIGH against a constant nobody measured";
+  EXPECT_GT(strict_synthetic.first, 0)
+      << "no fix survived, so the filter is dead reckoning on a config typo";
 }
