@@ -259,21 +259,28 @@ fusioncore:
     # R_imu[WZ,WZ] multiplier in coast mode. Makes IMU heading rate less trusted
     # so encoder WZ dominates. 1.0 = disabled. 500.0 typical for long blackouts.
 
-    gnss.recovery_rejection_n: 0
-    # After this many consecutive rejections, inflate P[x,x] and P[y,y] directly.
-    # Fires once per cascade. Must be > gnss.coast_n. 0 = disabled. Typical: 15.
+    gnss.recovery_rejection_n: 15
+    # After this many consecutive rejections that follow a GNSS gap, inflate
+    # P[x,x] and P[y,y] so the next fix passes chi2 and corrects through a normal
+    # update. This is what lets the filter come back after a blackout long enough
+    # that its own drift makes every returning fix look like an outlier. It is
+    # gap-gated: a continuous spike cannot trigger it. Must be > gnss.coast_n.
+    # 0 = disabled.
 
     gnss.p_inflate_sigma: 50.0
-    # XY sigma used for the P inflation above (meters). Only used when
-    # gnss.recovery_rejection_n > 0.
+    # Floor for that inflation (metres of XY sigma). The inflation is sized from
+    # the rejected innovation, so this is only a lower bound. A fixed value cannot
+    # work for both a 60 s outage and an eight minute one.
 
     gnss.recovery_timeout_s: 0.0
-    # GPS absence (seconds) before entering position-injection recovery mode, which
-    # bypasses chi2 for the first returning fix. Useful only when blackouts are very
-    # long (>200s) AND GPS outliers are not a concern at that location.
-    # 0.0 = disabled (chi2 always active, recommended). Must be >= coast_timeout_s.
 
-    # ── GPS track heading fusion ──────────────────────────────────────────────
+    # DEPRECATED and inert. The filter never read this parameter, and the
+
+    # position-injection recovery its old description promised does not exist.
+
+    # It is still declared so existing configs load, and the node warns if you
+
+    # set it. Post-blackout recovery is gnss.recovery_rejection_n.
     gnss.track_heading_enabled: true
     # Fuses GPS displacement bearing as a yaw pseudo-measurement whenever the
     # robot has moved gnss.track_heading_min_dist meters since the last fusion.
@@ -296,6 +303,15 @@ fusioncore:
     # Maximum yaw rate (rad/s) for displacement steps to count. During fast turns
     # the bearing changes too quickly for a reliable heading measurement.
     # Decrease for robots that make tight turns at slow speed.
+
+    gnss.gps_track_heading_cross_check_deg: 15.0
+    # Reject a GPS track heading that disagrees with the current heading estimate
+    # by more than this, measured as the median of recent disagreements rather
+    # than a single sample so one bad bearing cannot veto a good source. Course
+    # over ground is not body heading: on any curved path the two differ by a real
+    # bias, and a biased measurement pulls the estimate wrong however honest its
+    # covariance is. This is the guard against fusing that bias for a whole run.
+    # Set to 0 to disable the cross-check.
 
     # ── Lever arm heading gating ──────────────────────────────────────────────
     gnss.lever_arm_max_heading_sigma_deg: 20.0
@@ -358,6 +374,19 @@ fusioncore:
     # precisely to catch what a coast-inflated chi2 lets through.
 
     gnss.continuity_max_m: 0.0
+
+
+    gnss.continuity_auto: true
+
+    # When continuity_max_m is 0, measure the threshold from the receiver's own
+
+    # fix-to-fix scatter instead of leaving the gate off. The filter watches the
+
+    # first 200 admissible fixes, takes the largest prediction residual, and uses
+
+    # 1.5x that, clamped to [2, 25] m. It logs and publishes what it chose. An
+
+    # explicit continuity_max_m always wins and skips learning.
     # Rejects a fix that disagrees with the two accepted fixes before it, by more
     # than this many metres. 0.0 = disabled. This is the gate that can actually
     # see a small GPS spike.
@@ -490,6 +519,189 @@ fusioncore:
 ```
 
 ---
+
+## Nominal IMU dt: not trusting timestamps you cannot trust
+
+Anything downstream of an integrator amplifies timestamp error. On one recorded
+run, shifting **every IMU stamp by a single microsecond** and changing nothing
+else moved final yaw by **109 degrees**, and across a 120 s GNSS outage moved
+final position by 50.6 m. Most of that is an unbounded quaternion covariance
+rather than the stamps themselves, but the sensitivity is real.
+
+```yaml
+imu.fixed_rate_hz: 0.0    # 0 = derive dt from stamps (default). Above 0,
+                          # propagate by exactly 1/rate instead.
+```
+
+Set to your IMU's real rate and the propagation step no longer depends on stamp
+jitter at all. This is what Martin Pecka's team does: they never compute dt in
+fusion from IMU timestamps, they assume the configured rate.
+
+**Only set a rate you have measured.** A wrong rate is a *systematic* error, not
+a noisy one: the filter integrates the wrong amount of time on every single
+step, and it does not average out. A BNO085 nominally at 100 Hz has been logged
+running at 103 and 109.
+
+FusionCore watches for this. It measures the real arrival rate from the raw
+stamps and sets `imu_fixed_rate_mismatch` in the status when the two differ by
+more than 2%. There is a second, more visible symptom: because the filter clock
+advances at the nominal rate while stamps advance at the real one, the two
+separate at exactly the rate error, and once that exceeds
+`max_measurement_delay` the stale-skew guard **starts rejecting your IMU**. If
+you enable this and your IMU begins getting rejected, the rate is wrong.
+
+## Stopping a parked robot chasing its GPS
+
+When the wheels report zero velocity, FusionCore fuses a zero-velocity update
+(ZUPT). That pins **velocity**, and says nothing about **position**.
+
+The consequence is easy to miss. Position process noise keeps growing between
+fixes even though the robot is not moving, so the covariance stays large, the
+Kalman gain stays high, and every incoming fix drags the estimate. A receiver
+that wanders while parked takes the estimate with it.
+
+Measured on a u-blox M9N, parked for 57 seconds with wheel encoders confirming
+the robot was stationary: **the receiver's reported position moved 9.76 m and
+the fused position followed it for 10.16 m.** The robot did not move at all.
+
+```yaml
+zupt.velocity_threshold: 0.05      # m/s below which the robot counts as still
+zupt.angular_threshold: 0.05       # rad/s, same
+zupt.noise_sigma: 0.01             # m/s: how tightly to believe "not moving"
+zupt.position_noise_scale: 1.0     # scale on POSITION process noise while still
+zupt.accel_std_threshold: 0.5      # m/s^2: block ZUPT if the IMU disagrees
+```
+
+`zupt.accel_std_threshold` exists because wheels reporting zero is not the same
+thing as a stationary robot. An encoder that dies mid-run keeps publishing zero
+while the robot drives, ZUPT then pins velocity to zero and the filter spends the
+rest of the run refusing to let GNSS move it. On the run that found this, the
+estimate recovered about 7 m of 20 m actually driven.
+
+The accelerometer is the one sensor that cannot be fooled by a dead encoder, so
+the standard deviation of accelerometer magnitude over the last 100 samples is
+checked before ZUPT is allowed to fire. Measured on this project's rover:
+**1.69 to 2.25 m/s^2 while driving against 0.013 to 0.021 m/s^2 parked**, which
+is two orders of magnitude of separation, so the 0.5 default sits nowhere near
+either population. Set to 0 to disable the guard.
+
+A high-vibration platform running an isolated IMU mount may need this raised;
+`FusionCoreStatus::zupt_blocked_by_imu` says when the guard is the reason ZUPT
+is not firing, so check that before changing it.
+
+`zupt.position_noise_scale` is the one that fixes the drift. At 1.0 nothing
+changes. Below 1.0 the position covariance stops growing while the robot is
+known to be still, so it decays as fixes arrive, the gain falls, and consecutive
+fixes are **averaged** rather than followed. Measured at 0.001 across 11 parked
+windows from six field runs, mean excursion falls from 3.49 m to 1.64 m, loop
+closure over the whole run is unchanged within noise, and no additional fixes
+are rejected. The effect saturates below about 0.001, and it goes no further on
+its own: see the next section for why.
+
+It is deliberately **not** applied while GNSS coast mode is active. Coast
+inflation exists so the filter can re-admit GNSS after a blackout, and silently
+cancelling it here would change a behaviour this setting has nothing to do with.
+The scale is handed back as soon as the encoders report motion again.
+
+The default stays at 1.0 until this has been checked against the full NCLT
+regression suite. It is measured on one robot with one receiver, which is not
+enough to move a default.
+
+### Measuring the receiver while the robot is parked
+
+Suppressing process noise stops the covariance growing, but it does not fix the
+other half of the problem. A Kalman filter assumes measurement errors are white,
+so sixty parked fixes of a fixed point shrink its position uncertainty by about
+sqrt(60). GNSS error is not white over a minute: multipath, ionosphere and
+satellite geometry drift slowly, so consecutive fixes are largely the same error
+repeated. The filter ends up far more confident than the geometry supports, each
+fix keeps dragging the estimate, and it carries that over-confidence into the
+next leg of the run.
+
+Standing still is the one moment in a run where this is checkable, because every
+fix is then sampling the same physical point. `zupt.gnss_noise_scale` turns that
+into a correction:
+
+```yaml
+zupt.gnss_noise_scale: 1.0     # UPPER BOUND on the inflation; 1.0 disables it
+zupt.gnss_min_samples: 5       # parked fixes before the measurement is trusted
+```
+
+Two things are measured from the parked fixes, per axis:
+
+- **Magnitude.** Their spread is the receiver's real short-term sigma. Divided by
+  the sigma it declares and squared, a receiver that is as good as it claims
+  scores 1 and is left alone.
+- **Correlation.** The lag-1 autocorrelation `r` of those fixes. The honest
+  effective sample size is `N(1-r)/(1+r)`, so the measurement noise has to carry
+  a factor `(1+r)/(1-r)` for the filter's own posterior to mean what it says.
+
+The applied inflation is the product of the two, capped by
+`zupt.gnss_noise_scale`. So that number bounds how far one bad parked window can
+push the filter and does not decide the amount. Nothing here is tuned per
+environment or per receiver.
+
+The correlation term fires for an honest receiver too, and it should. An RTK unit
+correctly reporting a 2 cm sigma still has errors correlated over minutes, so a
+filter that parks for a minute and averages sixty of them is wrong about how much
+it knows. That is a general defect, not a bad-receiver defect.
+
+On the same 57-second parked window as above, with a receiver declaring 21 to 45 m
+of sigma while actually spreading 0.4 to 3.3 m, the magnitude term stayed at 1.0
+throughout: the receiver was not over-confident. The lag-1 autocorrelation
+measured 0.63 rising to 0.985, which is an inflation of 5x rising to the 100x cap,
+and it took that window's idle drift from 0.53 m to **0.10 m**. Across all 11
+windows the mean falls from 1.64 m to 0.74 m, helping in 8 and hurting in none.
+Whole-run loop closure was unchanged within noise.
+
+Watch what it actually measured on `filter_health`:
+
+```bash
+ros2 topic echo /fusioncore/filter_health --field gnss_parked_correlation
+```
+
+`gnss_parked_sigma_observed` and `_declared` report the magnitude side,
+`gnss_parked_correlation` the correlation side, and `gnss_parked_inflation` what
+was applied after the cap. All are -1 or 1.0 until a parked window has produced
+`zupt.gnss_min_samples` fixes.
+
+**The cost, and it is real.** A robot parked for a long time cannot re-acquire if
+it was genuinely lost before it stopped. For a stop of tens of seconds that does
+not matter. For one parked overnight it does. The evidence is dropped the moment
+the encoders report motion, so a robot that parks once does not stay
+over-confident for the rest of the run.
+
+## Secondary twist sources (`encoder2`)
+
+`encoder2.topic` accepts a second `nav_msgs/Odometry` source and fuses it through
+the same path as the wheel encoder. Typical uses are LiDAR odometry (KISS-ICP),
+a tracking camera, or an optical flow sensor.
+
+```yaml
+encoder2.topic: "/odom/flow"
+encoder2.vel_noise: 0.05
+encoder2.yaw_noise: 0.02
+encoder2.channels: ["vx", "vy"]     # default ["vx", "vy", "wz"]
+```
+
+**`encoder2.channels` matters more than it looks.** A `Twist` message always
+carries all three of vx, vy and wz, so a source that measures only some of them
+still publishes a number for the rest, and that number is 0.0. Once it reaches
+the filter there is nothing to distinguish it from a measured zero.
+
+The concrete case: the PMW3901 and PAA5100 optical flow drivers never assign
+`angular.z` and leave `twist.covariance` at zero. Without listing channels, the
+filter falls back to `encoder2.yaw_noise` and every sample arrives as a confident
+"the robot is not rotating", competing with the gyro on every turn. The sensor
+cannot measure yaw rate; it reported a zero because the field is a zero.
+
+List only what the sensor genuinely measures. Anything omitted is not fused at
+all, rather than fused with a large noise value.
+
+**Optical flow specifically:** the driver converts pixels to metres using a
+`z_height` parameter and the relationship is linear, so a sensor mounted at 0.25 m
+while the parameter is left at its 0.025 default reports every velocity 10x too
+small. Measure the real mount height.
 
 ## GNSS Doppler velocity bridge (ublox F9P / M8U)
 
