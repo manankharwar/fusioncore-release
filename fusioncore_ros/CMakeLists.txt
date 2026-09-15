@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fusioncore_ros VERSION 0.3.9)
+project(fusioncore_ros VERSION 0.4.0)
 
 # Default to Release when the caller has not chosen. A plain "colcon build" sets
 # no build type, which means no optimisation flags at all, and Eigen without
@@ -66,6 +66,12 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_gnss_dop_gate_warning tests/test_gnss_dop_gate_warning.cpp)
   target_include_directories(test_gnss_dop_gate_warning PRIVATE include)
+
+  ament_add_gtest(test_min_satellites_gate tests/test_min_satellites_gate.cpp)
+  target_include_directories(test_min_satellites_gate PRIVATE include)
+
+  ament_add_gtest(test_gnss_frame tests/test_gnss_frame.cpp)
+  target_include_directories(test_gnss_frame PRIVATE include)
 
   # Launches the real node and asserts /fromLL is advertised with the type
   # nav2_waypoint_follower binds. A different-but-identical type is invisible to
