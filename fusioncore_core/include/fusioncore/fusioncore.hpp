@@ -43,6 +43,26 @@ struct FusionCoreConfig {
   bool   gps_track_heading_enabled  = true;
   double gps_track_heading_min_dist = 5.0;   // meters
   double gps_track_heading_max_sigma = 0.4;  // radians
+  // Warn when the heading actually in use disagrees with the GPS track bearing
+  // by more than this many degrees, sustained over several straight segments.
+  //
+  // When an absolute heading source is present (dual antenna, magnetometer, or
+  // a 9-axis IMU's orientation) track heading correctly stands down: that source
+  // outranks it. Standing down SILENTLY is the problem. The track bearing is an
+  // independent measurement of where the robot actually went, so it is the one
+  // thing that can catch an absolute source which is confidently wrong, and the
+  // filter is already computing it.
+  //
+  // Issue #73, measured from a user's own log: a magnetometer heading 23 deg off
+  // true drove an entire waypoint mission into a dogleg on every leg. FusionCore
+  // reproduced that heading faithfully (within 1.6 deg of the IMU it was handed),
+  // its own position track disagreed with its own published yaw by a median 23.5
+  // deg across 20 straight segments, and nothing anywhere said so. The user found
+  // it by exporting a spreadsheet.
+  //
+  // This only ever warns. It does not override a heading source the config chose.
+  // 0 = disabled.
+  double gps_track_heading_cross_check_deg = 15.0;
 
   // Motion quality thresholds for GPS track heading observability.
   // A GPS displacement step only counts toward heading_observable_distance when:
@@ -166,6 +186,160 @@ struct FusionCoreConfig {
   // Noise sigma applied during ZUPT (m/s). Tight = filter strongly believes zero velocity.
   double zupt_noise_sigma = 0.01;
 
+  // Position process noise scale applied while ZUPT holds the robot stationary.
+  // 1.0 keeps the previous behaviour exactly; below 1.0 stops the position
+  // covariance growing while the wheels say the robot is not moving.
+  //
+  // ZUPT fuses [VX=0, VY=0, WZ=0]: it pins VELOCITY, and says nothing about
+  // position. So a parked robot's P kept growing from process noise between
+  // fixes, the Kalman gain stayed high, and the filter chased a wandering
+  // receiver. Measured on the 2026-09-07 bags: parked for 57 s with the
+  // encoders confirming stillness, the receiver's reported position moved
+  // 9.76 m and the fused position followed it for 7.18 m, i.e. 74% of pure
+  // GNSS wander on a robot that did not move at all.
+  //
+  // With process noise suppressed while stationary, P decays as fixes arrive
+  // instead of being held up, the gain falls, and consecutive fixes average
+  // rather than drag. Martin Pecka put the property well on ROS Discourse:
+  // a parked robot's estimate should not drift toward the GNSS mean.
+  double zupt_position_noise_scale = 1.0;
+
+  // UPPER BOUND on how much less to believe GNSS while the wheels say the robot
+  // is stationary. 1.0 disables it entirely and keeps the previous behaviour.
+  //
+  // This is a CAP on a MEASURED quantity, not a fixed policy, and the difference
+  // is the whole point. A fixed "always distrust GNSS 100x while parked" is
+  // right for one receiver in one place and wrong everywhere else, which is the
+  // same defect that has bitten every absolute-threshold GNSS gate in this
+  // project. Standing still is the one moment in a run where the filter can
+  // check a sensor against evidence instead of against a tuned constant,
+  // because every fix is then sampling the SAME physical point. Two things get
+  // measured from those fixes, per axis:
+  //
+  //   1. MAGNITUDE. Their spread is the receiver's real short-term sigma. Divide
+  //      by the sigma it declares and square: a receiver that is as good as it
+  //      claims scores 1 and is left alone.
+  //
+  //   2. CORRELATION, and this one is usually the larger of the two. A Kalman
+  //      filter assumes measurement errors are white, so N fixes of a fixed
+  //      point shrink its uncertainty like sqrt(N). GNSS error is not white:
+  //      multipath, ionosphere and satellite geometry drift over minutes, so
+  //      consecutive fixes are largely the same error repeated. Measure the
+  //      lag-1 autocorrelation r of the parked fixes and the honest effective
+  //      sample size is N(1-r)/(1+r), so R has to carry a factor (1+r)/(1-r) for
+  //      the filter's own posterior to mean what it says. At the 0.95 to 0.99
+  //      typical of a parked consumer receiver at 1 Hz, that alone is 39x to
+  //      199x, and it is why a hand-picked 100 happened to work.
+  //
+  // The applied inflation is the product, capped here. So this number bounds how
+  // far one bad parked window can push the filter and does NOT decide the
+  // amount, and there is nothing to retune per environment or per receiver.
+  //
+  // Note that (2) fires for an honest receiver too, and should: an RTK unit
+  // reporting a correct 2 cm sigma still has errors correlated over minutes, so
+  // a filter that parks for a minute and averages 60 of them ends up far more
+  // confident than the geometry supports, and carries that over-confidence into
+  // the next leg. That is a general defect, not a bad-receiver defect.
+  //
+  // Measured origin: on the 2026-09-07 bags the receiver's reported position
+  // moved 9.76 m over 57 parked seconds while declaring 3.6 m of accuracy.
+  // Suppressing position process noise alone (zupt_position_noise_scale) got the
+  // fused drift down from 10.16 m, but no further than 1.64 m mean across 11
+  // parked windows, because the filter still weighed that receiver by its own
+  // stated covariance.
+  //
+  // THE COST, and it is real: a robot parked for a long time cannot re-acquire
+  // if it was genuinely lost before it stopped. For a stop of tens of seconds
+  // that does not matter. For one parked overnight it does.
+  double zupt_gnss_noise_scale = 1.0;
+
+  // Parked fixes needed before their spread is treated as a measurement of the
+  // receiver's noise rather than as noise itself. Floored at 3 internally, since
+  // the autocorrelation term needs at least two consecutive pairs.
+  int zupt_gnss_min_samples = 5;
+
+  // Catch wheel odometry that has died while the robot is still driving.
+  //
+  // ZUPT fires when the encoders report near-zero velocity. Encoders that lose
+  // power do not go silent, they report ZERO, which is indistinguishable from a
+  // parked robot. The two settings above then make that far worse than it used
+  // to be: the filter holds its position covariance down AND distrusts GNSS by
+  // up to the cap, so the robot drives away while the estimate sits still,
+  // actively ignoring the GPS that is telling it otherwise. On this rover a
+  // loose breadboard power rail took out all four encoders at once, and that
+  // rail is shared, so it is a single point of failure.
+  //
+  // Displacement alone cannot tell the two apart: a genuinely parked receiver
+  // wandered 12.85 m over 57 s on the 2026-09-07 log. What separates them is
+  // STRAIGHTNESS, the ratio of net displacement to the path length through the
+  // fixes. A parked receiver wanders and returns, so its path is much longer
+  // than its displacement: measured 0.37 on that same window. A robot actually
+  // driving goes one way, so the two converge on 1.0.
+  //
+  // Metres of net displacement before the check can fire. 0.0 disables it.
+  // Only active while the ZUPT suppression above is doing something.
+  double zupt_parked_motion_m = 5.0;
+  // Straightness above which the displacement is real motion, not wander.
+  //
+  // 0.85, and the margin is measured rather than chosen. Across three genuinely
+  // parked windows on the 2026-09 rover logs the worst straightness reached, at
+  // any point where displacement exceeded the threshold above, was:
+  //     2026-09-07, 57 s, 12.85 m of wander   0.59
+  //     2026-09-05, 30 s,  2.70 m             0.00 (never reached 5 m)
+  //     2026-09-05, 27 s,  8.83 m             0.72   <- the one that matters
+  // A first attempt at 0.70 would have FIRED on that third window and disabled
+  // the idle-drift fix on a robot that was sitting still. A robot genuinely
+  // driving on dead encoders tracks close to 1.0, so 0.85 leaves room on both
+  // sides. Note the parked worst case is not small: a receiver whose error
+  // drifts one way under changing satellite geometry looks quite straight.
+  // Refuse ZUPT when the accelerometer says the robot is moving, however still
+  // the wheels claim to be. Standard deviation of accelerometer MAGNITUDE over
+  // the last second, in m/s^2. 0 disables the check.
+  //
+  // The wheels alone are not evidence of being stationary: they can skid, slip,
+  // or simply fail. Raised by Martin Pecka on ROS Discourse, and it had already
+  // cost a run here: an encoder died mid-drive and kept reporting zero, so the
+  // filter concluded parked, suppressed position noise, and then refused to let
+  // GNSS move the estimate. It recovered 7 m of the 20 m actually driven.
+  //
+  // A robot in motion vibrates and a parked one does not, and the gap is not
+  // subtle. Measured over 1 s windows across six 2026-09 rover logs:
+  //
+  //     genuinely driving    1.69, 1.90, 2.14, 2.25 m/s^2
+  //     stationary           0.013 to 0.021 m/s^2
+  //
+  // Default 0.5 is deliberately generous rather than centred: too HIGH only
+  // leaves today's behaviour, while too LOW would stop ZUPT firing at all and
+  // bring back the idle drift it exists to suppress. At 0.5 there is 25x margin
+  // above a parked rover and 3.4x below a driving one, which leaves room for a
+  // noisier IMU than this one. The measured value is published as
+  // zupt_accel_std so a user can pick their own from their own data.
+  //
+  // Honest limit: this is not a proof of stationarity. A robot at constant
+  // velocity on a very smooth surface has little angular rate and near zero net
+  // acceleration, so vibration is what gives it away and vibration is surface
+  // dependent. It is a large improvement on trusting the wheels, not a
+  // guarantee.
+  double zupt_accel_std_threshold = 0.5;
+  double zupt_parked_motion_straightness = 0.85;
+
+  // Nominal IMU rate in Hz. Above zero, the PREDICT step between IMU messages
+  // advances by exactly 1/rate instead of the gap between two stamps. Zero
+  // keeps the previous behaviour.
+  //
+  // Anything downstream that integrates amplifies stamp error: shifting every
+  // IMU stamp on one recorded run by a single MICROSECOND changed final yaw by
+  // 109 degrees. Most of that is an unbounded quaternion covariance rather than
+  // the stamps, but a nominal dt removes the input sensitivity entirely. Martin
+  // Pecka's team does exactly this, never computing dt in fusion from IMU
+  // timestamps.
+  //
+  // THE HAZARD, which is why FusionCoreStatus reports a mismatch: if the rate
+  // is wrong the filter integrates the wrong amount of time on EVERY step, and
+  // that error is systematic rather than noisy. A BNO085 nominally at 100 Hz
+  // was logged at 103 and 109. Only set a rate you have measured.
+  double imu_fixed_rate_hz = 0.0;
+
   // Does the IMU have a magnetometer (9-axis)?
   // true : IMU orientation includes magnetically-referenced yaw (BNO08x,
   //         VectorNav, Xsens). Orientation update validates heading.
@@ -174,13 +348,6 @@ struct FusionCoreConfig {
   //         Lever arm will not activate from IMU orientation alone.
   bool imu_has_magnetometer = false;
 
-  // Non-holonomic constraint: lateral velocity (VY) tightness.
-  // For differential drive robots, VY should be zero (robot can't move sideways).
-  // This is the sigma on that assertion (m/s): lower = harder constraint.
-  // Default 0.05 m/s matches encoder.vel_noise (previous hardcoded behavior).
-  // Increase to 10.0+ to effectively disable for mecanum/omnidirectional robots.
-  // Increase to 0.3-1.0 for Ackermann robots on slippery surfaces with lateral slip.
-  double encoder_nhc_vy_sigma = 0.05;
 
   // Non-holonomic constraint: body-frame vertical velocity (VZ) tightness.
   // For ground robots, VZ should be zero during steady locomotion.
@@ -244,26 +411,51 @@ struct FusionCoreConfig {
   // 0.0 = disabled; typical value: 30.0
   double gnss_coast_timeout_s = 0.0;
 
-  // Enter position-injection recovery mode only after a GPS absence longer than
-  // this many seconds. Recovery mode bypasses the chi2 gate for the first
-  // returning GPS fix, which is needed for very long blackouts (>100s) where
-  // dead-reckoning drift may exceed the chi2 acceptance range. For short
-  // blackouts (30-90s), the chi2 gate handles recovery correctly and recovery
-  // mode is counter-productive: it allows massive GPS outliers (bad multipath
-  // at the blackout boundary) to be injected unconditionally.
-  // 0.0 = enter recovery mode at the same time as coast mode (original behavior).
-  // Typical: 120.0 (2 minutes). Must be >= gnss_coast_timeout_s.
-  double gnss_recovery_timeout_s = 0.0;
 
-  // After this many consecutive chi2 rejections, inflate P[x,x] and P[y,y]
-  // directly so the next GPS fix passes the gate and corrects via a proper
-  // Bayesian update. This breaks the cascade where GPS is present but the
-  // filter has drifted far enough that all incoming fixes fail chi2.
-  // Fires exactly once per cascade (when counter first reaches this value).
-  // Must be > gnss_coast_n. 0 = disabled; typical value: 15.
-  int    gnss_recovery_rejection_n = 0;
-  // XY sigma for P inflation (meters). 50m covers any realistic drift from
-  // a chi2 cascade, allowing GPS to pull the filter back from up to ~100m off.
+  // After this many consecutive chi2 rejections that FOLLOW a GNSS gap, inflate
+  // P[x,x] and P[y,y] so the next fix passes the gate and corrects through a
+  // normal Bayesian update. This is what breaks the cascade where GNSS is
+  // present and healthy but the filter has dead-reckoned far enough that every
+  // incoming fix fails chi2, so the one measurement that would fix the drift is
+  // the one thing the filter refuses to look at.
+  //
+  // This used to default to 0, off. Measured cost of that default, on NCLT
+  // 2012-06-15 (issue #63) with the trajectories aligned on the pre-blackout
+  // segment: FusionCore tracks to 4.74 m median while GNSS is present, drifts to
+  // 397.7 m across a 461 s blackout, and is still 277.2 m out 300 s after fixes
+  // return at 5 Hz. robot_localization, same data, is back to 17.4 m within 30 s.
+  // Drifting more than a 2D filter during the blackout is the known cost of the
+  // 3D model. Never coming back afterwards was a separate defect, and it is the
+  // one that matters to a robot that drives under a bridge.
+  //
+  // Gap-gated: only a rejection sequence that STARTED after a GNSS gap can
+  // trigger it, so a continuous multipath spike cannot inflate P and talk its
+  // way in (see gnss_coast_min_gap_s, and SustainedSpikeStaysRejected).
+  // Must be > gnss_coast_n. 0 = disabled.
+  //
+  // THE TRADE, measured, not hypothesised. Believing a returning receiver means
+  // believing it when it is wrong too. OutlierClusterAtTheBlackoutBoundary drives
+  // the adversarial case: a blackout, then 20 s of self-consistent fixes offset
+  // 700 m (the shape of the NCLT 2012-08-20 cluster, issue #64). 85 of those are
+  // accepted and the filter ends the run 613 m out, and gnss_max_speed does NOT
+  // save it, because that gate's drift term reads the P this inflation just
+  // raised. Worse, once captured the filter cannot escape: escaping needs a
+  // rejection sequence that follows a gap, and the good fixes arrive with no gap.
+  //
+  // It is still the right default. The failure it removes is certain and
+  // universal, every robot that loses GNSS for long enough to drift past the gate
+  // never comes back. The failure it admits needs a sustained, internally
+  // consistent, far-offset cluster arriving in the seconds after an outage. But
+  // the trade is real and #64 is where it would show up, so re-run that sequence
+  // after touching anything here.
+  int    gnss_recovery_rejection_n = 15;
+  // Floor for the P inflation, in metres of XY sigma. The inflation itself is
+  // sized from the rejected innovation, because the error to be covered is
+  // however far the dead reckoning went and no constant brackets that: 50 m is
+  // fine after a 60 s outage and does nothing after eight minutes. Measured in
+  // test_gnss_reacquire against 379 m of drift: at 50 m the filter still never
+  // re-acquired (0 of 1501 fixes accepted), at 200 m it was back inside 0.4 m
+  // within 5 s. Sizing from the innovation removes the guess.
   double gnss_p_inflate_sigma = 50.0;
 };
 
@@ -308,6 +500,8 @@ enum class GnssRejectionReason {
   SIGMA_XY_HIGH   = 9,  // reported horizontal sigma in METRES > max_sigma_xy
   SIGMA_Z_HIGH    = 10, // reported vertical sigma in METRES > max_sigma_z
   CONTINUITY_BREAK = 11, // fix disagrees with the two fixes before it
+  NOT_FINITE      = 12, // position or covariance contained NaN or infinity
+  QUALITY_OTHER   = 13, // is_valid() refused it and no branch above explained why
 };
 
 // Why GPS track heading did or did not fuse on a given fix.
@@ -330,13 +524,27 @@ enum class TrackHeadingState {
   BASELINE_SHORT   = 4,  // displacement since the reference fix < track_heading_min_dist
   SIGMA_HIGH       = 5,  // sigma_xy/dist > track_heading_max_sigma, bearing too uncertain
   CHI2_FAILED      = 6,  // bearing computed but rejected as an outlier
+  WINDOW_HAD_TURN  = 7,  // robot turned inside the window; bearing would cross the corner
 };
 
 // Sizes for the tally arrays, which are indexed by static_cast<int>(reason).
 // The static_asserts below hold these to the enums, so adding a reason without
 // bumping the count fails the build instead of silently going uncounted.
-constexpr int GNSS_REJECTION_REASON_COUNT = 12;
+constexpr int GNSS_REJECTION_REASON_COUNT = 14;
 constexpr int MAG_REJECTION_REASON_COUNT  = 4;
+
+// Why an encoder measurement was rejected (or ACCEPTED if it passed).
+//
+// The encoder is the sensor nearly every ground robot has, and a rejected
+// encoder update is a direct cause of the drift users report. It used to be
+// discarded with nothing recorded but a counter that never left the core, so the
+// only external symptom was a wrong estimate. See #124 for the audit of the
+// other paths still in that state.
+enum class EncoderRejectionReason {
+  NOT_PROCESSED = 0,
+  ACCEPTED      = 1,
+  CHI2_FAILED   = 2,  // Mahalanobis distance > outlier_threshold_enc
+};
 
 // Why a magnetometer reading was rejected (or ACCEPTED if it passed).
 enum class MagRejectionReason {
@@ -346,7 +554,7 @@ enum class MagRejectionReason {
   FIELD_MAGNITUDE  = 3,  // corrected field magnitude outside configured range
 };
 
-static_assert(static_cast<int>(GnssRejectionReason::CONTINUITY_BREAK) + 1 ==
+static_assert(static_cast<int>(GnssRejectionReason::QUALITY_OTHER) + 1 ==
               GNSS_REJECTION_REASON_COUNT,
               "GNSS_REJECTION_REASON_COUNT must match GnssRejectionReason");
 static_assert(static_cast<int>(MagRejectionReason::FIELD_MAGNITUDE) + 1 ==
@@ -418,6 +626,26 @@ struct FusionCoreStatus {
   // Heading observability
   bool          heading_validated   = false;
   HeadingSource heading_source      = HeadingSource::NONE;
+  // Outcome of the most recent encoder update, and how surprising it was against
+  // the gate that judged it. chi2 is -1 when no encoder update has been gated.
+  EncoderRejectionReason encoder_reason = EncoderRejectionReason::NOT_PROCESSED;
+  double encoder_chi2           = -1.0;
+  double encoder_chi2_threshold = 0.0;
+  // Median of (filter yaw - GPS track bearing) in degrees over recent straight
+  // segments, and how many segments went into it. Only populated while an
+  // absolute heading source is in charge, which is when nothing else is checking
+  // it. Positive means the heading in use points counter-clockwise of the
+  // direction the robot is actually travelling. 0 samples means no opinion.
+  // Fix-to-fix continuity limit actually in force, in metres. 0 means the gate
+  // is not active yet, either because it is disabled or still learning.
+  double continuity_limit_m     = 0.0;
+  bool   continuity_learned     = false;
+  // Accelerometer magnitude standard deviation over the last second (m/s^2),
+  // and whether it is what stopped ZUPT firing. -1 until the window fills.
+  double zupt_accel_std         = -1.0;
+  bool   zupt_blocked_by_imu    = false;
+  double heading_vs_track_deg   = 0.0;
+  int    heading_vs_track_n     = 0;
   double        distance_traveled   = 0.0;
 
   // Outlier rejection counters: cumulative since init()
@@ -449,6 +677,37 @@ struct FusionCoreStatus {
   // Reason the most recent GNSS fix was rejected (NOT_PROCESSED until the first
   // rejection). Quality-gate rejects (HDOP/VDOP/fix-type/sats) and delay rejects
   // do NOT increment gnss_outliers, so this is the only place they are reported.
+  // Largest Mahalanobis distance seen by the GNSS outlier gate, -1 before any
+  // fix has been judged, alongside the threshold it is compared against and the
+  // number of fixes behind it.
+  // Observed IMU rate, and whether it disagrees with imu_fixed_rate_hz enough
+  // that the filter is integrating the wrong amount of time per step.
+  double imu_rate_observed_hz    = -1.0;
+  bool   imu_fixed_rate_mismatch = false;
+  // What the receiver was measured to be while the wheels confirmed the robot
+  // was parked, and the inflation that measurement earned. -1 before enough
+  // parked fixes have been seen.
+  //
+  //   sigma_observed vs sigma_declared: is the receiver as good as it claims?
+  //   correlation:    lag-1 autocorrelation of the parked fixes. Near 0 means
+  //                   consecutive fixes are independent and averaging them is
+  //                   worth what the filter assumes. Near 1 means they are
+  //                   nearly the same error repeated, so averaging N of them
+  //                   buys far less than sqrt(N) and the filter is otherwise
+  //                   over-converging on a stationary robot.
+  //   inflation:      what was actually applied, horizontal, after the cap.
+  double gnss_parked_sigma_observed = -1.0;
+  double gnss_parked_sigma_declared = -1.0;
+  double gnss_parked_correlation    = 0.0;
+  double gnss_parked_inflation      = 1.0;
+  // True when ZUPT says parked but the GNSS fixes are moving in a straight line,
+  // which means the wheel odometry is lying. Published so it is visible in a bag
+  // rather than only in a log line nobody was watching.
+  bool   zupt_parked_but_moving     = false;
+  double zupt_parked_straightness   = 0.0;
+  double gnss_chi2_max = -1.0;
+  double gnss_chi2_threshold = 0.0;
+  int    gnss_chi2_samples = 0;
   GnssRejectionReason gnss_last_rejection_reason = GnssRejectionReason::NOT_PROCESSED;
   MagRejectionReason mag_last_rejection_reason = MagRejectionReason::NOT_PROCESSED;
 
@@ -470,7 +729,7 @@ public:
 
   void init(const State& initial_state, double timestamp_seconds);
 
-  // Runtime updater for the IMU lever arm — the ROS wrapper calls this
+  // Runtime updater for the IMU lever arm: the ROS wrapper calls this
   // after auto-resolving base_frame -> imu_frame from TF. Cheap (one
   // struct copy) and only touches config_.imu.lever_arm.
   void set_imu_lever_arm(const sensors::ImuLeverArm& lever_arm);
@@ -574,11 +833,27 @@ private:
   double last_imu_time_     = -1.0;
   double last_encoder_time_ = -1.0;
   double last_gnss_time_    = -1.0;
-  // Fix-to-fix continuity: the last two ACCEPTED fixes, for the second difference.
-  // Only accepted fixes, so a rejected spike can never become the reference that
-  // makes the next good fix look like a break.
-  double cont_x1_ = 0.0, cont_y1_ = 0.0, cont_t1_ = -1.0;   // most recent
-  double cont_x2_ = 0.0, cont_y2_ = 0.0, cont_t2_ = -1.0;   // the one before
+  // Fix-to-fix continuity: the last few ACCEPTED fixes, oldest first, used to
+  // predict where the next one should land.
+  //
+  // Only accepted fixes go in, so a REJECTED spike can never become the
+  // reference that makes the next good fix look like a break. That was never the
+  // whole problem though. A spike small enough to pass the limit still gets in,
+  // and with a two-point extrapolation (px = x1 + (x1 - x2) * r) an error in the
+  // newest reference point lands in the prediction multiplied by about two. So a
+  // 1.5 m spike passed a 3 m limit and then threw the NEXT good fix over it:
+  // measured on the 2026-09-07 rover log, the gate accepted the spike and
+  // rejected the good fix after it, which is worse than not gating at all.
+  //
+  // A least-squares line over CONT_HISTORY points fixes that by arithmetic. For
+  // five evenly spaced points extrapolating one step, the weight on the newest
+  // is 0.8 rather than 2.0, so a spike that passes the limit can only move the
+  // next prediction by 0.8 of itself and can no longer reach the limit. Five is
+  // the smallest history where that holds: four gives exactly 1.0, which is
+  // borderline, and three gives 1.33, which is not enough.
+  static constexpr int CONT_HISTORY = 5;
+  std::array<double, CONT_HISTORY> cont_x_{}, cont_y_{}, cont_t_{};
+  int cont_n_ = 0;
   double last_vslam_time_   = -1.0;
   double last_mag_time_     = -1.0;
   int    update_count_      = 0;
@@ -674,6 +949,39 @@ private:
   // Inertial coast mode tracking
   int  gnss_consecutive_rejects_ = 0;
   bool gnss_in_coast_            = false;
+  // True while update_zupt owns the position noise scale, so only it undoes it.
+  bool zupt_holds_pos_noise_     = false;
+  // Largest Mahalanobis distance the GNSS gate has seen, and how many fixes it
+  // has judged. Compare against outlier_threshold_gnss: a large ratio means the
+  // gate cannot fire, which is invisible in any per-fix field.
+  // Drop every parked-fix statistic. Called on init, on reset, and the moment
+  // the wheels report motion, because a spread measured while stationary says
+  // nothing about a receiver that is moving.
+  void reset_parked_gnss_evidence();
+
+  // GNSS fixes seen while the wheels confirm the robot is parked. All of them
+  // sample the same physical point, so their spread and how strongly one fix
+  // predicts the next are direct measurements of the receiver, not estimates.
+  double parked_fix_n_ = 0.0;
+  std::array<double, 3> parked_fix_s_{};       // sum
+  std::array<double, 3> parked_fix_ss_{};      // sum of squares
+  std::array<double, 3> parked_fix_slag_{};    // sum of consecutive products
+  std::array<double, 3> parked_fix_prev_{};
+  bool   parked_fix_has_prev_ = false;
+  double gnss_parked_sigma_observed_ = -1.0;
+  double gnss_parked_sigma_declared_ = -1.0;
+  double gnss_parked_correlation_    = 0.0;
+  double gnss_parked_inflation_      = 1.0;
+  // Straightness check on the parked fixes, see zupt_parked_motion_m.
+  double parked_ref_x_ = 0.0, parked_ref_y_ = 0.0;
+  double parked_path_len_ = 0.0;
+  bool   parked_moving_detected_ = false;
+  double gnss_parked_straightness_ = 0.0;
+  double imu_rate_prev_stamp_    = -1.0;
+  double imu_rate_observed_sum_  = 0.0;
+  int    imu_rate_observed_n_    = 0;
+  double gnss_chi2_max_          = -1.0;
+  int    gnss_chi2_samples_      = 0;
   // Persists the reason of the last rejected GNSS fix, for status reporting.
   GnssRejectionReason last_gnss_rejection_reason_ = GnssRejectionReason::NOT_PROCESSED;
   // Persists the reason of the last rejected magnetometer reading.
@@ -683,6 +991,12 @@ private:
   // Record the outcome sitting in gnss_debug_/mag_debug_ and stamp it. Called at
   // every terminal point so accepted and rejected fixes are both counted.
   void note_gnss_outcome(double timestamp_seconds);
+  // Decides, on the first fix of a rejection sequence, whether it follows a
+  // GNSS gap. Called from every gate that can start such a sequence.
+  void note_rejection_cascade_start(double timestamp_seconds);
+  // Re-admit GNSS when the filter, not the receiver, is the thing that is wrong.
+  // Called from every gate that counts a rejection (#120).
+  void maybe_inflate_for_recovery(const sensors::GnssPosMeasurement& innovation_pre);
   void note_mag_outcome(double timestamp_seconds);
 
   // Inter-sensor clock-skew protection. Raw per-stream stamps (recorded whether
@@ -707,6 +1021,22 @@ private:
   // the first rejection of a sequence and used to gate rejection-triggered
   // coast so a continuous outlier (spike) cannot inflate P to defeat the gate.
   bool reject_after_gap_         = false;
+
+  // A GNSS outage is not over because one fix was accepted.
+  //
+  // reject_after_gap_ is decided from the gap to the last ACCEPTED fix, and
+  // after a blackout the filter can accept a fix that happens to land near its
+  // own drifted estimate. That fix corrects nothing but it refreshes the clock,
+  // so every later rejection sequence looks like it followed no gap, recovery is
+  // never armed again, and the filter sits hundreds of metres out with a healthy
+  // receiver in front of it. Measured in OneAcceptedFixMustNotDisarmRecovery:
+  // one decoy fix, then 1 accepted and 1999 rejected, 690 m out at the end.
+  //
+  // So an outage stays latched until GNSS is demonstrably back, meaning several
+  // fixes accepted in a row rather than one. A sustained spike cannot abuse
+  // this, because the latch is only ever SET by a real gap.
+  bool post_outage_unconfirmed_   = false;
+  int  gnss_consecutive_accepts_  = 0;
   // Recovery mode: after a timeout-triggered coast, accept the first returning
   // GPS fix unconditionally (bypass chi2 gate). After 7+ minutes blind, dead
   // reckoning error can be hundreds of meters, far outside the chi2 gate.
@@ -801,6 +1131,73 @@ private:
   // the chi2 gate to reject the very first heading fusion when the initial
   // heading error exceeds ~75 degrees.
   bool   gps_track_hdg_fused_ = false;
+
+  // True if |yaw_rate| exceeded gps_track_heading_max_yaw_rate at any point
+  // since last_hdg_fix_x_/y_ was last set. The GPS-track heading fusion
+  // computes its bearing as atan2(dy, dx) over that whole displacement --
+  // valid only if the path between the two points was roughly straight. A
+  // turn inside the window makes atan2 return the chord direction across the
+  // curve, not the robot's actual heading, and (because sigma_hdg depends
+  // only on GPS noise vs. distance, not on path curvature) that wrong bearing
+  // can still look "confident" enough to collapse the filter's own yaw
+  // covariance onto it. Set from update_distance_traveled()'s existing
+  // yaw_rate check; consumed and cleared in apply_gnss_update()'s heading
+  // fusion block.
+  bool   hdg_window_had_turn_ = false;
+
+  // Rolling accelerometer magnitude window for the ZUPT stationarity check.
+  // 100 samples is one second at the 100 Hz these IMUs run at.
+  static constexpr int ACC_WIN = 100;
+  double acc_mag_[ACC_WIN] = {0.0};
+  int    acc_n_ = 0;
+  int    acc_i_ = 0;
+  bool   zupt_blocked_by_imu_ = false;
+  double accel_magnitude_std() const;
+
+  // Outcome of the most recent encoder update (see EncoderRejectionReason).
+  EncoderRejectionReason encoder_reason_ = EncoderRejectionReason::NOT_PROCESSED;
+  double encoder_chi2_ = -1.0;
+
+  // Continuity threshold learned from the receiver (see GnssParams::continuity_auto).
+  //
+  // 100, chosen by measurement rather than feel. At 1 Hz, which is what every
+  // consumer receiver in this project's field logs actually runs at, this is 100
+  // seconds before the gate can protect anything, so the number is a direct
+  // trade between arming early and learning enough. Swept over six 2026-09 rover
+  // logs, counting how many runs the gate ever armed on and how many good fixes
+  // it then rejected:
+  //
+  //     N=40   5 of 6 logs armed, 2 good fixes rejected
+  //     N=60   5 of 6 logs armed, 2 good fixes rejected
+  //     N=100  5 of 6 logs armed, 0 rejected
+  //     N=200  3 of 6 logs armed, 0 rejected
+  //
+  // 200 was the first guess and it left half the runs with no gate at all. Below
+  // 100 the learning window can fall entirely inside a quiet stretch and set a
+  // threshold the same receiver later exceeds honestly. The one log that never
+  // arms at 100 is 41 fixes long, and nothing sensible would arm on that.
+  static constexpr int CONT_LEARN_N = 100;
+
+  // Accepted fixes in a row before a GNSS outage is considered genuinely over.
+  // One is not enough (see post_outage_unconfirmed_); a handful at any realistic
+  // fix rate is under a couple of seconds.
+  static constexpr int kAcceptsToConfirmReacquisition = 3;
+  double cont_learn_max_ = 0.0;
+  int    cont_learn_n_   = 0;
+  double cont_learned_m_ = 0.0;   // 0 = not learned yet
+
+  // GPS-track cross-check against whichever absolute heading source is in use.
+  // Kept separate from the fusion path's reference above, because the two never
+  // run at the same time and mixing their windows would compare a bearing to a
+  // baseline that a different code path had already consumed.
+  static constexpr int XCHK_HISTORY = 16;
+  double xchk_ref_x_ = 0.0;
+  double xchk_ref_y_ = 0.0;
+  bool   xchk_ref_set_ = false;
+  double xchk_diff_deg_[XCHK_HISTORY] = {0.0};
+  int    xchk_n_ = 0;
+  int    xchk_i_ = 0;
+  double xchk_median_deg() const;
 
   // Returns heading 1-sigma in radians computed from P via quaternion-to-yaw Jacobian.
   double compute_heading_sigma_rad() const;
