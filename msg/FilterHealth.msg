@@ -71,3 +71,55 @@ string[]  outcome_names
 int32[]   outcome_counts
 float64[] outcome_first_seen
 float64[] outcome_last_seen
+
+# Can the GNSS outlier gate actually fire?
+#
+# The largest Mahalanobis distance the chi2 gate has seen all run, the threshold
+# it is judged against, and how many fixes are behind that. A gate whose biggest
+# innovation sits far below its threshold has not been passing good fixes, it has
+# been incapable of rejecting a bad one, and no per-fix field shows that: every
+# fix reports ACCEPTED, which reads exactly like a healthy run. On a rover log
+# from 2026-09-06 the largest of 222 fixes was 39x below firing.
+#
+# Read gnss_chi2_max / gnss_chi2_threshold as a ratio. Near 1 means the gate is
+# working at its limit. Below about 0.1 it cannot reject anything a real
+# receiver would produce. -1 means no fix has been judged yet.
+float64 gnss_chi2_max
+float64 gnss_chi2_threshold
+int32   gnss_chi2_samples
+
+# What the GNSS receiver was measured to be during the last window in which the
+# wheels confirmed the robot was parked, and what that measurement earned it.
+#
+# Standing still is the one moment in a run where a sensor's self-reported
+# confidence can be checked against evidence, because every fix is then sampling
+# the same physical point. Two things come out of that:
+#
+#   gnss_parked_sigma_observed vs _declared: is the receiver as good as it says?
+#   gnss_parked_correlation: lag-1 autocorrelation of those fixes. Near 0 means
+#     consecutive fixes are independent, so averaging N of them is worth the
+#     sqrt(N) the filter assumes. Near 1 means they are largely the same error
+#     repeated, and a filter that averages them anyway ends up far more confident
+#     than the geometry supports.
+#   gnss_parked_inflation: the factor actually applied to the GNSS measurement
+#     noise, horizontal, after the zupt.gnss_noise_scale cap. 1.0 means the
+#     receiver was left alone, which is what an honest uncorrelated one gets.
+#
+# -1 in the sigma fields means no parked window has produced enough fixes yet.
+# These are only populated when zupt.gnss_noise_scale is above 1.0.
+float64 gnss_parked_sigma_observed
+float64 gnss_parked_sigma_declared
+float64 gnss_parked_correlation
+float64 gnss_parked_inflation
+
+# Outcome of the most recent encoder update, and how surprising it was against
+# the gate that judged it:
+#   NOT_PROCESSED | ACCEPTED | CHI2_FAILED
+# A rejected encoder update is a direct cause of the drift users report, and it
+# used to be discarded with nothing recorded but a counter that never left the
+# core. chi2 is -1 until an update has been gated. Compare against the threshold:
+# a value sitting just above it is a tuning problem, one in the thousands is a
+# units or frame problem.
+string  encoder_reason
+float64 encoder_chi2
+float64 encoder_chi2_threshold
