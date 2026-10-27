@@ -102,6 +102,17 @@ FusionCore resolves this by treating `B_EWZ` as known from the GPS calibration p
 
 **Workaround:** Ensure the robot operates with GPS for at least the first minute of each run to calibrate `B_EWZ`. The `init.stationary_window` setting helps calibrate `B_GZ` before motion begins.
 
+**Two limits on `init.stationary_window`, measured 2026-10-22 on NCLT 2013-04-05.** The window
+aborts if any single encoder sample exceeds `zupt.velocity_threshold` or
+`zupt.angular_threshold` (0.05 by default), so a robot that is never perfectly still at
+startup, such as a balancing platform, silently falls back to zero bias: NCLT's Segway
+sits at a median 0.04 to 0.05 m/s and a 90th percentile of 0.087 m/s while parked. And with
+the default `imu.gyro_bias_initial_sigma` of 0.175 rad/s, a correctly calibrated starting
+bias is forgotten within about 2 s of fusion, so on that sequence starting from the
+calibrated value changed ATE by nothing measurable. A robust stationarity test (gyro and
+accelerometer variance plus the MEDIAN wheel speed) and a tighter prior after a successful
+window would both be needed for boot calibration to matter.
+
 ---
 
 ## Non-holonomic constraint assumes flat ground
@@ -124,7 +135,7 @@ For lateral velocity: `adaptive.encoder: true` (enabled by default) adapts the V
 
 The delay compensation mechanism buffers up to 1 second of IMU measurements (at `imu.topic` rate) and replays them when a delayed GPS fix arrives. This assumes IMU arrives at the filter's nominal rate and GPS arrives late. If GPS arrives before IMU (e.g., low-frequency IMU with high-frequency GPS), the buffer does not help.
 
-**Limitation:** The buffer covers GPS latency up to 500 ms by default (`gnss.max_delay_s`). Fixes arriving more than 500 ms late are processed at arrival time with no retrodiction.
+**Limitation:** Fixes older than `max_measurement_delay` (0.5 s by default, and declared without a `gnss.` prefix) are rejected rather than replayed. The IMU ring buffer itself holds `imu_buffer_size` samples, 100 by default, which is one second at 100 Hz, so the gate is the binding constraint rather than the buffer.
 
 ---
 
