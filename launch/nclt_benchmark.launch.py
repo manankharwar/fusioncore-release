@@ -43,7 +43,11 @@ from lifecycle_msgs.msg import Transition
 
 def generate_launch_description():
     pkg = get_package_share_directory('fusioncore_datasets')
-    fc_config  = os.path.join(pkg, 'config', 'nclt_fusioncore.yaml')
+    # Default FusionCore config. Overridable with fusioncore_config:=<path> so one
+    # parameter can be A/B tested across otherwise identical runs. Without this the
+    # path was hardcoded and the only way to vary a setting was to edit the installed
+    # YAML between runs, which leaves no record of what each run actually used.
+    default_fc_config = os.path.join(pkg, 'config', 'nclt_fusioncore.yaml')
     rl_config  = os.path.join(pkg, 'config', 'rl_ekf.yaml')
     nav_config = os.path.join(pkg, 'config', 'navsat_transform.yaml')
 
@@ -60,6 +64,8 @@ def generate_launch_description():
 
     # ── args ──────────────────────────────────────────────────────────────────
     args = [
+        DeclareLaunchArgument('fusioncore_config', default_value=default_fc_config,
+                              description='FusionCore params YAML, for A/B testing one setting'),
         DeclareLaunchArgument('data_dir',      description='Path to NCLT sequence directory'),
         DeclareLaunchArgument('output_bag',     default_value='./benchmarks/nclt/2012-01-08/bag',
                               description='Output bag path'),
@@ -125,7 +131,7 @@ def generate_launch_description():
         name='fusioncore',
         namespace='',
         output='screen',
-        parameters=[fc_config, {'use_sim_time': True}],
+        parameters=[LaunchConfiguration('fusioncore_config'), {'use_sim_time': True}],
     )
 
     configure_fc = TimerAction(
@@ -186,6 +192,19 @@ def generate_launch_description():
             '/rl/odometry',
             '/gnss/fix',
             '/clock',
+            # The INPUTS, added 2026-09-27. Without them a benchmark bag records only
+            # what the filter concluded and nothing it was told, so a result can never
+            # be re-derived: bisecting a regression costs one 90 minute playback per
+            # commit. With them the whole sequence replays through fusioncore_core in
+            # milliseconds via hardware/replay.cpp, which is how the rover side already
+            # works. Cost is roughly 60 MB per sequence against 490 MB for the outputs.
+            '/imu/data',
+            '/odom/wheels',
+            # And the filter's own account of every fix. Without it a benchmark bag
+            # cannot answer "did the lever arm ever activate" or "what was heading
+            # sigma doing", which is exactly what #148 needed and could not get.
+            '/fusion/debug/gnss_status',
+            '/fusion/debug/filter_health',
         ],
         output='screen',
     )
