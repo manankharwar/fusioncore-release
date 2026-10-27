@@ -6,6 +6,393 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+---
+
+## [0.5.0]: 2026-10-26
+
+Read this before upgrading if you use `platform.profile: ground_robot` or
+`ground_robot_flat`: those profiles now turn on GNSS re-anchoring, which changes the
+published position after a GPS outage (it can jump). Set `gnss.reanchor_enabled: false` to
+keep 0.4.x behaviour. Nothing changes for `platform.profile: general`, the default. One
+parameter was removed (`vslam.frame_id`, which did nothing; see Removed). Every measured
+number below is from the public NCLT dataset; none is a hardware result, and the comparison
+against robot_localization is withheld pending a re-run.
+
+### Changed
+
+- **Behaviour change: `platform.profile: ground_robot` and `ground_robot_flat` turn on
+  `gnss.reanchor_enabled`.** The library default stays off. This is a product decision with
+  stated costs, not a pass: re-anchoring FAILED the rule a library default change has to
+  pass (`tools/ship_rule.md`, written before the test) on two secondary clauses. On the
+  seven held-out NCLT sequences it raised median error by 3.3% and 4.4% on two and
+  output-rate jitter by 0.126 on one. Measured on all twelve sequences with the corrected
+  dataset player (`tools/eval_20261025_results.md`, offline replay, full-trajectory ATE
+  RMSE) it lowers RMSE on 10, raises it on none, and is identical on the two where it never
+  fires; the median rises on 4 (0.3% to 3.0%) and jitter on 3 (up to 0.124). Through the
+  ROS node on 2012-01-08 it read 10.882 m at GPS fix times against 10.898 m in replay on the
+  same points, inside a pass band fixed before that run (9.253 to 12.403 m); one sequence,
+  one run. Each re-anchor is a deliberate position jump, reported on
+  `/fusion/debug/gnss_status` (`reanchored`, `reanchor_jump_m`, `reanchor_count`) and in
+  `/diagnostics`; a consumer that differentiates pose will see it. An explicit
+  `gnss.reanchor_enabled: false` wins over the profile, from `-p` or a params file
+  (`test_platform_profile.py` pins both, because false is also the declared default and a
+  compare-against-default check could not see it).
+
+### Added
+
+- **`gnss.reanchor_enabled`: recover after a GPS outage instead of rejecting the fixes that
+  would correct the filter.** Measured on NCLT, 74.8% to 96.8% of squared error on the five
+  development sequences sat in GPS blackouts or the re-convergence after them, and in that
+  recovery window the outlier gate rejected 81% of arriving fixes on two sequences. When the
+  gate has been refusing most of what arrives and the recent fixes agree with each other and
+  with wheel odometry, re-anchoring moves position (only position, never heading) onto them.
+  Off by default. Nine parameters: `gnss.reanchor_enabled` (false), `gnss.reanchor_window`
+  (20), `gnss.reanchor_reject_frac` (0.6), `gnss.reanchor_bias_trigger` (false: its extra
+  events were measured net harmful), `gnss.reanchor_bias_m` (8.0), `gnss.reanchor_buffer_n`
+  (5), `gnss.reanchor_odom_tol_m` (4.0), `gnss.reanchor_sigma_xy` (5.0),
+  `gnss.reanchor_cooldown_s` (20.0). `test_gnss_reanchor.cpp` pins that it is off by
+  default, never fires while the filter is healthy, shortens recovery, does not storm, and
+  does not touch heading.
+- **`tools/bag_report.py`: a diagnostic that reads any rosbag2 and reports why an estimator
+  is drifting, with no ground truth and no FusionCore build.** It flags IMU and wheel yaw
+  rates that disagree in sign or scale, sensors on different clocks, a receiver whose
+  declared accuracy does not match how far its fixes move, a log with no stop (gyro bias
+  unobservable), long GNSS gaps, and an IMU orientation that is only the accelerometer's
+  tilt declared as a confident attitude.
+- **The node warns once when it fuses IMU roll/pitch declared tighter than 1 degree.** An
+  accelerometer-referenced tilt is wrong by more than a degree at ordinary accelerations, so
+  a tighter declaration double-counts the accelerometer as a confident attitude. This is the
+  mistake our own NCLT player made (below).
+- **`messages_lost` on `/diagnostics`, from the middleware's own lost-message callback**, and
+  a once-a-minute log of consumed callbacks per sensor, so dropped sensor messages are
+  visible instead of inferred.
+- **`output_rate_path_ratio` in `tools/evaluate.py` and `hardware/ate_tum.py`**: the
+  estimate's path length at its full output rate over the ground-truth path, which measures
+  output-rate jitter that a truth-rate path ratio cannot see.
+
+### Fixed
+
+- **Our NCLT dataset player declared the IMU's accelerometer-derived tilt as a 0.57 degree
+  attitude.** The dataset's roll/pitch are the accelerometer's tilt; the 0.57 deg was our
+  choice, and it made the node fuse the accelerometer twice and lock onto a wrong position
+  for about 800 s on 2012-01-08 (178.808 m to 57.314 m full-trajectory ATE RMSE once fixed).
+  `nclt_player.py` now publishes that orientation with `orientation_covariance[0] = -1`.
+  Every NCLT number measured before 2026-10-25 used the old player.
+
+### Added
+
+- **`platform.profile`: the deployment declares what it can observe.** One parameter,
+  values `general` (the default, which changes nothing), `ground_robot` and
+  `ground_robot_flat`. A 23-state filter can estimate more than a wheeled robot can
+  observe: the gyro measures `WZ + B_GZ` and the accelerometer measures
+  `AX + B_AX + gravity`, so those pairs are not separately observable from those sensors
+  alone. On a robot with encoders, `ground_robot` sets the bias process noises and priors
+  to zero and treats the encoder's yaw rate as bias-free, so the encoder carries the
+  constraint. That does NOT hold the biases fixed: the UKF's sigma-point regularisation (a 1e-6 identity added to P, plus the identity-shift repair a zero-variance state triggers) still lets them drift: on NCLT 2013-04-05 the 'frozen' gyro bias reached a median sigma of 0.053 rad/s and roamed up to about 0.18 rad/s, so the profile slows the biases rather than holding them (found 2026-10-22, not
+  fixed). Measured in
+  replay, frozen against free, scored through `hardware/ate_tum.py` (the median is worse
+  on 2013-04-05, 7.010 to 7.082, and better on the other four):
+
+  ```
+    replay, ATE RMSE 3D (m), shipped NCLT config, only the seven profile keys differ
+    sequence      free      ground_robot   change
+    2012-02-04   142.043     141.595       -0.3%
+    2012-06-15    78.428      64.537      -17.7%
+    2012-08-20   165.364     141.195      -14.6%
+    2012-09-28    22.805      21.560       -5.5%
+    2013-04-05    16.456      15.168       -7.8%
+  ```
+
+  An earlier version of this entry justified the change with `r(WZ, B_GZ) = -0.998`. That
+  figure is real but comes from a 1.8 s in-place spin in `test_observability.cpp`, not from
+  a robot driving on real data; on NCLT the same correlation measured -0.63 to -0.04, so it
+  does not support this change and was removed. It also said the encoder measures yaw rate
+  with no bias term; the model carries an encoder yaw-rate bias, which the profile freezes.
+
+  Measured on NCLT at 1x, with the robot_localization control on the same run shown
+  because it reads the same input and runs none of this code:
+
+  ```
+    2012-06-15   82.011 -> 32.149   -60.8%   ctrl -0.05%   a 44% loss becomes a 30% win
+    2013-04-05   14.058 ->  9.193   -34.6%   ctrl +0.50%
+    2012-08-20  155.618 -> 157.591   +1.3%   ctrl +0.04%   worse, so it is not uniform
+    2012-09-28   18.594 ->  8.872   -52.3%   ctrl +11.2%   weak, that control move is
+                                                           inside the sequence's own
+                                                           11.05% control spread
+  ```
+
+  Four of twelve sequences measured. Measured on three rover bags offline: closure moved
+  less than the receiver's own 2.6 m sigma in every arm, so it is not an accuracy result
+  on hardware, but it establishes that freezing seven states broke nothing on real data.
+  Excess path length fell 3 to 11% on 3 of 3 with a 120 s GNSS blackout cut in.
+
+  **A profile only supplies DEFAULTS.** Anything set explicitly wins and the node logs
+  both what it supplied and what it kept. One consequence worth knowing: a config that
+  writes a value out, even the value the node would have used anyway, blocks the profile
+  for that key. Delete what you hand to a profile. An unknown profile name refuses to
+  configure rather than silently falling back to `general`.
+
+  No library default changed. `0.0` is the right process noise for `fusioncore_core`,
+  which has to serve platforms that leave the ground plane, and the equivalent parameter
+  bundles still ship as YAML in `fusioncore_datasets/config/profiles/`.
+  `tools/test_profiles.py` pins the node's table to those files so the two forms cannot
+  drift apart and hand two users different filters.
+
+### Changed
+
+- **The robot_localization benchmark config fuses IMU yaw rate only, no longer acceleration
+  or roll/pitch** (`fusioncore_datasets/config/rl_ekf.yaml`). Once the NCLT player stopped
+  supplying an attitude (orientation covariance -1), robot_localization removed gravity
+  using its own roll and pitch, which `two_d_mode` holds at zero, so platform tilt leaked
+  into the fused acceleration and the control diverged to kilometres on nine of twelve
+  sequences. The new config follows the planar wheeled-robot example in
+  robot_localization's documentation, minus its x acceleration for the same reason. The
+  rover replay launch reuses this file, so its robot_localization arm changes too.
+
+- **Scope stated explicitly: FusionCore is for outdoor wheeled ground robots that lose
+  GPS.** Differential drive, skid steer, tracked or Ackermann. That is the platform every
+  published number was measured on (NCLT is a wheeled Segway, the hardware runs are a
+  four-wheeled rover). Not built for drones, boats, legged robots or mecanum platforms:
+  the library runs on them and `platform.profile: general` freezes nothing, but nothing
+  is tuned or benchmarked for them and the non-holonomic constraint is wrong for anything
+  that can move sideways on purpose. No code changed; this was always what the evidence
+  covered and the README did not say so.
+
+### Documentation
+
+- **The published NCLT table overstated FusionCore on all three rows that have since
+  been re-measured, and the note that was supposed to correct it was itself wrong.**
+  The note claimed 2013-04-05 had "regressed 12.1 m to ~19.4 m, still a 93% win". No run
+  on file supports 19.4 m. `tools/benchmark_baseline.json` recorded **189.700 m** on
+  `bcc0e09` (repeats 190.15, 190.47), and two runs on current `main` on 2026-10-03 read
+  **49.486 m** and **50.243 m**. The real margin over RL-EKF is 81% at the current figure
+  and 29% at the September one, not 93%.
+
+  The same pattern holds on the other two re-measured sequences: 2012-06-15 published
+  49.2 m against 73.525 m measured, and 2012-08-20 published 98.3 m against 116.444 m.
+  The RL-EKF control reproduces within 2% on all three (18.2/18.5, 10.6/10.5,
+  268.9/266.7-268.8), which rules out the harness and places the move in FusionCore's
+  own column.
+
+  The twelve-row table is left as the labelled May 2026 snapshot rather than half-rewritten
+  from three rows, but the three affected rows now carry a `†` marker and the corrected
+  figures, in `README.md`, `docs/index.md`, `docs/reference/benchmark.md`,
+  `benchmarks/README.md` and the MicroStrain certified-config page. The performance tiers
+  now say which sequences would change tier. A controlled full-suite re-run is still owed
+  before any published number is updated.
+
+- **Three parameters named in the docs do not exist**, found in an audit of all 50
+  user-facing markdown files. ROS 2 ignores an override for an undeclared parameter
+  in silence, so a reader following these set something, see no warning, and get
+  none of the described behaviour.
+
+  - `docs/guides/delayed-gps-measurements.md` advised enabling
+    `gnss.use_wall_clock_stamp` and increasing `imu.buffer_duration`. **Neither has
+    ever existed.** There is no wall-clock fallback for a zero-stamped fix, and the
+    ring buffer is sized by `imu_buffer_size`, a `FusionCoreConfig` field and not a
+    ROS parameter at all. The recommendations now describe what can actually be done.
+  - `docs/known-limitations.md` called the delay bound `gnss.max_delay_s`. The real
+    parameter is `max_measurement_delay`, declared with no `gnss.` prefix.
+  - The 0.4.0 release notes listed a new parameter as
+    `gnss.gps_track_heading_cross_check_deg` in the upgrade table. The `gps_` prefix
+    belongs to the C++ config field; the parameter is
+    `gnss.track_heading_cross_check_deg`. Anyone who copied that line out of the
+    release notes was setting nothing.
+
+- **`tools/check_docs_params.py` makes this class of rot fail CI**, joining
+  `check_config_wiring.py` and `check_node_member_wiring.py`. It asserts that every
+  backticked parameter name in every tracked doc is a parameter the node actually
+  declares. CHANGELOG.md is skipped on purpose, since a changelog legitimately names
+  parameters that were removed.
+
+  **This has happened before.** The 0.3.x notes record `gnss.degraded_noise_multiplier`
+  being "documented but never implemented" in `configuration.md`. It recurred because
+  nothing checked.
+
+- **Test counts removed from CONTRIBUTING.md and getting-started.md.** They claimed
+  102 and 272 against a real 256, and a hardcoded count is stale the moment anyone
+  adds a test. Both now state the bar that does not rot: zero failures.
+
+- README no longer says the IMU ring buffer "replays 1 second". The buffer holds one
+  second at 100 Hz, but a fix older than `max_measurement_delay` (0.5 s) is dropped
+  rather than replayed, so the usable window is half what was claimed.
+
+- Fixed a dead link to `how-it-works.md` in `docs/simulation.md`.
+
+### Removed
+
+- **`vslam.frame_id`**, which was declared, shipped in `fusioncore.yaml`, read into
+  `vslam_frame_override_`, and then never read again. It did nothing.
+
+  The config described it as "Override the VSLAM TF frame", but the VSLAM path does
+  no TF lookup at all: `vslam_callback` anchors the VSLAM map origin to the filter's
+  current position by offset. Its siblings `imu.frame_id` and `gnss.frame_id` are
+  live because they feed TF lookups for antenna and IMU lever arms, and VSLAM has no
+  lever-arm support for this to attach to. So there was nothing to override.
+
+  It is removed rather than allowlisted. Allowlisting would make the checker below
+  report a clean tree while the parameter went on doing nothing, which is the exact
+  failure mode of #138: a gate that stands down on purpose is indistinguishable from
+  one that is broken. Redefining it to mean something else would have been worse,
+  because the documented meaning would then be a lie.
+
+  **Nothing breaks.** A parameter override for a parameter the node never declares
+  is ignored by ROS 2, so a config that still sets it starts fine, and since the
+  value was never read no behaviour changes. If VSLAM lever-arm support is added
+  later, the parameter comes back with the feature that needs it.
+
+### Fixed
+
+- **The ROS buildfarm dev jobs (Humble and Jazzy) were Unstable with 5 test failures.**
+  `test_platform_profile.py` drives the node through the `ros2` CLI, and `ros2run`,
+  `ros2node`, `ros2lifecycle` and `ros2param` were never declared, so the buildfarm, which
+  installs only declared dependencies, had no `ros2` command. Reproduced locally by hiding
+  the CLI: all four of that file's tests fail. They are now `test_depend`s.
+
+- **`magnetometer.declination_rad` had the wrong sign, and the 9-axis IMU path ignored
+  it.** Behaviour change for anyone who set a non-zero declination; every shipped config
+  sets 0.0, so no default changes. The raw-field path computed yaw as the magnetic angle
+  PLUS the declination. With magnetic north D east of true north, a body at true ENU yaw
+  psi measures a horizontal field of (sin(psi + D), cos(psi + D)), so the true yaw is the
+  magnetic angle MINUS D, and setting the documented value doubled the bias instead of
+  removing it. The old unit test pinned the formula's own output rather than this physics;
+  it is replaced by one that builds the field from a known true yaw and requires that yaw
+  back. Separately, with `imu.has_magnetometer: true` the IMU's orientation quaternion is
+  the heading source and its yaw is magnetic, but nothing on that path applied the
+  declination at all, so the local declination went straight into heading as a constant
+  bias. It is now subtracted there with the same convention. Tests:
+  `MagnetometerTest.DeclinationRecoversTrueYaw`,
+  `FusionCoreTest.NineAxisYawCorrectedForDeclination`.
+
+- **The GNSS Doppler bridge never compiled.** `gnss_doppler_bridge.cpp` set the
+  outgoing odometry stamp from `msg->header.stamp` on a `ublox_msgs/NavPVT`, and
+  NavPVT has no `std_msgs/Header` at all. Against real `ublox_msgs` the file fails
+  with `'NavPVT_' has no member named 'header'`, so anyone who actually had the
+  dependency installed could not build the package.
+
+  It went unnoticed because the target is guarded by
+  `find_package(ublox_msgs QUIET)`, so on every machine without `ublox_msgs` the
+  bridge was silently skipped and no error ever appeared, and because CI did not
+  build `fusioncore_ublox` at all. Found in a fork by **@idesign0**, who hit it and
+  fixed it locally rather than reporting it.
+
+  The stamp is now node time. NavPVT does carry UTC fields and `i_tow`, but
+  FusionCore times its IMU replay buffer against ROS time, so a receiver clock that
+  disagrees with the system clock would shift every Doppler measurement against the
+  IMU it is being fused with. Stamping on arrival costs the USB and driver latency,
+  which is small and roughly constant; the alternative costs a systematic and
+  variable offset.
+
+  CI now installs `ublox_msgs` and builds `fusioncore_ublox`, so the optional path
+  is exercised rather than skipped. **The general lesson: a target behind an
+  optional `find_package` is invisible to CI unless the dependency is installed
+  there. Same shape as the magnetometer branch that carried a NameError and had
+  never once run.**
+
+### Added
+
+- **GNSS antenna lever arms now auto-resolve from TF per receiver, not just for
+  the primary.** (#4) The one-shot TF lookup that fills in `gnss.lever_arm_x/y/z`
+  from `base_frame -> the receiver's frame` was hardcoded to `source_id == 0` and
+  lived inline in the NavSatFix callback. Two consequences, both reported by a
+  dual-antenna user: a robot with two receivers had to type the second antenna's
+  offset into YAML even though the URDF already described exactly where it was,
+  and anyone reading `gps_msgs/GPSFix` got no auto-resolve at all, on either
+  receiver.
+
+  The lookup moved into `resolve_gnss_lever_arm_from_tf(source_id, frame)` and is
+  called from both the NavSatFix and GPSFix paths for whichever receiver the fix
+  arrived on. Each receiver keeps its own one-shot flag and its own warn budget,
+  so a silent second antenna cannot spend the primary's warnings and hide a real
+  fault on the first.
+
+  New `gnss.frame_id2`, the same override `gnss.frame_id` provides, for a second
+  receiver whose driver publishes an empty or wrong `header.frame_id`.
+
+  Unchanged on purpose: a lever arm written in the YAML is still never
+  overwritten from TF. TF says where the antenna is bolted, the YAML says what
+  the operator wants used, and those are allowed to disagree. Behaviour for a
+  single-receiver setup is identical.
+
+  Covered by `test_gnss_lever_arm_tf.py`, which stands up two static transforms
+  and two receivers and asserts each resolves its own distinct offset. Verified
+  against a negative control: reinstating the `source_id != 0` early return makes
+  the test fail, so it tests the feature rather than the harness.
+
+### Fixed
+
+- **The parked-motion check ran on every prefix of the window, not on the window.**
+  `zupt_parked_motion_straightness` is 0.85, a figure calibrated against whole parked
+  windows. It was evaluated on every prefix as fixes arrived, and short prefixes are
+  far straighter than whole ones. Re-measured on the same bags, worst parked
+  straightness at the moment displacement first passes 5 m:
+
+  ```
+   6 segments  0.902      17 segments  0.847
+   8 segments  0.877      22 segments  0.840
+  10 segments  0.880      30 segments  0.811
+  13 segments  0.855      38 segments  0.722   <- where 0.85 came from
+  ```
+
+  So the threshold is breached by a stationary robot anywhere under about 30
+  segments, and at one segment it is exactly 1.00 by construction. It false fired
+  three times on 2026-09-15, once indoors 2.8 s after the first fix. Now
+  `kParkedMotionMinSegments` requires 10 fix-to-fix segments before the figure is
+  allowed to mean anything, and the accelerometer has to agree the robot is moving
+  before the wheels are called liars. A dead encoder reports zero but cannot fake
+  the vibration of a rolling robot, and that separation is about 100x where
+  straightness overlaps outright.
+
+- **A magnetometer could never establish the heading it exists to provide.** `init()`
+  leaves yaw at 0 with `P(QZ,QZ) = 1e-8`, a hundredth of a degree of claimed certainty
+  about a number nobody measured. Gating a magnetometer against that is circular and
+  locks out the one sensor that could correct it. Measured on the rover the first time
+  the magnetometer was ever enabled: 2499 clean readings, `|B|` steady at 56.46 uT,
+  zero failed reads, and every single one rejected `CHI2_FAILED`.
+
+  Fusing ungated does not work either. The gain against a 1e-8 prior is nil, so an
+  accepted update moves yaw by nothing, and waiting for the covariance to grow walks
+  into the unbounded-quaternion-covariance defect where the sigma points spread far
+  enough that the mean stops meaning anything (measured: yaw converged to -29.5 deg
+  against a truth of 40). So when `heading_source` is `NONE` the first reading now SETS
+  the orientation through the new `UKF::set_orientation`, and the gate works normally
+  from the next one. Roll and pitch are left alone, being gravity referenced and
+  already observable. The GPS track heading path already skips its own gate on first
+  fusion for the same reason.
+
+### Added
+
+- **Every sensor gate now records why it rejected, not just that it did.** The GNSS and
+  encoder paths already did; the remaining six sites incremented a counter and threw the
+  measurement away. The IMU case is why a counter is not enough: three separate gates share
+  `imu_outliers`, and they fail for different reasons and point at different parameters, so
+  "47 outliers" is a number you cannot act on. `ImuRejectionReason` distinguishes
+  `CHI2_RATE` (gyro and accelerometer), `CHI2_ROLL_PITCH` (tilt from gravity) and
+  `CHI2_ORIENTATION` (the full quaternion), alongside new `VslamRejectionReason` and
+  `HeadingRejectionReason`. Each site also records the Mahalanobis distance the way the
+  encoder path does, so a marginal rejection is distinguishable from a wild one, and all
+  three surface in the diagnostics that already carried the counts. Closes #124.
+
+- **The node says which node name your parameters were matched against.** A ROS 2 params
+  file is keyed by node name, so if the running node is not called what the YAML says, the
+  entire file is ignored and every setting falls back to its library default. Nothing
+  errors, and `ros2 param get` returns the default as though it were configured, so the
+  usual way of checking agrees with you.
+
+  It does not degrade gracefully either. Two of the defaults it restores are the worst
+  settings this project has measured: `imu.accel_noise` at 0.1 tells the filter to trust an
+  accelerometer reading several m/s^2 of chassis vibration, which drew 53 m of path against
+  27.73 m actually travelled, and `gnss.max_hdop` at 4.0 compared against a synthesised DOP
+  in metres rejected 500 of 500 fixes on a u-blox M9N. Anyone who namespaces or renames the
+  node lands on both at once.
+
+  So `on_configure` now logs the resolved node name and namespace together with four
+  parameters nobody should be running at their defaults in the field. Wrong name and you see
+  `imu.accel_noise=0.1 gnss.max_hdop=4`; right name and you see `50` and `25`. One line, no
+  behaviour change. Closes #134.
+
 ## [0.4.0]: 2026-09-14
 
 This is the 0.4.0 candidate rather than a patch release. Two public fields were
@@ -24,7 +411,7 @@ section before upgrading; nothing else in the release needs action.
   | `gnss.recovery_rejection_n` | 0, off | 15 | post-blackout P inflation fires |
   | `gnss.continuity_auto` | new | `true` | fix-to-fix gate arms itself after 100 fixes |
   | `zupt.accel_std_threshold` | new | 0.5 | the IMU can veto a ZUPT |
-  | `gnss.gps_track_heading_cross_check_deg` | new | 15.0 | a disagreeing GPS track heading is refused |
+  | `gnss.track_heading_cross_check_deg` | new | 15.0 | a disagreeing GPS track heading is refused |
 
   All four were shipped on deliberately. The two GNSS ones close failure modes
   that make a filter look healthy while being unrecoverable, which is not a
@@ -90,7 +477,7 @@ section before upgrading; nothing else in the release needs action.
   up in the outcome tally. `gnss.continuity_max_m` above zero still overrides it
   with a fixed number. Closes #116.
 
-- **`gnss.gps_track_heading_cross_check_deg`: refuse a GPS track heading that
+- **`gnss.track_heading_cross_check_deg`: refuse a GPS track heading that
   disagrees with the heading you already have.** Course over ground is not body
   heading. On any curved path the two differ by a real bias, and a biased
   measurement pulls the estimate wrong no matter how honest its covariance is. The
@@ -491,7 +878,7 @@ Three fixes found by running FusionCore on real hardware: one from a user's fiel
 - **Benchmark regression tracking**: `evaluate.py` now emits `metrics.json`, and `tools/check_benchmark_regression.py` compares a run against `tools/benchmark_baseline.json` so a tuning change that silently worsens another sequence is caught instead of shipping unnoticed. Documented in `tools/benchmark_regression.md`.
 
 ### Changed
-- **Documentation accuracy pass**: the benchmark and comparison pages no longer describe the magnetometer as a roadmap item (it ships) or `gnss.max_speed` as hypothetical (it ships), the long-blackout losses are explained honestly as dead-reckoning drift rather than the visible GPS transients, and the published NCLT numbers now carry a note that they predate a controlled full-suite re-run (the 2013-04-05 figure has regressed 12.1 m to ~19.4 m, still a 93% win).
+- **Documentation accuracy pass**: the benchmark and comparison pages no longer describe the magnetometer as a roadmap item (it ships) or `gnss.max_speed` as hypothetical (it ships), the long-blackout losses are explained honestly as dead-reckoning drift rather than the visible GPS transients, and the published NCLT numbers now carry a note that they predate a controlled full-suite re-run (the 2013-04-05 figure has regressed 12.1 m to ~19.4 m, still a 93% win). **The ~19.4 m and 93% figures in that note were wrong and are retracted; see the Unreleased section.**
 
 ---
 
