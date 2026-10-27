@@ -14,6 +14,12 @@ ros2 launch fusioncore_ros fusioncore.launch.py \
 ```yaml
 fusioncore:
   ros__parameters:
+    platform.profile: general   # general | ground_robot | ground_robot_flat
+                                # What kind of robot is this? The filter cannot work
+                                # that out, and the answer decides which states are
+                                # worth estimating. See "Declaring the platform" below.
+                                # Only supplies DEFAULTS: anything you set yourself wins.
+
     base_frame: base_link    # must match your robot's base TF frame
     odom_frame: odom
     publish_rate: 100.0
@@ -304,7 +310,61 @@ fusioncore:
     # the bearing changes too quickly for a reliable heading measurement.
     # Decrease for robots that make tight turns at slow speed.
 
-    gnss.gps_track_heading_cross_check_deg: 15.0
+    gnss.rotation_heading_enabled: true
+    # Absolute heading from the arc the antenna sweeps when the robot rotates in
+    # place. Needs gnss.lever_arm_x/y to be nonzero, since with the antenna on
+    # base_link there is no arc.
+    #
+    # RTK ONLY in practice, and the noise model enforces that rather than a flag.
+    # Passing rotation_heading_max_sigma at rotation_heading_min_arc_baseline needs
+    # the lateral sigma of the displacement BETWEEN the two fixes to be under about
+    # 10 cm, so roughly 7 cm per fix. A 2 to 5 m consumer receiver is far outside
+    # that and the bootstrap never fires, which costs nothing, so there is no reason
+    # to turn this off on such a receiver.
+    #
+    # It also needs a BRISK rotation. Yaw 1-sigma grows about 0.2 rad/s while
+    # turning with an IMU feeding and about 0.3 rad/s on encoder alone, so a slow
+    # turn loses track of its own rotation before it has swept enough arc and the
+    # delta-yaw gate refuses it. Measured: a 2.0 rad/s turn bootstraps, the same
+    # angle taken at 0.5 rad/s does not. Turn at a rad/s or more.
+
+    gnss.rotation_heading_min_yaw_delta: 1.0
+    # Radians of rotation the window must accumulate before a heading is computed.
+
+    gnss.rotation_heading_min_arc_baseline: 0.25
+    # Metres of predicted antenna arc required. The arc is
+    # 2 * lever_arm_length * |sin(yaw_delta / 2)|, so a short lever arm needs more
+    # rotation. With a 0.32 m lever arm, 1.0 rad of turn gives 0.31 m.
+
+    gnss.rotation_heading_max_base_translation: 0.20
+    # Metres the base itself may travel across the window, from the ENCODER. If the
+    # base drives, the displacement is translation rather than arc.
+
+    gnss.rotation_heading_max_sigma: 0.4
+    # Radians. Reject a computed heading whose 1-sigma exceeds this.
+
+    gnss.rotation_heading_sigma_floor: 0.05
+    # Radians. Floor on the reported heading sigma, so a very long baseline cannot
+    # claim an implausibly tight heading.
+
+    gnss.rotation_heading_delta_yaw_sigma: 0.03
+    # Radians. FLOOR on the uncertainty of the window's delta_yaw. The value used is
+    # taken from the filter's own yaw covariance: specifically the variance ADDED
+    # across the window, which is the honest figure for a difference of two
+    # estimates. This is what makes the bootstrap decline while the filter has lost
+    # track of its rotation (issue #150) instead of trusting a constant.
+
+    gnss.rotation_heading_max_window_s: 10.0
+    # Seconds a window may stay open before it is discarded.
+
+    gnss.rotation_heading_max_len_residual_sigma: 3.0
+    # How many sigma the observed displacement LENGTH may differ from the length the
+    # rotation model predicts. Only the angle of the displacement carries heading;
+    # a displacement of the wrong size was not produced by rotation about the lever
+    # arm, so its angle means nothing. Catches wheel slip, which the encoder
+    # translation guard above cannot.
+
+    gnss.track_heading_cross_check_deg: 15.0
     # Reject a GPS track heading that disagrees with the current heading estimate
     # by more than this, measured as the median of recent disagreements rather
     # than a single sample so one bad bearing cannot veto a good source. Course
@@ -671,6 +731,31 @@ not matter. For one parked overnight it does. The evidence is dropped the moment
 the encoders report motion, so a robot that parks once does not stay
 over-confident for the rest of the run.
 
+**It will corrupt a loop-closure measurement. Set it to 1.0 before you take
+one.** The usual way to measure this filter is to drive a loop, park back on a
+mark, and compare the estimate against the mark. That measurement is taken in a
+parked window, which is the one window this inflation is active in, so whatever
+error the filter held at the moment it stopped is what gets reported. It cannot
+be corrected away no matter how long you sit there, and the number looks like
+drift the filter accumulated while driving.
+
+Measured on a 2026-09-26 rover run, 99 m driven and then 200 s parked on the
+mark. The filter was shown 150 fixes averaging 8.20 m of error, accepted every
+one of them, and moved 0.279 m in total: an effective gain of 0.0002. Loop
+closure came out 7.22 m while the raw receiver closed 0.90 m. Replaying the same
+measurements with this set to 1.0 and nothing else changed closed 0.79 m. Across
+seven runs from that campaign, setting it to 1.0 improved closure in five, left
+one unchanged, and cost 0.06 m in one.
+
+The inflation is not the problem, and turning it off costs something: on 17.5
+minutes genuinely parked, peak excursion was 0.37 m with it and 2.36 m without,
+against a receiver wandering 4.60 m. The problem is that it cannot tell a
+receiver repeating the same correlated error from a filter that is simply biased.
+An 8 m offset from a receiver scattering 2.8 m is the second thing, and
+suppressing the correction is the wrong response to it. Until that is separated,
+pick the metric you are actually measuring: 1.0 for closure, the cap for idle
+drift.
+
 ## Secondary twist sources (`encoder2`)
 
 `encoder2.topic` accepts a second `nav_msgs/Odometry` source and fuses it through
@@ -744,6 +829,180 @@ gnss.velocity_topic: "/gnss/doppler_vel"
 Fixes with `fix_type < 3` (no 3D lock) or `gnssFixOK` flag unset are silently dropped. Speeds below 0.05 m/s are also dropped to avoid heading corruption at standstill.
 
 **Other receivers:** publish `nav_msgs/Odometry` with ENU velocity on any topic and point `gnss.velocity_topic` at it. FusionCore doesn't care which driver produced it.
+
+---
+
+## Recovering after GPS comes back (`gnss.reanchor_enabled`)
+
+**Recommended for any robot that loses GPS for more than a few seconds at a time. Off in
+the library default, for the reasons measured below; on in `platform.profile: ground_robot`
+and `ground_robot_flat` from 0.5.0 (set `gnss.reanchor_enabled: false` to opt out).**
+
+When GPS drops out, the filter dead-reckons and drifts. When fixes return, they disagree
+with the drifted estimate, so the outlier gate can reject them as outliers, and adaptive
+noise discounts the few that get through. The filter then stays wrong, sometimes for many
+minutes, while perfectly good fixes arrive. Measured on NCLT, most of the error on the
+worst sequences was in this recovery window, not in the outage itself.
+
+Re-anchoring watches for that state: the gate refusing most of what arrives, while the
+recent fixes agree with each other and with wheel odometry. When both hold, it moves the
+position onto the fixes instead of waiting for the gate to let them in. It moves position
+only, never heading.
+
+```yaml
+    gnss.reanchor_enabled: true
+```
+
+Every other re-anchoring setting (window, rejection fraction, buffer, odometry tolerance, cooldown) has a measured default; leave them unless you have
+data that says otherwise. Each re-anchor is reported on `/fusion/debug/gnss_status`
+(`reanchored`, `reanchor_jump_m`, `reanchor_count`) and in `/diagnostics`, because it is a
+deliberate jump in the published position and anything consuming the pose should know.
+
+**What it does, measured on all twelve NCLT sequences** (2026-10-26, corrected dataset
+player, offline replay of the shipped config with and without it, full-trajectory ATE RMSE,
+`tools/eval_20261025_results.md`): RMSE lower on 10 of 12, higher on none, identical on the two
+where it never fires. The largest change is 2012-08-20, 165.364 m to 45.669 m. Scored at GPS
+fix times it brings FusionCore below raw GPS on 2 of 12 sequences, both held out from
+development (2012-03-31 by 22.0%, 2012-10-28 by 5.6%). Through the ROS node on 2012-01-08 it
+read 10.882 m at fix times against replay's 10.898 m on the same points, checked against a
+pass band fixed before the run.
+
+**What it costs, on the same twelve:** the median error rose on 4 sequences (0.3% to 3.0%),
+and the output-rate jitter of the position rose on 3 (by up to 0.124). A re-anchor is a jump,
+and those are the price of it. On the seven held-out sequences, the rule a library default
+change has to pass was written before the test, and re-anchoring fails it on those two costs.
+That is why the library default stays off and the ground-robot profiles turn it on as a
+stated decision rather than a pass. The full tables and the rule are in
+`tools/benchmark_regression.md` and `tools/ship_rule.md`.
+
+## Declaring the platform
+
+`platform.profile` is a single parameter that answers one question: what can this
+robot actually observe? It is the only setting in FusionCore that changes other
+settings, so it is worth understanding before you use it.
+
+```yaml
+fusioncore:
+  ros__parameters:
+    platform.profile: ground_robot_flat
+```
+
+### Why a 23-state filter needs to be told
+
+FusionCore estimates 23 states. The textbook GNSS/INS error-state filter estimates 15.
+The extra eight are angular velocity, acceleration, the encoder yaw-rate bias, and the
+quaternion carried as four numbers instead of three, and some of them cannot be
+observed from the sensors on a wheeled robot:
+
+| the sensor measures | the filter estimates | result |
+|---|---|---|
+| `WZ + B_GZ` (gyro) | both separately | one equation, two unknowns |
+| `AX + B_AX + gravity` (accel) | all three | one equation, three unknowns |
+
+Measured on a 1.8 s in-place spin in `test_observability.cpp`, `r(WZ, B_GZ) = -0.998`. On
+NCLT with encoders the same correlation measured -0.63 to -0.04, so real driving locks the
+pair far less than that synthetic does. Where it is locked, the pair slides along an unobservable
+line at no measurement cost: the sum stays correct, so nothing objects, and anything
+integrating `WZ` on its own inherits the whole error. The literature agrees
+independently, that accelerometer bias is completely unobservable in straight motion
+and that for land vehicles the azimuth and its gyro bias are unobservable in straight
+motion and under constant acceleration.
+
+### The three values
+
+- **`general`** is the default and changes nothing. Estimate everything. This is the
+  right answer for drones, boats, handhelds and anything that leaves the ground plane,
+  and it is why no library default was changed to ship this.
+- **`ground_robot`** stops estimating acceleration and the bias states, and (from 0.5.0)
+  turns on `gnss.reanchor_enabled`, with the costs stated in
+  [Recovering after GPS comes back](#recovering-after-gps-comes-back-gnssreanchor_enabled).
+  **It requires wheel encoders.** Freezing the gyro bias is only safe because the
+  profile also treats the encoder's yaw rate as bias-free (the model carries an encoder
+  yaw-rate bias, which the profile freezes too), so the encoder carries the constraint.
+  **Measured 2026-10-22: "frozen" means slowed, not held.** The profile zeroes the bias process noises and priors, but the UKF adds a 1e-6 identity to P when it builds sigma points, and a zero-variance state triggers its identity-shift repair, so the biases still drift. On NCLT 2013-04-05 the gyro bias reached a median sigma of 0.053 rad/s and roamed up to about 0.18 rad/s. The measured improvements are what the profile does as shipped; the word "freeze" overstates the mechanism. Not yet fixed. On a
+  platform without odometry this profile is simply wrong.
+- **`ground_robot_flat`** is `ground_robot` plus a Z-position constraint at 0.3 m, for
+  terrain that really is flat: campus, warehouse, parking lot, most field work. Do not
+  use it where the robot genuinely climbs, because it will fight the real altitude
+  change.
+
+An unknown value refuses to configure rather than falling back to `general`, because
+you asked for something specific and would not have got it.
+
+### What it measured
+
+NCLT at 1x through the ROS node, ATE RMSE in metres, measured 2026-10-17. The fourth column is
+how far robot_localization moved on the same run: it consumes the same input and runs none of
+this code, so a control that stays put is what makes the FusionCore change attributable
+rather than merely coincident. These runs used the dataset player as it was before
+2026-10-25, which declared the accelerometer-derived tilt as a 0.57 degree attitude (since
+corrected), so they measure the profile's direction, not current figures.
+
+| sequence | `general` | `ground_robot_flat` | control moved | change |
+|---|---|---|---|---|
+| 2012-06-15 | 82.011 | **32.149** | -0.05% | **-60.8%** |
+| 2013-04-05 | 14.058 | **9.193** | +0.50% | **-34.6%** |
+| 2012-08-20 | 155.618 | 157.591 | +0.04% | +1.3% |
+| 2012-09-28 | 18.594 | **8.872** | +11.23% | **-52.3%** |
+
+2012-08-20 gets slightly worse, by about 10x its own 0.13% run-to-run spread, so the
+profile is not uniformly better and this page is not going to pretend otherwise.
+
+The 2012-09-28 row needs a caveat the others do not. Its control moved 11.23%, which
+would normally void the comparison, except that this sequence has a measured
+control-side spread of 11.05% of its own. So the control move is consistent with that
+sequence's noise rather than with a changed input, and the row is weaker evidence than
+the three above it.
+
+Four of the twelve NCLT sequences have been measured with the profile and **no hardware
+bag has.** Treat these as a measured direction, not as a number your robot will
+reproduce.
+
+### It only ever supplies defaults
+
+Anything you set explicitly wins over the profile. The node logs every value it
+supplied and every value of yours it kept:
+
+```
+[INFO] Platform profile: ground_robot_flat. 7 parameter(s) supplied, 1 kept from your config.
+[INFO]   ukf.q_gyro_bias                    0.002      KEPT (you set it, profile wanted 0)
+```
+
+So a profile is a starting point you can disagree with one line at a time, and you can
+see in the log which line won. The equivalent parameter bundles are also shipped as
+YAML in `fusioncore_datasets/config/profiles/` if you would rather read and copy the
+values than set one parameter; a test pins the two forms together so they cannot drift.
+
+### If you adopt a profile, delete the lines it replaces
+
+A profile supplies defaults, so a value already written in your YAML wins, even when
+it is the value the node would have used anyway. FusionCore's own rover config lists
+all four process noises at exactly their library defaults, and on that config a profile
+correctly keeps all four and applies almost nothing. Writing a number down is
+indistinguishable from meaning it. Delete what you are handing over, and read the
+startup log to confirm what was applied instead of assuming.
+
+### What it did on real hardware
+
+Three rover bags replayed offline through `fusioncore_core`, about 105 m driven each.
+Loop closure moved by less than the receiver's own 2.6 m sigma in every arm, with
+continuous GPS and with a 120 s blackout cut into the same logs, so nothing there is a
+measurement of accuracy. What it does establish is that freezing seven states broke
+nothing on real data. Excess path length fell 3 to 11% on 3 of 3 under the blackout,
+the same direction as the NCLT result.
+
+The NCLT-scale gain did not appear, and the likely reason is the course: 105 m over
+about 400 s with continuous 1 Hz fixes, against NCLT's 7.5 km with a 461 s blackout.
+Unobservable states need time and distance with nothing pinning them. If your robot
+drives further than it can see GPS, expect more than this; if it never loses sky, expect
+about this.
+
+### Check your bag first
+
+Run `tools/bag_report.py` on one of your own bags before changing this. If it reports
+that your IMU and wheels disagree about turn direction, or that the bag contains no
+manoeuvre that makes heading observable, fix that first. A profile cannot rescue a
+sensor that is wired backwards.
 
 ---
 
@@ -882,3 +1141,141 @@ When `gnss.use_gps_fix: true`, FusionCore picks the best available covariance so
 
 !!! warning "Upgrading from an older config"
     If your YAML has `ukf.q_orientation: 0.01`, change it to `1.0e-9` or delete the line. The old value corrupts quaternion math at typical IMU rates and causes yaw drift and Z-axis rise in simulation.
+
+    time_offset.estimate_interval_s: 10.0
+    # How often, in seconds of filter time, to recompute the measured offset between
+    # the IMU and encoder clocks. 0 disables the estimator entirely.
+    #
+    # The filter has always GUARDED against clock disagreement: a measurement whose
+    # stamp lags the filter clock by more than max_measurement_delay is dropped and
+    # counted as DELAY_TOO_LARGE. That is safe, and it throws the data away. This
+    # measures the offset so it can be corrected instead.
+    #
+    # It needs no extra hardware, because the gyro's z rate and a differential
+    # drive's encoder yaw rate are the same signal observed twice: the lag that
+    # maximises their agreement IS the offset between their clocks. Normalised
+    # cross-correlation over a grid of candidate lags, then a parabolic refinement
+    # through the peak, which gets below the 10 ms grid step.
+    #
+    # Measured accuracy on synthetic data with realistic gyro noise: 0.8 ms. The
+    # estimate is SCALE INVARIANT, so a 28.5% encoder scale error (the real ratio
+    # measured on NCLT in issue #169) does not move it.
+    #
+    # It refuses rather than guessing in three cases: nothing is turning, so every
+    # lag fits a constant equally well; the window is shorter than 10 s, because a
+    # short window finds a confident peak in noise; and the two streams are
+    # ANTI-correlated, which is not a timing problem at all but a sign convention
+    # problem, reported as anti_correlated so it is diagnosed rather than hidden.
+
+    encoder.time_offset: 0.0
+    # Seconds added to every encoder timestamp before use. Zero by default, so it is
+    # inert until you set it.
+    #
+    # APPLYING is deliberately a separate, manual decision from estimating. Read the
+    # reported estimate, decide whether you believe it, then set this. A filter that
+    # silently shifted a sensor stream would be very hard to debug the first time it
+    # was wrong, and the behaviour being replaced here was already too quiet.
+    #
+    # The reported offset is what to ADD to align the streams, so the signs match.
+
+    imu.gyro_bias_initial_sigma: 0.175
+    imu.accel_bias_initial_sigma: 0.30
+    # How well you know the sensor's zero offset AT STARTUP, as a 1-sigma
+    # (rad/s for the gyro, m/s^2 for the accelerometer).
+    #
+    # NOT an ordinary tuning knob. A gyro measures rate + bias, so the two are not
+    # separately observable from the gyro alone, and the filter divides a reading
+    # between them in proportion to their covariances. This sets that division.
+    #
+    # With n rate sensors each carrying its own bias, all measuring the same rate,
+    # and r = P_wz / P_bias, the minimum-variance split is
+    #
+    #     WZ fraction = n*r / (1 + n*r)       each bias fraction = 1 / (1 + n*r)
+    #
+    # Measured on this filter, where r works out to exactly 2 * P0_wz / P0_bias,
+    # confirmed across four orders of magnitude with a gyro and an encoder (n = 2):
+    #
+    #     P0(bias) 0.1    -> WZ gets 80.00%      P0(bias) 0.01   -> 97.56%
+    #     P0(bias) 0.05   -> WZ gets 88.89%      P0(bias) 0.001  -> 99.75%
+    #
+    # Until 2026-10-06 every state was initialised at 0.1, which is a gyro bias sigma
+    # of 0.316 rad/s, or 18 deg/s. No MEMS gyro is that bad. Claiming it handed 20%
+    # of every yaw rate to the bias, and since yaw integrates the rate alone, yaw
+    # advanced at 80% of truth. That was the measured 81.6% in issue #150.
+    #
+    # THE DEFAULT IS DELIBERATELY LOOSE. Datasheet initial zero-rate offset, which is
+    # what an UNCALIBRATED driver hands the filter at boot:
+    #
+    #     MPU-6050    +/- 20 deg/s  (0.35 rad/s)
+    #     ICM-20948   +/-  5 dps    (0.087 rad/s)
+    #
+    # Both are everywhere on hobby ROS robots. 0.175 rad/s is 10 deg/s, which covers
+    # a raw MPU-6050 without claiming to know a bias nobody measured.
+    #
+    # TIGHTEN IT to 0.01 or below if your driver calibrates the gyro at startup or
+    # you measured the offset yourself. That returns nearly all of the yaw rate to
+    # the rate state instead of leaking ~20% into the bias.
+    #
+    # The cost of getting it wrong, measured at a 0.6 rad/s turn over 10 s with no
+    # stop, for a 20 deg/s true bias (a raw MPU-6050):
+    #
+    #     tight prior (0.02)    103.2 deg of yaw error
+    #     loose prior (0.175)    77.2 deg of yaw error
+    #
+    # The loose one is better, and NEITHER is acceptable. A prior cannot fix an
+    # uncalibrated gyro, it can only choose which way to be wrong. If your driver
+    # does not calibrate, the only real answer is to keep the robot still for a few
+    # seconds at startup so ZUPT can measure the bias: it converges immediately once
+    # a zero-velocity update fires, whatever the prior was.
+    #
+    # This does NOT make the pair observable, and the filter will still report the
+    # gyro bias as UNOBSERVABLE until a zero-velocity update or an absolute heading
+    # actually fires. A better prior starts the split somewhere defensible; only a
+    # measurement separates the pair. See docs/observability.md.
+    #
+    # These are NODE-LEVEL parameters. Initial covariance is not filter config, it is
+    # the State handed to init(), so fusioncore_core has no field for it by design. A
+    # library user sets State::P directly and needs no parameter at all.
+
+    encoder.yaw_scale_model: false
+    encoder.wz_scale_initial_sigma: 0.30
+    # How encoder yaw-rate error is modelled.
+    #
+    #   false (default)  z_wz = WZ + B_EWZ          an additive bias
+    #   true             z_wz = (1 + B_EWZ) * WZ    a multiplicative scale
+    #
+    # An encoder has no constant additive yaw-rate offset. Its errors are scale
+    # (track width), speed-proportional (wheel radius) and slip events. None is a
+    # constant. Modelling scale as a bias creates a null direction that the GYRO bias
+    # hides in: the gyro reads WZ + b_g and the encoder reads WZ + b_ewz, which is two
+    # equations and three unknowns.
+    #
+    # Why the scale model removes it, which is not obvious: ON A STRAIGHT DRIVE the
+    # encoder reads zero yaw rate whatever the scale is, since (1 + s) * 0 = 0. So
+    # every straight stretch is a KNOWN ZERO for the yaw rate, and the gyro's reading
+    # there is its bias. The robot never has to stop. With the additive model the same
+    # stretch gives WZ = -b_ewz, which pins nothing.
+    #
+    # Measured over 30 s of alternating 3 s straight and 3 s turning, yaw error:
+    #
+    #   gyro bias 20 dps, clean encoder    additive -119.12 deg   scale   +9.61 deg
+    #   encoder scale 1.297, turn 0.15     additive  +45.51       scale   +3.17
+    #                        turn 0.60     additive  +66.68       scale   +9.62
+    #                        turn 1.20     additive  -47.51       scale   +7.66
+    #
+    # The additive model's error swings with turn rate because a constant-bias proxy
+    # for a scale error only holds at one speed. The scale model recovers 0.30 against
+    # a true 0.297 at every rate.
+    #
+    # KNOWN LIMIT, and it is not a bug: a constant-rate circle with no straight
+    # segments is still unobservable, and the scale model is WORSE there (-145 deg
+    # against the additive model's -57). With no straight stretch there is no known
+    # zero, so two equations cannot resolve three unknowns. If your robot only ever
+    # drives circles at one rate, this will not help you.
+    #
+    # Slip is handled by the existing chi-squared gate, so outlier_rejection must be
+    # on. Measured: a 1 s slip burst left the scale at 0.30, identical to the run
+    # without it.
+    #
+    # OFF BY DEFAULT because it is unvalidated on real data. When on, B_EWZ holds a
+    # DIMENSIONLESS scale error, not a rad/s bias.
