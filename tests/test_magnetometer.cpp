@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <limits>
 #include "fusioncore/fusioncore.hpp"
 #include "fusioncore/sensors/magnetometer.hpp"
 #include "fusioncore/motion_model.hpp"
@@ -52,14 +53,127 @@ TEST(MagnetometerTest, FlatPointingWest) {
   EXPECT_NEAR(std::abs(yaw), M_PI, 1e-9);
 }
 
+// ─── The lockout found on the rover, 2026-09-15 ──────────────────────────────
+// First time the magnetometer was ever enabled on real hardware it delivered
+// 2499 clean readings, |B| steady at 56.46 uT, zero failed, and the filter
+// rejected every single one of them with CHI2_FAILED.
+//
+// The cause is circular reasoning, not a bad sensor. The state is born at yaw 0
+// with P(QZ,QZ) = 1e-8, which claims a hundredth of a degree of certainty about
+// a heading nobody ever measured. A magnetometer that disagrees by any real
+// amount then fails chi2 forever, so the one sensor able to fix heading is the
+// one sensor locked out. The GPS track heading path already documents this trap
+// and skips its own gate on first fusion; this path did not.
+//
+// NOTE the config here deliberately leaves outlier_rejection ON, unlike
+// make_fc_with_mag(), because the gate is the thing under test.
+TEST(MagnetometerTest, LockedOutByAHeadingTheFilterInvented) {
+  FusionCoreConfig cfg;
+  cfg.outlier_rejection   = true;     // the point of the test
+  cfg.mag.noise_rad       = 0.05;
+  cfg.mag.chi2_threshold  = 9.21;
+  cfg.mag.declination_rad = 0.0;
+  cfg.motion_model = create_motion_model("DifferentialDrive");
+
+  FusionCore fc(cfg);
+  State initial;
+  initial.P(X, X) = 1.0;
+  initial.P(Y, Y) = 1.0;
+  fc.init(initial, 0.0);
+
+  // The robot is genuinely pointing 40 degrees away from the yaw the filter
+  // assumed. Field for a flat robot at yaw y is [Bh*sin(y), Bh*cos(y), 0]
+  // under this convention (see FlatPointingNorth above).
+  const double truth = 40.0 * M_PI / 180.0;
+  const double bh = 25.6e-6;              // the rover's measured horizontal field
+  const double mx = bh * std::sin(truth);
+  const double my = bh * std::cos(truth);
+
+  const double dt = 0.01, g = 9.80665;
+  int accepted = 0;
+  for (int step = 1; step * dt <= 120.0 + 1e-9; ++step) {
+    const double t = step * dt;
+    fc.update_imu(t, 0, 0, 0, 0, 0, g);
+    if (step % 5 == 0)                      // 20 Hz, as the rover publishes
+      if (fc.update_magnetometer(t, mx, my, 0.0)) ++accepted;
+  }
+
+  EXPECT_GT(accepted, 0)
+    << "every magnetometer reading was rejected, which is the rover's 2499 for "
+       "2499 all over again";
+
+  double roll, pitch, yaw;
+  const State& s = fc.get_state();
+  quat_to_euler(s.x[QW], s.x[QX], s.x[QY], s.x[QZ], roll, pitch, yaw);
+  EXPECT_NEAR(yaw, truth, 10.0 * M_PI / 180.0)
+    << "heading never converged on the magnetometer; it sits at "
+    << yaw * 180.0 / M_PI << " deg against a truth of " << truth * 180.0 / M_PI;
+
+  EXPECT_EQ(fc.get_status().heading_source, HeadingSource::MAGNETOMETER)
+    << "the magnetometer never became the heading source";
+}
+
+// And the gate must still WORK once heading is established, or the fix above
+// would have traded a lockout for no outlier rejection at all.
+TEST(MagnetometerTest, GateStillRejectsOnceHeadingIsEstablished) {
+  FusionCoreConfig cfg;
+  cfg.outlier_rejection   = true;
+  cfg.mag.noise_rad       = 0.05;
+  cfg.mag.chi2_threshold  = 9.21;
+  cfg.mag.declination_rad = 0.0;
+  cfg.motion_model = create_motion_model("DifferentialDrive");
+
+  FusionCore fc(cfg);
+  State initial;
+  initial.P(X, X) = 1.0;
+  initial.P(Y, Y) = 1.0;
+  fc.init(initial, 0.0);
+
+  const double bh = 25.6e-6;
+  const double dt = 0.01, g = 9.80665;
+
+  // Settle on a steady heading first.
+  for (int step = 1; step * dt <= 120.0 + 1e-9; ++step) {
+    const double t = step * dt;
+    fc.update_imu(t, 0, 0, 0, 0, 0, g);
+    if (step % 5 == 0) fc.update_magnetometer(t, 0.0, bh, 0.0);
+  }
+  ASSERT_EQ(fc.get_status().heading_source, HeadingSource::MAGNETOMETER);
+
+  // Now hand it a reading 90 degrees out, the shape of a steel post or a motor.
+  const bool taken = fc.update_magnetometer(120.5, bh, 0.0, 0.0);
+  EXPECT_FALSE(taken)
+    << "a 90 degree jump was accepted, so the chi2 gate is no longer doing "
+       "anything once heading is established";
+}
+
 // ─── Test 4: Declination offset applied correctly ────────────────────────────
 
+// This test used to assert yaw == +0.1 here, which pinned the formula's own sign
+// error rather than the physics. A field straight along body +y means the body faces
+// MAGNETIC east. With magnetic north 0.1 rad east of true north, magnetic east is
+// 0.1 rad clockwise of true east, so the true ENU yaw is -0.1.
 TEST(MagnetometerTest, DeclinationOffset) {
   MagParams p;
-  p.declination_rad = 0.1;  // 0.1 rad positive declination
-  // Pointing east (yaw=0 true north reference). m_body = [0, Bh, 0].
+  p.declination_rad = 0.1;  // magnetic north 0.1 rad east of true north
   double yaw = mag_yaw_from_field(0.0, 1.0, 0.0, p, 0.0, 0.0);
-  EXPECT_NEAR(yaw, 0.1, 1e-9);
+  EXPECT_NEAR(yaw, -0.1, 1e-9);
+}
+
+// The physics, built forward: put the body at a known TRUE yaw, construct the field
+// it would measure, and require the true yaw back. World field direction in ENU is
+// (sin D, cos D); in a body at yaw psi it reads (sin(psi + D), cos(psi + D)).
+TEST(MagnetometerTest, DeclinationRecoversTrueYaw) {
+  for (double D : {-0.18, 0.0, 0.1, 0.27}) {
+    MagParams p;
+    p.declination_rad = D;
+    for (double psi : {0.0, 1.0, -2.0, 3.0}) {
+      const double yaw = mag_yaw_from_field(std::sin(psi + D), std::cos(psi + D), 0.0,
+                                            p, 0.0, 0.0);
+      const double err = std::atan2(std::sin(yaw - psi), std::cos(yaw - psi));
+      EXPECT_NEAR(err, 0.0, 1e-9) << "D=" << D << " psi=" << psi;
+    }
+  }
 }
 
 // ─── Test 5: Hard iron correction ────────────────────────────────────────────
@@ -152,8 +266,16 @@ TEST(MagnetometerTest, Chi2GateRejectsOutlier) {
   fc.init(initial, 0.0);
   fc.update_imu(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.80665);
 
-  // Filter is at yaw=0. Feed a pi/2 reading with noise_rad=0.001: huge outlier.
-  bool accepted = fc.update_magnetometer(0.01, 1.0, 0.0, 0.0);  // yaw=pi/2
+  // Establish a heading first. This used to feed the outlier as the very FIRST
+  // reading, back when the gate ran against init()'s fabricated yaw of 0. That
+  // is not a test of the gate, it is a test of the lockout that cost the rover
+  // 2499 consecutive rejections on 2026-09-15: the first reading now sets
+  // heading, because there is nothing yet to judge it against.
+  ASSERT_TRUE(fc.update_magnetometer(0.01, 0.0, 1.0, 0.0));   // yaw=0, sets it
+
+  // Now the filter genuinely knows it is at yaw=0. A pi/2 reading against
+  // noise_rad=0.001 is a huge outlier and must be thrown out.
+  bool accepted = fc.update_magnetometer(0.02, 1.0, 0.0, 0.0);  // yaw=pi/2
   EXPECT_FALSE(accepted);
   EXPECT_EQ(fc.get_magnetometer_debug().reason, MagRejectionReason::CHI2_FAILED);
   EXPECT_GT(fc.get_magnetometer_debug().mahalanobis_sq,
@@ -211,7 +333,11 @@ TEST(MagnetometerTest, OutlierCounterIncremented) {
   fc.init(initial, 0.0);
   fc.update_imu(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.80665);
 
-  fc.update_magnetometer(0.01, 1.0, 0.0, 0.0);  // outlier
+  // A heading has to exist before a reading can be an outlier against it. See
+  // Chi2GateRejectsOutlier above for why this line is here.
+  ASSERT_TRUE(fc.update_magnetometer(0.01, 0.0, 1.0, 0.0));   // yaw=0, sets it
+
+  fc.update_magnetometer(0.02, 1.0, 0.0, 0.0);  // outlier
 
   auto status = fc.get_status();
   EXPECT_GT(status.mag_outliers, 0);
@@ -396,4 +522,61 @@ TEST(MagnetometerTest, MicroteslaParameterLooksWrong) {
     Eigen::Vector3d(1.2e-5, -3.0e-6, 8.0e-6).norm()));
   EXPECT_TRUE (mag_value_looks_like_microtesla(
     Eigen::Vector3d(12.0, -3.0, 8.0).norm()));
+}
+
+// ─── Test 17: A reading carrying NaN never reaches the filter ─────────────────
+//
+// See GNSSTest.NonFiniteFixIsRejectedAndNamed and #103. The magnetometer is the
+// worst place for one. While no heading source exists, the first reading is
+// written straight into the orientation without meeting the chi2 gate (see
+// LockedOutByAHeadingTheFilterInvented), so a NaN reading went directly into
+// the quaternion and became the heading source. Both paths are covered, before
+// and after a heading has been established.
+TEST(MagnetometerTest, NonFiniteReadingIsRejectedAndNamed) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+  const double bh = 25.6e-6;   // the rover's measured horizontal field
+
+  for (const bool heading_established : {false, true}) {
+    for (int field = 0; field < 3; ++field) {
+      for (const double bad : {nan, inf}) {
+        FusionCoreConfig cfg;
+        cfg.outlier_rejection   = true;
+        cfg.mag.noise_rad       = 0.05;
+        cfg.mag.chi2_threshold  = 9.21;
+        cfg.mag.declination_rad = 0.0;
+        FusionCore fc(cfg);
+        State initial;
+        fc.init(initial, 0.0);
+
+        // A flat robot at yaw 0 reads [0, Bh, 0] (see FlatPointingNorth).
+        const HeadingSource source_before = heading_established
+          ? HeadingSource::MAGNETOMETER : HeadingSource::NONE;
+        if (heading_established) {
+          ASSERT_TRUE(fc.update_magnetometer(0.05, 0.0, bh, 0.0));
+        }
+        ASSERT_EQ(fc.get_status().heading_source, source_before);
+
+        double reading[3] = {0.0, bh, 0.0};
+        reading[field] = bad;
+        EXPECT_FALSE(fc.update_magnetometer(0.1, reading[0], reading[1], reading[2]))
+            << "field " << field << " = " << bad << " was accepted, heading "
+            << (heading_established ? "established" : "not yet established");
+        EXPECT_EQ(fc.get_magnetometer_debug().reason, MagRejectionReason::NOT_FINITE)
+            << "field " << field << " = " << bad << " was not rejected as NOT_FINITE";
+        EXPECT_EQ(fc.get_status().mag_last_rejection_reason, MagRejectionReason::NOT_FINITE);
+        EXPECT_EQ(fc.mag_outcome_tally()[static_cast<int>(MagRejectionReason::NOT_FINITE)].count, 1)
+            << "the rejection must be counted in the outcome tally";
+        EXPECT_EQ(fc.get_status().heading_source, source_before)
+            << "a rejected reading must not change the heading source";
+        EXPECT_TRUE(fc.get_state().x.allFinite())
+            << "field " << field << " = " << bad << " reached the state";
+        EXPECT_TRUE(fc.get_state().P.allFinite())
+            << "field " << field << " = " << bad << " reached the covariance";
+
+        EXPECT_TRUE(fc.update_magnetometer(0.15, 0.0, bh, 0.0))
+            << "an ordinary reading after field " << field << " was not accepted";
+      }
+    }
+  }
 }
