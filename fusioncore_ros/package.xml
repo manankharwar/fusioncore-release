@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>fusioncore_ros</name>
-  <version>0.4.0</version>
+  <version>0.5.0</version>
   <description>ROS 2 UKF sensor fusion for IMU, wheel encoders, GPS, and visual SLAM pose. 23-state filter with ECEF-native GPS handling, online gyro/accel/encoder bias estimation, adaptive noise covariance, chi-squared outlier rejection on every sensor, and map reinitialization recovery for GPS-denied operation. Drop-in robot_localization alternative. Benchmarked on 12 full-length NCLT sequences: wins 10 of 12 vs robot_localization EKF.</description>
   <maintainer email="manan.kharwar@ansys.com">Manan Kharwar</maintainer>
   <license>Apache-2.0</license>
@@ -46,8 +46,17 @@
   <depend>robot_localization</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
+  <!-- test_platform_profile.py. Without this the find_package is QUIET, so a clean
+       container built from these deps would skip the test instead of running it. -->
+  <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>launch_testing_ament_cmake</test_depend>
   <test_depend>launch_testing_ros</test_depend>
+  <!-- test_platform_profile.py drives the node through the ros2 CLI. The buildfarm installs
+       only declared deps, so without these all four of its tests fail there with no ros2. -->
+  <test_depend>ros2run</test_depend>
+  <test_depend>ros2node</test_depend>
+  <test_depend>ros2lifecycle</test_depend>
+  <test_depend>ros2param</test_depend>
 
   <export>
     <build_type>ament_cmake</build_type>
