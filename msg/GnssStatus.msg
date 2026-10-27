@@ -38,6 +38,11 @@ float64 heading_sigma_deg   # heading 1-sigma (degrees) used to decide lever arm
 string  track_heading_state
 float64 track_heading_baseline_m   # displacement since the reference fix (m)
 float64 track_heading_sigma_rad    # sigma_xy/baseline, -1.0 if not computed
+# Angle the bearing window thinks the robot has turned, degrees. -1.0 when
+# gnss.track_heading_max_window_turn_deg is 0, i.e. the angle gate is off and the
+# instantaneous rate check is in force instead. Added for #144: the gate was
+# discarding ~300 windows a run and no field could say why.
+float64 track_heading_window_turn_deg
 
 # Cross-check on whichever ABSOLUTE heading source is in charge, in degrees:
 # the filter's yaw minus the GPS track bearing, median over recent straight
@@ -55,3 +60,17 @@ int32   heading_vs_track_n
 # from this receiver rather than configured. 0.0 = gate not active yet.
 float64 continuity_limit_m
 bool    continuity_learned
+
+# Re-anchor events. A re-anchor is a DELIBERATE position discontinuity: the filter
+# gave up on correcting itself incrementally and jumped the state onto the recent
+# GNSS fixes. On NCLT 2012-08-20 one moved the estimate 787 m and took the error
+# from 798 m to 16.8 m, so the jump is the fix and not the fault. A consumer that
+# cannot see it happen has no way to tell it apart from divergence, and would chase
+# it or replan against it; both are wrong. reanchored is true on exactly the fix
+# that re-anchored, so a nav stack can act on the edge rather than poll a counter.
+# A re-anchor moves POSITION ONLY: there is no heading discontinuity to report,
+# because the yaw reset that used to accompany it was removed after showing no
+# measurable benefit.
+bool    reanchored
+float64 reanchor_jump_m
+int32   reanchor_count
