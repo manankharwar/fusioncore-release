@@ -6,6 +6,7 @@
 #include "fusioncore/fusioncore.hpp"
 #include "fusioncore/motion_model.hpp"
 #include <cmath>
+#include <limits>
 
 using namespace fusioncore;
 using namespace fusioncore::sensors;
@@ -364,4 +365,86 @@ TEST(EncoderTest, RejectionRecordsWhyAndHowSurprising) {
       << "an encoder update was thrown away without recording why";
   EXPECT_GT(bad.encoder_chi2, bad.encoder_chi2_threshold)
       << "the published distance must actually explain the rejection";
+}
+
+// The IMU's three gates are distinguishable, not just counted.
+//
+// #124 again, and this one is the reason a bare counter is not enough. Three
+// separate gates increment imu_outliers_: the rate measurement, the roll/pitch
+// tilt from gravity, and the full orientation quaternion. They fail for
+// different reasons and send you to different parameters, so "imu_outliers: 47"
+// is a number you cannot act on. Driving the rate gate specifically and checking
+// the reason names that gate, rather than a generic CHI2_FAILED, is what the
+// enum buys.
+TEST(EncoderTest, ImuRejectionNamesWhichOfTheThreeGatesFired) {
+  FusionCoreConfig cfg;
+  cfg.imu_has_magnetometer = false;
+  cfg.motion_model = create_motion_model("DifferentialDrive");
+  FusionCore fc(cfg);
+  State s0;
+  fc.init(s0, 0.0);
+
+  const double dt = 0.01, g = 9.80665;
+  for (int step = 1; step <= 400; ++step) {
+    const double t = step * dt;
+    fc.update_imu(t, 0, 0, 0, 0, 0, g);
+    if (step % 2 == 0) fc.update_encoder(t, 1.0, 0.0, 0.0);
+  }
+
+  const auto good = fc.get_status();
+  EXPECT_EQ(good.imu_reason, ImuRejectionReason::ACCEPTED);
+  EXPECT_GE(good.imu_chi2, 0.0) << "the gate ran, so its distance must be reported";
+
+  // A yaw rate no ground robot produces: 200 rad/s, about 1900 rpm.
+  fc.update_imu(4.01, 0, 0, 200.0, 0, 0, g);
+  const auto bad = fc.get_status();
+
+  std::cerr << "  accepted: reason " << static_cast<int>(good.imu_reason)
+            << " chi2 " << good.imu_chi2 << "\n"
+            << "  rejected: reason " << static_cast<int>(bad.imu_reason)
+            << " chi2 " << bad.imu_chi2 << "\n";
+
+  EXPECT_EQ(bad.imu_reason, ImuRejectionReason::CHI2_RATE)
+      << "the rate gate fired, so the reason must name the rate gate and not "
+         "merely say an IMU update was discarded";
+  EXPECT_GT(bad.imu_chi2, good.imu_chi2)
+      << "a 200 rad/s yaw must be more surprising than a still IMU";
+}
+
+// ─── A reading carrying NaN must never reach the filter ─────────────────────
+//
+// See GNSSTest.NonFiniteFixIsRejectedAndNamed and #103. The chi2 gate cannot
+// catch it, because a NaN compares false against the threshold. The variances
+// count too: a NaN one falls back to the defaults, but an infinite one passes
+// the > 0 test and becomes R.
+TEST(EncoderTest, NonFiniteReadingIsRejectedAndNamed) {
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double inf = std::numeric_limits<double>::infinity();
+
+  for (int field = 0; field < 6; ++field) {
+    for (const double bad : {nan, inf}) {
+      FusionCoreConfig cfg;
+      FusionCore fc(cfg);
+      State s0;
+      fc.init(s0, 0.0);
+
+      // Standing still, with the variances a wheel odometry driver publishes:
+      // vx, vy, wz, var_vx, var_vy, var_wz.
+      double reading[6] = {0.0, 0.0, 0.0, 0.01, 0.01, 0.02};
+      reading[field] = bad;
+      fc.update_encoder(0.01, reading[0], reading[1], reading[2],
+                        reading[3], reading[4], reading[5]);
+
+      EXPECT_EQ(fc.get_status().encoder_reason, EncoderRejectionReason::NOT_FINITE)
+          << "field " << field << " = " << bad << " was not rejected as NOT_FINITE";
+      EXPECT_TRUE(fc.get_state().x.allFinite())
+          << "field " << field << " = " << bad << " reached the state";
+      EXPECT_TRUE(fc.get_state().P.allFinite())
+          << "field " << field << " = " << bad << " reached the covariance";
+
+      fc.update_encoder(0.02, 0.0, 0.0, 0.0, 0.01, 0.01, 0.02);
+      EXPECT_EQ(fc.get_status().encoder_reason, EncoderRejectionReason::ACCEPTED)
+          << "an ordinary reading after field " << field << " was not accepted";
+    }
+  }
 }
