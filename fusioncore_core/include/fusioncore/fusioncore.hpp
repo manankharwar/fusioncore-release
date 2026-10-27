@@ -1,5 +1,6 @@
 #pragma once
 #include "fusioncore/ukf.hpp"
+#include "fusioncore/time_offset.hpp"
 #include "fusioncore/state.hpp"
 #include "fusioncore/motion_model.hpp"
 #include "fusioncore/sensors/imu.hpp"
@@ -73,6 +74,117 @@ struct FusionCoreConfig {
   // is being incorrectly validated during tight turns (parking lot maneuvers).
   double gps_track_heading_min_speed    = 0.2;   // m/s
   double gps_track_heading_max_yaw_rate = 0.3;   // rad/s (~17 deg/s)
+
+  // Discard the bearing window on the ANGLE TURNED across it, in degrees,
+  // instead of on an instantaneous yaw-rate sample. 0.0 keeps the rate check
+  // above and is the default, so nothing changes until this is set.
+  //
+  // Why it exists (#144). max_yaw_rate is tested against one sample, so a single
+  // 20 ms jolt off a stone discards the whole accumulated baseline. Measured over
+  // five rover bags on ordinary grass: the rate gate latched 791-887 times per run
+  // and the baseline never got past 8.8-11.9 m against the 25 m that fusion needs,
+  // so ZERO bearings were ever fused. The excursions were not noise and not
+  // corners: median duration one sample, median NET angle 0.43-0.52 degrees,
+  // 93-100% under 2 degrees, and zero excursions while parked. Meanwhile the four
+  // scripted 90 degree corners were driven at 0.09 rad/s achieved, under the 0.3
+  // threshold, so the gate caught none of the turns it exists for.
+  //
+  // At 5.0 degrees the same five bags reach 26.7-29.9 m and clear 25 m on every
+  // one, latching 103-110 times instead of 791-887. Raising max_yaw_rate instead
+  // was tried across four bags and rejected: it lets a bearing span a real turn,
+  // which injects a wrong heading.
+  //
+  // The angle is integrated from the RAW GYRO. The other three sources were each
+  // tried and each fails: the yaw ESTIMATE swings 122 degrees on a 1.03 degree
+  // truth and sometimes reverses sign because the quaternion covariance is
+  // unbounded; the filter's WZ state accumulates its own noise and bias, so six
+  // seconds of driving straight trips the gate; and wheel encoders over-report
+  // rotation under slip, 129 degrees out on one of the five bags. Integrating the
+  // raw gyro therefore needs IMU samples: on a platform with no gyro, leave this
+  // at 0.0 and keep the rate check.
+  double gps_track_heading_max_window_turn_deg = 0.0;  // degrees, 0 = use max_yaw_rate
+
+  // GNSS rotation heading bootstrap (RTK only in practice).
+  //
+  // When the antenna sits off base_link, rotating the robot sweeps the antenna
+  // along an arc. The observed GNSS displacement, the relative yaw over the same
+  // window and the known lever arm give absolute heading without the robot having
+  // to drive in a straight line, which is what gps_track_heading needs.
+  //
+  // This is an RTK-grade feature and the noise model enforces that on its own
+  // rather than through a flag: passing max_sigma at min_arc_baseline requires the
+  // lateral sigma of the displacement between the two fixes to be under about
+  // 10 cm, so roughly 7 cm per fix. Consumer GNSS at 2 to 5 m is far outside that
+  // and the bootstrap simply never fires. Leaving it enabled costs nothing there.
+  bool   gps_rotation_heading_enabled              = true;
+  double gps_rotation_heading_min_yaw_delta        = 1.0;   // radians of rotation needed
+  double gps_rotation_heading_min_arc_baseline     = 0.25;  // metres of predicted arc
+  double gps_rotation_heading_max_base_translation = 0.20;  // metres the base may move
+  double gps_rotation_heading_max_sigma            = 0.4;   // radians, reject above this
+  double gps_rotation_heading_sigma_floor          = 0.05;  // radians, floor on the result
+  double gps_rotation_heading_delta_yaw_sigma      = 0.03;  // radians, FLOOR on delta-yaw sigma
+  double gps_rotation_heading_max_window_s         = 10.0;  // seconds, window lifetime
+  // How many sigma the observed displacement length may differ from the length the
+  // rotation model predicts before the window is discarded. The angle of a
+  // displacement that is the wrong size carries no heading information.
+  double gps_rotation_heading_max_len_residual_sigma = 3.0;
+
+  // ---- how encoder yaw-rate error is modelled ----
+  //
+  // false (default): z_wz = WZ + B_EWZ, an additive bias.
+  // true:            z_wz = (1 + B_EWZ) * WZ, a multiplicative scale.
+  //
+  // An encoder has no constant additive yaw-rate offset. Its errors are scale (track
+  // width), speed-proportional (wheel radius) and slip. Modelling scale as a bias
+  // creates a null direction in which the gyro bias can hide, measured at 77 deg of
+  // yaw error in 10 s from a 20 deg/s gyro bias.
+  //
+  // The scale model removes it because a STRAIGHT DRIVE reads zero yaw rate whatever
+  // the scale is, so every straight stretch is a known zero for WZ and the gyro's
+  // reading there is its bias. No stop required.
+  //
+  // OFF BY DEFAULT until it is measured on real data. When on, B_EWZ is a
+  // DIMENSIONLESS scale error, not a rad/s bias, and encoder_wz_scale_initial_sigma
+  // applies instead of gyro_bias_initial_sigma.
+  bool   encoder_yaw_scale_model = false;
+  double encoder_wz_scale_initial_sigma = 0.30;   // dimensionless, 30%
+
+    // Initial bias uncertainty is NOT filter config: it belongs to the State you hand
+  // init(), as State::P. It lived here briefly and check_config_wiring.py was right
+  // to reject it ("mapped to config.gyro_bias_initial_sigma, but never read by
+  // fusioncore_core"): a config field the core ignores is a lie to a library user.
+  //
+  // The ROS wrapper exposes imu.gyro_bias_initial_sigma and friends and builds P from
+  // them, which is a node-level concern the checker allows. A library user sets P
+  // directly, which is the natural API and needs no parameter at all.
+  //
+  // Why it matters at all: the gyro measures rate + bias, so the two are not
+  // separately observable and the filter divides a reading between them in proportion
+  // to their covariances. Datasheet initial zero-rate offset is +/- 20 deg/s on an
+  // MPU-6050 and +/- 5 dps on an ICM-20948, so a tight prior is tight-and-WRONG on an
+  // uncalibrated driver: measured 103 deg of yaw error in 10 s against a loose
+  // prior's 77. Neither is acceptable, which is the argument for measuring the bias
+  // at boot rather than guessing it. See docs/observability.md.
+
+  // ---- inter-sensor time offset ----
+  //
+  // The filter has always GUARDED against clock disagreement: reject_stale_from_skew
+  // drops a measurement whose stamp lags the filter clock by more than
+  // max_measurement_delay, and DELAY_TOO_LARGE counts it. Safe, and it throws the
+  // data away. Nothing measured the offset so it could be corrected instead.
+  //
+  // It is measurable with no extra hardware, because the gyro's z rate and a
+  // differential drive's encoder yaw rate are the same signal observed twice, so the
+  // lag that maximises their agreement is the offset. See time_offset.hpp.
+  //
+  // Estimating is ON by default because it only reports. APPLYING is a separate,
+  // manual decision: a filter that silently shifted a sensor stream would be very
+  // hard to debug the first time it was wrong, and the behaviour being replaced here
+  // was already too quiet.
+  double time_offset_estimate_interval_s = 10.0;   // 0 disables the estimator
+  // Added to every encoder timestamp before use. Set it from the reported estimate
+  // once you believe it. Reported offset is what to ADD, so the sign matches.
+  double encoder_time_offset = 0.0;                // seconds
 
   // Lever arm correction is only applied when heading uncertainty is below this threshold.
   // When heading_sigma exceeds this value (e.g. during prolonged turns with no GPS track
@@ -164,6 +276,36 @@ struct FusionCoreConfig {
 
   // Learning rate: how fast R adapts to estimated noise (0.0 = off, 0.1 = fast)
   double adaptive_alpha = 0.01;
+
+  // Hard ceiling on an adapted R, as a multiple of the configured nominal. 0 means
+  // unbounded, which is the current behaviour and the default so nothing moves.
+  //
+  // adapt_R moves R toward the measured innovation covariance and clamps it only
+  // from BELOW. That is a positive feedback loop: a wrong filter produces large
+  // innovations, R grows toward them, the update carries less weight AND the
+  // chi-squared gate widens because it normalises by S = H*P*H' + R, so the filter
+  // gets wronger. Measured on NCLT 2013-04-05 with the shipped config, the gyro R
+  // reached 1723x its configured value: var(WZ + B_GZ) of 1.551077e-02 against a
+  // configured 9.000e-06. With adaptation off the same quantity is 8.912238e-06,
+  // a ratio of 1.0 to nominal, which is what confirms the gyro is otherwise fused
+  // correctly.
+  //
+  // A wrong filter should not be able to manufacture its own permission to stay
+  // wrong. 10.0 is a reasonable setting: it still lets adaptation absorb a sensor
+  // that is genuinely several times noisier than specified.
+  double adaptive_r_max_scale = 0.0;
+
+  // Subtract the filter's own contribution before treating the innovation window
+  // as an estimate of R.
+  //
+  // The innovation covariance is E[nu*nu'] = H*P*H' + R, so assigning the measured
+  // window covariance straight into R double counts H*P*H'. That is a SECOND
+  // feedback path with the same shape as the missing ceiling: a large P inflates
+  // the innovations, which inflates R, which widens the gate. The textbook estimate
+  // is C_hat - H*P*H', floored at the nominal.
+  //
+  // Default false so the existing behaviour is byte identical.
+  bool adaptive_subtract_hph = false;
 
   // Max delay to compensate for (seconds). GNSS is typically 100-300ms late.
   double max_measurement_delay = 0.5;
@@ -257,6 +399,41 @@ struct FusionCoreConfig {
   // receiver's noise rather than as noise itself. Floored at 3 internally, since
   // the autocorrelation term needs at least two consecutive pairs.
   int zupt_gnss_min_samples = 5;
+  // Stand the parked inflation down when the fix is further away than the receiver's own
+  // measured parked scatter can explain (#145). 0 disables the check.
+  //
+  // The inflation exists for a receiver repeating a correlated error, and it cannot tell
+  // that from a filter that is simply biased. On fc_field_20260926_1755 the filter sat
+  // 8.20 m from a receiver whose parked scatter was 2.8 m, accepted all 150 fixes, and
+  // moved 0.279 m in total: an effective gain of 0.0002. Loop closure read 7.22 m where
+  // the raw receiver closed 0.90 m, and the workaround was to switch the whole feature
+  // off, which costs 0.37 m of idle excursion becoming 2.36 m.
+  //
+  // An offset many times the observed scatter is not correlated receiver noise, it is the
+  // filter being wrong, and refusing the correction is the wrong response.
+  //
+  // 5.0 is measured, not chosen. Swept on the rover bags with the inflation left at 100,
+  // reading closure on fc_field_20260926_1755 against idle excursion on the 17.5 minute
+  // parked fc_field_20260926_1810:
+  //
+  //     ratio   1755 closure   1810 idle excursion
+  //       0        3.80 m           0.37 m          (before this check existed)
+  //       3        1.18 m           1.59 m
+  //       4        1.48 m           0.75 m
+  //       5        1.83 m           0.36 m          <- full idle benefit kept
+  //       8        2.96 m           0.37 m
+  //
+  // So it halves the closure cost while keeping ALL of the idle-drift benefit the
+  // inflation exists for. It does NOT eliminate the tradeoff: disabling the inflation
+  // entirely still closes better (0.79 m) at the cost of idle drift going to 2.36 m.
+  //
+  // The reason a simple innovation test cannot fully separate the two: a receiver
+  // genuinely wandering while parked reaches several times its own scatter (4.60 m peak
+  // against ~1 m on 1810), which is indistinguishable from bias on any single fix. The
+  // better discriminator is PERSISTENCE, because filter bias holds one direction while
+  // receiver wander changes direction. That needs the mean innovation over the parked
+  // window rather than the instantaneous one, and is not done here.
+  double zupt_gnss_bias_ratio = 5.0;
 
   // Catch wheel odometry that has died while the robot is still driving.
   //
@@ -292,6 +469,23 @@ struct FusionCoreConfig {
   // driving on dead encoders tracks close to 1.0, so 0.85 leaves room on both
   // sides. Note the parked worst case is not small: a receiver whose error
   // drifts one way under changing satellite geometry looks quite straight.
+  //
+  // CORRECTION, 2026-09-15, and it is why this value is no longer trusted on its
+  // own. Those three numbers are each one whole parked window, but the check
+  // runs on every PREFIX of the window as fixes arrive, and short prefixes are
+  // far straighter. Re-measuring every prefix on the same bags, worst parked
+  // straightness at the moment displacement first passes 5 m:
+  //
+  //     6 segments   0.902      17 segments  0.847
+  //     8 segments   0.877      22 segments  0.840
+  //    10 segments   0.880      30 segments  0.811
+  //    13 segments   0.855      38 segments  0.722   <- the old figure
+  //
+  // So 0.85 is breached by a stationary robot anywhere under about 30 segments,
+  // and at one segment the figure is exactly 1.00 by construction. It false
+  // fired three times on 2026-09-15, once indoors 2.8 s after the first fix.
+  // Hence kParkedMotionMinSegments, and hence the accelerometer now has to
+  // agree the robot is moving before the wheels are called liars.
   // Refuse ZUPT when the accelerometer says the robot is moving, however still
   // the wheels claim to be. Standard deviation of accelerometer MAGNITUDE over
   // the last second, in m/s^2. 0 disables the check.
@@ -405,6 +599,26 @@ struct FusionCoreConfig {
   // Scale = 1000: encoder provides ~96% (essentially RL behavior for heading).
   // 1.0 = disabled (default). Suggested: 500.0 for deployments with long GPS outages.
   double gnss_coast_imu_wz_scale = 1.0;
+  // Multiplier applied to R_encoder[WZ] during GPS coast mode, the mirror of
+  // gnss_coast_imu_wz_scale: large values leave heading rate to the gyro (pair it
+  // with gnss_coast_imu_wz_scale = 1). 1.0 = disabled. Experimental and not exposed
+  // as a ROS parameter: on NCLT it helped four sequences and cost 2013-04-05 65%,
+  // see tools/benchmark_regression.md 2026-10-22, the coast variant.
+  double gnss_coast_encoder_wz_scale = 1.0;
+  // During GPS coast, after each IMU update, hold the three body acceleration states
+  // at zero with this 1-sigma (m/s^2), so speed comes from the wheels rather than from
+  // integrating acceleration. The IMU's accelerometer rows still run, so gravity keeps
+  // roll and pitch observable; only AX/AY/AZ are pinned. 0 = disabled. Experimental,
+  // replay-only: see tools/benchmark_regression.md 2026-10-22.
+  double gnss_coast_hold_accel_sigma = 0.0;
+  // Non-holonomic lateral-acceleration constraint for wheeled robots: on every encoder
+  // update, fuse AY - VX*WZ = 0 with this 1-sigma (m/s^2). A robot that does not slip
+  // sideways has only centripetal lateral acceleration. VY = 0 is already fused through
+  // the encoder (encoder.nhc_vy_sigma); AY was left free, and with nothing observing it
+  // during a GNSS gap its cross-covariance with position grows and every update kicks
+  // position sideways (tools/benchmark_regression.md 2026-10-22). 0 = disabled.
+  // Experimental, replay-only.
+  double nhc_ay_sigma = 0.0;
   // Also enter coast mode when GPS has been absent for this many seconds.
   // Handles GPS outages where the receiver stops publishing entirely (mode=2,
   // power loss, tunnel) rather than publishing fixes that fail the chi2 gate.
@@ -449,6 +663,83 @@ struct FusionCoreConfig {
   // the trade is real and #64 is where it would show up, so re-run that sequence
   // after touching anything here.
   int    gnss_recovery_rejection_n = 15;
+  // Number of consecutive accepted fixes required to confirm GNSS recovery.
+  // Set to 0 to disable confirmation and clear the outage latch immediately.
+  int    gnss_reacquire_confirm_fixes = 3;
+
+  // ── Re-anchoring after a blackout ───────────────────────────────────────────
+  //
+  // Measured 2026-10-18 on NCLT: 74.8% to 96.8% of the error on every sequence is
+  // in GNSS gaps or the recovery after them, and steady coverage never exceeds
+  // 25.2%. Inside the recovery windows the gate rejects 81.0% and 81.2% of fixes
+  // against 10.4% and 10.6% over the whole run, with a median mahalanobis of
+  // 85.542 against a threshold of 16.27. The filter drifts in the hole, then
+  // throws away the fixes that would get it out because they disagree with it.
+  //
+  // The existing maybe_inflate_for_recovery() widens P but never MOVES the
+  // filter, and 81% rejection is what that is worth. Re-anchoring moves it.
+  //
+  // THE EVIDENCE IS AGREEMENT AMONG THE FIXES, NOT WITH THE FILTER. The filter is
+  // the thing in doubt, so it does not get a vote. A buffer of recent fixes must
+  // agree with each other AND with wheel odometry over the same interval, which
+  // is an independent source. That is what stops this becoming the third latch
+  // bug in this file: it cannot fire on a drifting cluster of outliers, because
+  // outliers do not track the encoder.
+  //
+  // Default OFF so the shipped path is byte identical.
+  bool   gnss_reanchor_enabled = false;
+  // Re-anchoring triggers on a windowed REJECTION RATE, not a consecutive count.
+  //
+  // A consecutive counter was tried first and never fired. Measured on
+  // 2012-08-20, the recovery windows reject 81.2% of fixes, but the ~19% that are
+  // accepted are interspersed, so runs of consecutive rejections stay short and
+  // a threshold of 20 is never reached. The synthetic caught this before it ever
+  // touched real data: with NCLT-grade fix noise it rejected 31 of 220 and fired
+  // zero times. What actually characterises a stuck filter is the RATE.
+  int    gnss_reanchor_window = 20;        // fixes to look back over
+  double gnss_reanchor_reject_frac = 0.6;  // fraction of them rejected
+  // SECOND trigger, for branch C. A high rejection rate cannot detect the case
+  // where fixes are ACCEPTED and the filter is still wrong, which is what
+  // 2012-09-28 does: median mahalanobis 0.526 against a 16.27 threshold, and the
+  // error persists anyway because the heading it left the blackout with is wrong.
+  // The synthetic reproduces it too, settling 18.9 m out after 120 s of good
+  // fixes while rejecting only 15 of 220.
+  //
+  // The signature is a PERSISTENTLY ONE-SIDED innovation: every fix pulls the
+  // filter the same way, which random noise does not do. Trigger when the mean
+  // offset over the window exceeds this many metres and is consistent in
+  // direction.
+  // The persistent-bias trigger, branch C. DEFAULT OFF, and that is a measured
+  // decision rather than caution. Ablated on NCLT 2026-10-18: with it on, 5 of 5
+  // sequences improve over baseline but three are WORSE than with it off, and the
+  // reject-rate trigger alone fires about half as often and lands better:
+  //
+  //   sequence     baseline   both triggers   rate trigger only
+  //   2012-02-04    142.792     61.357 (14)      59.689  (7)
+  //   2012-06-15     78.139     78.109  (1)      78.139  (0)
+  //   2012-08-20    171.393     60.674  (6)      46.671  (4)
+  //   2012-09-28     23.638     13.750  (4)      10.008  (2)
+  //   2013-04-05     16.677     16.005  (5)      16.011  (3)
+  //
+  // The extra events the bias trigger adds are net harmful, by 23% on 2012-08-20
+  // and 27% on 2012-09-28. What it buys is 0.04% on the two sequences where it
+  // wins. Fewer re-anchors is better. See tools/benchmark_regression.md 2026-10-18.
+  bool   gnss_reanchor_bias_trigger = false;
+  double gnss_reanchor_bias_m = 8.0;
+  // How many recent fixes must agree. Fewer than 3 cannot establish a track.
+  int    gnss_reanchor_buffer_n = 5;
+  // Each fix-to-fix displacement must match the odometry distance over the same
+  // interval to within this, in metres. This is the independent check.
+  double gnss_reanchor_odom_tol_m = 4.0;
+  // Minimum speed, m/s, before the GNSS track is trusted as a heading source.
+  // Below this the bearing between fixes is receiver noise, not a direction.
+  // Position sigma to leave behind after re-anchoring, metres.
+  double gnss_reanchor_sigma_xy = 5.0;
+  // Yaw sigma to leave behind when heading is reset, radians.
+  // TIME BOUND. No second re-anchor within this many seconds, and normal gating
+  // resumes immediately afterwards because nothing here latches. A test asserts
+  // that it does.
+  double gnss_reanchor_cooldown_s = 20.0;
   // Floor for the P inflation, in metres of XY sigma. The inflation itself is
   // sized from the rejected innovation, because the error to be covered is
   // however far the dead reckoning went and no constant brackets that: 50 m is
@@ -484,7 +775,78 @@ enum class HeadingSource {
   IMU_ORIENTATION = 2,  // AHRS/IMU published full orientation
   GPS_TRACK       = 3,  // robot moved enough for heading to be geometric
   MAGNETOMETER    = 4,  // raw magnetometer field fused directly
+  GPS_ROTATION    = 5,  // GNSS antenna lever-arm arc swept during rotation
 };
+
+// ---------------------------------------------------------------------------
+// Observability: what the filter can currently SEE, and what to drive to fix it.
+//
+// Most of this project's hardest open problems are observability problems wearing
+// a filter problem's clothes. #150 is WZ + B_GZ sliding along a direction nothing
+// measures. "Heading never fuses" was 0 bearings in 298 fixes. The GNSS lever arm
+// sits inert until heading uncertainty drops under a threshold. The #67 rotation
+// bootstrap declines unless the turn is brisk enough that the filter still knows
+// the rotation it just made.
+//
+// In every one of those the filter was working as specified and the robot was never
+// driven in a way that made the quantity observable. A user has no way to tell those
+// two apart from the outside, so this says which it is, and names the manoeuvre.
+// ---------------------------------------------------------------------------
+
+enum class Observability {
+  UNKNOWN      = 0,  // not enough data yet to judge
+  UNOBSERVABLE = 1,  // nothing is constraining this; no amount of waiting fixes it
+  MARGINAL     = 2,  // constrained, but not tightly enough to rely on
+  OBSERVABLE   = 3,
+};
+
+// The motion that makes an unobservable quantity observable. Prescribing the motion
+// is the whole point: hoping the robot happens to move usefully is what produced
+// three open issues.
+enum class ExcitationManoeuvre {
+  NONE               = 0,  // nothing is missing
+  DRIVE_STRAIGHT     = 1,  // GNSS track heading needs a straight run
+  TURN_IN_PLACE_FAST = 2,  // rotation heading bootstrap, and it must be brisk
+  FIGURE_EIGHT       = 3,  // both of the above, which also separates the gyro bias
+  STOP_AND_WAIT      = 4,  // ZUPT, let the biases settle while stationary
+};
+
+struct ObservabilityReport {
+  Observability heading     = Observability::UNKNOWN;
+  Observability gyro_bias_z = Observability::UNKNOWN;
+  Observability lever_arm   = Observability::UNKNOWN;
+
+  double heading_sigma_deg  = 0.0;   // from P via the quaternion-to-yaw Jacobian
+  double gyro_bias_z_sigma  = 0.0;   // rad/s, from P
+  // Correlation between WZ and B_GZ. This is the #150 number. A gyro alone cannot
+  // separate a rate from a bias on that rate, so as |r| approaches 1 the pair is
+  // free to slide with no measurement cost, and anything integrating WZ alone
+  // inherits the error. Measured at 1.000 for the B_GZ/B_EWZ pair, which is
+  // structurally unidentifiable rather than merely poorly conditioned.
+  double wz_bgz_correlation = 0.0;
+
+  ExcitationManoeuvre next = ExcitationManoeuvre::NONE;
+};
+
+// Thresholds, in one place so the doc and the code cannot drift apart.
+// heading: 10 deg is where the GNSS lever arm becomes worth applying on a 0.3 m arm
+// against metre-scale GNSS noise; 30 deg is where a heading stops being a heading.
+constexpr double kHeadingObservableDeg   = 10.0;
+constexpr double kHeadingMarginalDeg     = 30.0;
+// correlation: above this the rate and its bias are not separable in practice.
+constexpr double kWzBgzCorrelationLimit  = 0.95;
+// A low correlation is not enough on its own. At init P is diagonal, so the
+// correlation is 0 while the bias sigma is sqrt(0.1) = 0.316 rad/s, which is 18 deg/s
+// and not observable in any useful sense: nothing has constrained it yet, it is
+// merely uncorrelated. A decent MEMS gyro bias is around 0.01 rad/s, so 0.02 is
+// "constrained" and 0.05 is "nothing has pinned this down".
+constexpr double kGyroBiasObservableSigma = 0.02;   // rad/s
+constexpr double kGyroBiasMarginalSigma   = 0.05;   // rad/s
+
+// Human-readable instruction for a manoeuvre. Defined in the cpp so the text lives
+// next to the thresholds that decide which one is returned.
+const char* excitation_instruction(ExcitationManoeuvre m);
+const char* observability_name(Observability o);
 
 // Why a GNSS fix was rejected (or ACCEPTED if it passed)
 enum class GnssRejectionReason {
@@ -531,7 +893,7 @@ enum class TrackHeadingState {
 // The static_asserts below hold these to the enums, so adding a reason without
 // bumping the count fails the build instead of silently going uncounted.
 constexpr int GNSS_REJECTION_REASON_COUNT = 14;
-constexpr int MAG_REJECTION_REASON_COUNT  = 4;
+constexpr int MAG_REJECTION_REASON_COUNT  = 5;
 
 // Why an encoder measurement was rejected (or ACCEPTED if it passed).
 //
@@ -544,6 +906,40 @@ enum class EncoderRejectionReason {
   NOT_PROCESSED = 0,
   ACCEPTED      = 1,
   CHI2_FAILED   = 2,  // Mahalanobis distance > outlier_threshold_enc
+  NOT_FINITE    = 3,  // a velocity or a variance was NaN or infinity
+};
+
+// Why an IMU update was rejected (or ACCEPTED if it passed).
+//
+// Three separate gates share imu_outliers_, so the count alone cannot say which
+// channel fired. They fail for different reasons and point at different
+// parameters: the rate gate at a noisy gyro or accelerometer, the roll/pitch
+// gate at a tilted or vibrating mount, the orientation gate at a 9-axis IMU
+// disagreeing with the filter's own attitude. Telling them apart is the whole
+// point of recording a reason rather than a number. See #124.
+enum class ImuRejectionReason {
+  NOT_PROCESSED    = 0,
+  ACCEPTED         = 1,
+  CHI2_RATE        = 2,  // gyro + accel, outlier_threshold_imu
+  CHI2_ROLL_PITCH  = 3,  // tilt from gravity, outlier_threshold_imu
+  CHI2_ORIENTATION = 4,  // full quaternion, outlier_threshold_imu
+  NOT_FINITE       = 5,  // a rate, acceleration, angle or variance was NaN or infinity
+};
+
+// Why a VSLAM pose update was rejected (or ACCEPTED if it passed).
+enum class VslamRejectionReason {
+  NOT_PROCESSED = 0,
+  ACCEPTED      = 1,
+  CHI2_FAILED   = 2,  // Mahalanobis distance > outlier_threshold_vslam
+  NOT_FINITE    = 3,  // pose or its covariance contained NaN or infinity
+};
+
+// Why a GNSS heading update was rejected (or ACCEPTED if it passed).
+enum class HeadingRejectionReason {
+  NOT_PROCESSED = 0,
+  ACCEPTED      = 1,
+  CHI2_FAILED   = 2,  // Mahalanobis distance > outlier_threshold_hdg
+  NOT_FINITE    = 3,  // heading or its accuracy was NaN or infinity
 };
 
 // Why a magnetometer reading was rejected (or ACCEPTED if it passed).
@@ -552,12 +948,13 @@ enum class MagRejectionReason {
   ACCEPTED         = 1,
   CHI2_FAILED      = 2,  // Mahalanobis distance > threshold
   FIELD_MAGNITUDE  = 3,  // corrected field magnitude outside configured range
+  NOT_FINITE       = 4,  // a field component was NaN or infinity
 };
 
 static_assert(static_cast<int>(GnssRejectionReason::QUALITY_OTHER) + 1 ==
               GNSS_REJECTION_REASON_COUNT,
               "GNSS_REJECTION_REASON_COUNT must match GnssRejectionReason");
-static_assert(static_cast<int>(MagRejectionReason::FIELD_MAGNITUDE) + 1 ==
+static_assert(static_cast<int>(MagRejectionReason::NOT_FINITE) + 1 ==
               MAG_REJECTION_REASON_COUNT,
               "MAG_REJECTION_REASON_COUNT must match MagRejectionReason");
 
@@ -576,6 +973,11 @@ struct GnssFixDebug {
   // The same question answered completely, including the two cases the booleans
   // above never covered: baseline too short, and bearing sigma too high.
   TrackHeadingState  track_heading_state = TrackHeadingState::NOT_ATTEMPTED;
+  // How far the bearing window thinks the robot has turned, degrees. #144 could
+  // not be diagnosed from a bag because this number did not exist: the gate was
+  // discarding 300 windows a run and nothing reported why. -1 when the angle gate
+  // is disabled, so "off" is distinguishable from "zero turn measured".
+  double             track_heading_window_turn_deg = -1.0;
   double             track_heading_baseline_m = 0.0;  // displacement since the reference fix
   double             track_heading_sigma_rad  = 0.0;  // sigma_xy/dist, -1 if not computed
   double             hdop               = 0.0;
@@ -626,11 +1028,27 @@ struct FusionCoreStatus {
   // Heading observability
   bool          heading_validated   = false;
   HeadingSource heading_source      = HeadingSource::NONE;
+  // 1-sigma of the last heading observation actually fused, radians. 0 if none.
+  double        last_heading_sigma  = 0.0;
+  // What the filter can currently see, and what to drive to fix what it cannot.
+  ObservabilityReport observability;
+  // Measured offset between the IMU and encoder clocks. Reported, never applied on
+  // its own: set encoder.time_offset from it when you believe it.
+  TimeOffsetEstimator::Result time_offset;
   // Outcome of the most recent encoder update, and how surprising it was against
   // the gate that judged it. chi2 is -1 when no encoder update has been gated.
   EncoderRejectionReason encoder_reason = EncoderRejectionReason::NOT_PROCESSED;
   double encoder_chi2           = -1.0;
   double encoder_chi2_threshold = 0.0;
+  // Same treatment for the other gates: the reason that fired and how surprising
+  // the measurement was, so a climbing outlier count can be explained instead of
+  // guessed at. -1.0 chi2 means the gate did not run. See #124.
+  ImuRejectionReason     imu_reason     = ImuRejectionReason::NOT_PROCESSED;
+  double                 imu_chi2                 = -1.0;
+  VslamRejectionReason   vslam_reason   = VslamRejectionReason::NOT_PROCESSED;
+  double                 vslam_chi2               = -1.0;
+  HeadingRejectionReason heading_reason = HeadingRejectionReason::NOT_PROCESSED;
+  double                 heading_chi2             = -1.0;
   // Median of (filter yaw - GPS track bearing) in degrees over recent straight
   // segments, and how many segments went into it. Only populated while an
   // absolute heading source is in charge, which is when nothing else is checking
@@ -704,6 +1122,29 @@ struct FusionCoreStatus {
   // which means the wheel odometry is lying. Published so it is visible in a bag
   // rather than only in a log line nobody was watching.
   bool   zupt_parked_but_moving     = false;
+  // True when the #145 bias check stood the parked inflation down for this fix.
+  bool   gnss_parked_bias_standdown = false;
+  // #151: how many times the post-blackout recovery inflation has actually FIRED, and
+  // the largest sigma it asked for. On NCLT 2012-08-20 raising gnss.p_inflate_sigma 40x
+  // moved ATE by 0.001 m, which said the mechanism was inert and there was no field to
+  // confirm it from a bag. A recovery that silently never runs looks exactly like one
+  // that runs and does not help.
+  long   gnss_recovery_inflations = 0;
+  // Re-anchor events, so a nav stack can tell a corrected pose from a diverged one.
+  // A re-anchor is a deliberate position discontinuity: on NCLT 2012-08-20 one moved
+  // the estimate 787 m and took the error from 798 m to 16.8 m. A consumer that cannot
+  // see it happen has to treat it as divergence and chase it, which is the opposite of
+  // what it should do. jump_m is the distance the state moved. A re-anchor moves
+  // POSITION ONLY, so a consumer never sees a heading discontinuity from one: the yaw
+  // reset that used to sit beside it was removed on 2026-10-18, having shown no
+  // measurable benefit on NCLT, which cannot score heading at all.
+  long   gnss_reanchors = 0;
+  double gnss_reanchor_last_t = 0.0;
+  double gnss_reanchor_last_jump_m = 0.0;
+  // #151: the two flags that decide whether recovery can run at all.
+  bool   gnss_reject_after_gap = false;
+  int    gnss_consecutive_rejects_now = 0;
+  double gnss_recovery_last_sigma = 0.0;
   double zupt_parked_straightness   = 0.0;
   double gnss_chi2_max = -1.0;
   double gnss_chi2_threshold = 0.0;
@@ -808,6 +1249,11 @@ public:
   // Diagnostic passthrough: metres the last measurement update moved position.
   // See UKF::last_position_correction().
   double last_position_correction() const { return ukf_.last_position_correction(); }
+  // Diagnostics only: run the predict step up to t with no measurement, so the
+  // update that follows at the same t predicts nothing and its position change is
+  // the update's alone. hardware/replay.cpp uses it to split motion into predict
+  // and update; replay with it on is byte-identical to replay without it.
+  void predict_only(double t) { predict_to(t); }
   FusionCoreStatus   get_status()     const;
 
   // Per-outcome tallies, indexed by static_cast<int>(the reason enum).
@@ -818,10 +1264,28 @@ public:
   const std::array<OutcomeTally, MAG_REJECTION_REASON_COUNT>&
     mag_outcome_tally() const { return mag_tally_; }
   const GnssFixDebug& get_gnss_debug() const { return gnss_debug_; }
+
+  // The adapted GNSS position noise, and the nominal it started from. Exposed
+  // because "the fix was accepted but weighted at nothing" and "the fix was
+  // rejected" are different failures with different fixes, and they are
+  // indistinguishable from the outside without this. adapt_R has no ceiling on
+  // this channel: on the IMU channel the same code was measured at 1723x nominal.
+  // How many times the filter has been re-anchored. Exposed so a test can assert
+  // that it fired, and that it did NOT fire while GNSS was healthy.
+  long gnss_reanchor_count() const { return reanchor_count_; }
+
+  double gnss_r_scale_xy() const {
+    const double nom = R_gnss_floor_(0,0);
+    return nom > 0.0 ? R_gnss_(0,0) / nom : 1.0;
+  }
   const MagnetometerDebug& get_magnetometer_debug() const { return mag_debug_; }
   void               reset();
   bool               is_initialized()    const { return initialized_; }
   bool               is_heading_valid()  const { return heading_validated_; }
+
+  // What the filter can currently observe, and the manoeuvre that would fix the
+  // rest. Cheap: reads P and a few flags, no iteration.
+  ObservabilityReport observability() const;
   HeadingSource      heading_source()    const { return heading_source_; }
 
 private:
@@ -959,6 +1423,13 @@ private:
   // nothing about a receiver that is moving.
   void reset_parked_gnss_evidence();
 
+  // Which GNSS solution type the parked-evidence window is accumulating. The error
+  // process differs per mode (standalone, SBAS, DGNSS, RTK float, RTK fixed, PPP), so
+  // a window that spans a mode switch is averaging two different processes and the
+  // lag-1 correlation it reports describes neither. Suggested by a Septentrio
+  // integrator on the ROS Discourse thread this estimator came from.
+  sensors::GnssFixType parked_fix_type_ = sensors::GnssFixType::NO_FIX;
+
   // GNSS fixes seen while the wheels confirm the robot is parked. All of them
   // sample the same physical point, so their spread and how strongly one fix
   // predicts the next are direct measurements of the receiver, not estimates.
@@ -971,10 +1442,24 @@ private:
   double gnss_parked_sigma_observed_ = -1.0;
   double gnss_parked_sigma_declared_ = -1.0;
   double gnss_parked_correlation_    = 0.0;
+  // #145: true when the bias check stood the parked inflation down for the last fix.
+  // Stamp of the last fix RECEIVED, accepted or not (#151). Distinct from
+  // last_gnss_time_, which is the last ACCEPTED fix. The difference is the whole
+  // discriminator between an outage and a spike: during a spike fixes keep arriving on
+  // cadence while none is accepted, so the gap to the last ACCEPTED fix grows without
+  // limit and wrongly looks like an outage. The gap to the last RECEIVED fix stays at
+  // the cadence, which is the physical truth.
+  double last_gnss_rx_time_ = -1.0;
+  // Gap to the previous RECEIVED fix, computed once per fix at entry.
+  double gnss_rx_gap_ = 0.0;
+  bool   gnss_parked_bias_standdown_ = false;
+  long   gnss_recovery_inflations_ = 0;
+  double gnss_recovery_last_sigma_ = 0.0;
   double gnss_parked_inflation_      = 1.0;
   // Straightness check on the parked fixes, see zupt_parked_motion_m.
   double parked_ref_x_ = 0.0, parked_ref_y_ = 0.0;
   double parked_path_len_ = 0.0;
+  int    parked_seg_n_ = 0;
   bool   parked_moving_detected_ = false;
   double gnss_parked_straightness_ = 0.0;
   double imu_rate_prev_stamp_    = -1.0;
@@ -1036,6 +1521,16 @@ private:
   // fixes accepted in a row rather than one. A sustained spike cannot abuse
   // this, because the latch is only ever SET by a real gap.
   bool post_outage_unconfirmed_   = false;
+
+  // Re-anchor buffer: recent fixes with the odometry distance at each, so the
+  // consistency test can use a source the filter does not influence.
+  struct ReanchorSample { double t, x, y, z, odom, fx, fy, sigma; };
+  std::deque<ReanchorSample> reanchor_buf_;
+  double reanchor_last_t_ = -1e18;
+  std::deque<bool> reanchor_recent_;   // true = rejected, most recent at the back
+  long   reanchor_count_  = 0;
+  double reanchor_last_jump_ = 0.0;
+  bool   maybe_reanchor(double timestamp_seconds);
   int  gnss_consecutive_accepts_  = 0;
   // Recovery mode: after a timeout-triggered coast, accept the first returning
   // GPS fix unconditionally (bypass chi2 gate). After 7+ minutes blind, dead
@@ -1055,12 +1550,16 @@ private:
   void init_adaptive_R();
 
   template <int z_dim>
+  // hph is the filter's own contribution H*P*H' to the innovation covariance.
+  // Pass a zero matrix when it is not available; the subtraction is then a no-op
+  // and only the ceiling applies.
   void adapt_R(
     Eigen::Matrix<double, z_dim, z_dim>& R,
     const Eigen::Matrix<double, z_dim, z_dim>& R_floor,
     InnovationWindow<z_dim>& window,
     const Eigen::Matrix<double, z_dim, 1>& innovation,
-    bool enabled
+    bool enabled,
+    const Eigen::Matrix<double, z_dim, z_dim>* hph = nullptr
   );
 
   // ─── State snapshot for delay compensation
@@ -1145,6 +1644,17 @@ private:
   // fusion block.
   bool   hdg_window_had_turn_ = false;
 
+  // Signed raw-gyro angle accumulated across the current bearing window, radians.
+  // Signed deliberately: a wheel crossing a stone rocks the robot one way and
+  // back, so those cancel, while a real corner accumulates monotonically. That is
+  // the whole reason this discriminates where an instantaneous rate cannot.
+  // Reset wherever hdg_window_had_turn_ is cleared, because both mean "the window
+  // starts again from here". Only maintained when
+  // gps_track_heading_max_window_turn_deg > 0.
+  double hdg_window_turn_rad_ = 0.0;
+  // Stamp of the last IMU sample folded into hdg_window_turn_rad_, for dt.
+  double hdg_turn_prev_t_ = -1.0;
+
   // Rolling accelerometer magnitude window for the ZUPT stationarity check.
   // 100 samples is one second at the 100 Hz these IMUs run at.
   static constexpr int ACC_WIN = 100;
@@ -1157,6 +1667,12 @@ private:
   // Outcome of the most recent encoder update (see EncoderRejectionReason).
   EncoderRejectionReason encoder_reason_ = EncoderRejectionReason::NOT_PROCESSED;
   double encoder_chi2_ = -1.0;
+  ImuRejectionReason     imu_reason_     = ImuRejectionReason::NOT_PROCESSED;
+  double                 imu_chi2_       = -1.0;
+  VslamRejectionReason   vslam_reason_   = VslamRejectionReason::NOT_PROCESSED;
+  double                 vslam_chi2_     = -1.0;
+  HeadingRejectionReason heading_reason_ = HeadingRejectionReason::NOT_PROCESSED;
+  double                 heading_chi2_   = -1.0;
 
   // Continuity threshold learned from the receiver (see GnssParams::continuity_auto).
   //
@@ -1178,10 +1694,10 @@ private:
   // arms at 100 is 41 fixes long, and nothing sensible would arm on that.
   static constexpr int CONT_LEARN_N = 100;
 
-  // Accepted fixes in a row before a GNSS outage is considered genuinely over.
-  // One is not enough (see post_outage_unconfirmed_); a handful at any realistic
-  // fix rate is under a couple of seconds.
-  static constexpr int kAcceptsToConfirmReacquisition = 3;
+  // Fix-to-fix segments needed before the parked straightness figure means
+  // anything. With one segment it is exactly 1.00 by construction: the
+  // displacement and the path are the same line. See zupt_parked_motion_m.
+  static constexpr int kParkedMotionMinSegments = 10;
   double cont_learn_max_ = 0.0;
   int    cont_learn_n_   = 0;
   double cont_learned_m_ = 0.0;   // 0 = not learned yet
@@ -1210,6 +1726,53 @@ private:
     const std::function<void()>& apply_fn
   );
   void update_distance_traveled(double x, double y, double pre_update_speed = -1.0);
+
+  // Reference endpoint for the GNSS rotation heading bootstrap. yaw_sigma is stored
+  // alongside yaw because the uncertainty of the window's delta_yaw is the filter's
+  // own, not a constant.
+  struct GpsRotationHeadingWindow {
+    bool            set                = false;
+    double          timestamp          = 0.0;
+    double          fix_x              = 0.0;
+    double          fix_y              = 0.0;
+    Eigen::Matrix2d fix_cov            = Eigen::Matrix2d::Identity();
+    double          yaw                = 0.0;
+    double          yaw_sigma          = 0.0;
+    double          encoder_distance   = 0.0;
+  };
+
+  // Has anything that CAN observe the yaw gyro bias actually fired?
+  //
+  // A tight prior is not an observation, and that distinction cost a wrong verdict
+  // once already on heading. With a tight bias prior the bias barely moves, so there
+  // is little covariance to correlate, and a correlation-only test reads that as
+  // observability: measured r = -0.37 at a 1e-5 prior while the pair was still
+  // structurally free. Only zupt_measurement_function (z = WZ, no bias term) and an
+  // absolute heading can actually separate the pair, so this records whether one of
+  // them has fused.
+  bool                     gyro_bias_observed_ = false;
+
+  TimeOffsetEstimator      time_offset_est_;
+  TimeOffsetEstimator::Result time_offset_last_{};
+  double                   time_offset_last_eval_ = -1.0;
+
+  GpsRotationHeadingWindow gps_rotation_hdg_window_;
+  bool   gps_rotation_hdg_fused_ = false;
+  double last_heading_sigma_     = 0.0;
+
+  // Path length integrated from the ENCODER, not from GNSS fix positions.
+  // distance_traveled_ is fed fix.x/fix.y, so when the antenna sweeps an arc it
+  // counts that arc as travel. The rotation bootstrap needs the opposite: it has
+  // to know the base stayed put while the antenna moved, so it cannot use a
+  // counter that the arc itself advances.
+  double encoder_distance_ = 0.0;
+
+  bool try_fuse_gps_rotation_heading(
+    double timestamp_seconds, const sensors::GnssFix& fix,
+    const sensors::GnssPosNoiseMatrix& R_meas);
+  void reset_gps_rotation_heading_window(
+    double timestamp_seconds, const sensors::GnssFix& fix,
+    const sensors::GnssPosNoiseMatrix& R_meas);
 };
 
 } // namespace fusioncore

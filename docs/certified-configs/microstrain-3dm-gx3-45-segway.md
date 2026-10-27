@@ -1,7 +1,7 @@
-# Microstrain 3DM-GX3-45 + Novatel SPAN-CPT GPS
+# Microstrain 3DM-GX3-45 + consumer GPS (NCLT Segway)
 
 **Platform:** Segway RMP campus rover (University of Michigan NCLT dataset)
-**Status: Field validated.** 12 sequences, 940 minutes total, evaluated against RTK GPS ground truth. [Full benchmark results](../reference/benchmark.md).
+**Status: Field validated.** 12 sequences, 940 minutes total, scored against the dataset's RTK GPS ground truth. Current results: [Benchmark Results](../reference/benchmark.md).
 
 ---
 
@@ -9,8 +9,8 @@
 
 | Sensor | Model | Notes |
 |---|---|---|
-| IMU | Microstrain 3DM-GX3-45 | 6-axis (accel + gyro). No magnetometer. 100 Hz. |
-| GPS | Novatel SPAN-CPT | ~3m CEP in urban campus conditions. 5 Hz. |
+| IMU | Microstrain 3DM-GX3-45 | Accelerometer and gyro fused at 100 Hz. It also has a magnetometer, which the NCLT player does not publish. Its orientation output is published as invalid, because its roll and pitch are the accelerometer's own tilt. |
+| GPS | Consumer-grade receiver (NCLT `gps.csv`) | Reports a 3 m sigma; measured errors are far wider, see the config comment below. |
 | Wheel odometry | Segway RMP encoders | Differentiated from odometry at 100 Hz. |
 
 **IMU datasheet specs used:**
@@ -42,11 +42,11 @@ fusioncore:
     encoder.vel_noise: 0.05         # m/s
     encoder.yaw_noise: 0.02         # rad/s
 
-    # Novatel SPAN-CPT: stated CEP 3m, but NCLT measured p95 errors range
+    # Consumer GPS: stated sigma 3m, but NCLT measured p95 errors range
     # from 9.7m (clean day) to 53.1m (bad multipath day).
     # Adaptive noise compensates automatically: gnss.base_noise_xy is the
     # floor, not the ceiling.
-    gnss.base_noise_xy: 3.0         # m  : matches stated CEP
+    gnss.base_noise_xy: 3.0         # m  : matches the stated sigma
     gnss.base_noise_z: 5.0          # m
 
     # Which of the two quality gates below actually runs depends on your driver.
@@ -114,30 +114,26 @@ ros2 launch fusioncore_ros fusioncore.launch.py \
   --ros-args \
   -r /imu/data:=/microstrain/imu/data \
   -r /odom/wheels:=/segway_rmp/odom \
-  -r /gnss/fix:=/novatel/fix
+  -r /gnss/fix:=/gps/fix
 ```
 
 ---
 
 ## Validation results
 
-Evaluated against RTK GPS ground truth (Novatel SPAN-CPT RTK mode) using `evo_ape` with SE(3) alignment.
+Measured 2026-10-26 on all twelve sequences with this config: scored at GPS fix times, it does
+not beat raw unfiltered GPS (raw GPS lower on 11 of 12, one tie at 9.186 m against 9.187 m).
+With `gnss.reanchor_enabled: true` added, it is lower than raw GPS on 2 of 12 held-out
+sequences (2012-03-31 by 22.0%, 2012-10-28 by 5.6%). Full table, pipelines and scoring:
+[Benchmark Results](../reference/benchmark.md).
 
-| Sequence | ATE 3D | vs RL-EKF |
-|---|---|---|
-| 2012-01-08 | 18.6 m | +55% better |
-| 2012-05-11 | 9.7 m | +16% better |
-| 2012-09-28 | 22.4 m | +58% better |
-| 2013-04-05 | 12.1 m | +96% better |
-| 2012-08-20 | 98.3 m | RL wins (adversarial GPS cluster at blackout boundary) |
+The robot_localization comparison that used to be on this page ("+55% better" and similar)
+is withdrawn. It was measured through a dataset player with two input errors that fed both
+filters wrong data, and the corrected comparison is being re-run.
 
-> **Note:** the 2013-04-05 figure (12.1 m) is stale, it has since regressed to ~19.4 m (still a 93% win). These numbers predate a controlled full-suite re-run on current `main`. See `tools/benchmark_regression.md`.
-
-Full results across all 12 sequences: [Benchmark Results](../reference/benchmark.md).
-
-Reproduce with:
+Reproduce one sequence through the ROS node:
 ```bash
-bash benchmarks/run_one.sh 2012-01-08
+bash tools/run_nclt.sh 2012-01-08 <output_dir> 1.0
 ```
 
 ---
