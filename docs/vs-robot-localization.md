@@ -1,6 +1,8 @@
 # FusionCore vs robot_localization
 
-A direct technical comparison based on 940 minutes of real robot data across twelve NCLT sequences.
+An architectural comparison: what each package models and how it handles GPS. The measured
+comparison on NCLT is being re-run (see [Benchmark](#benchmark) below), so this page makes no
+accuracy claim in either direction.
 
 Paper: [arXiv:2605.25239](https://arxiv.org/abs/2605.25239)
 
@@ -18,66 +20,42 @@ Paper: [arXiv:2605.25239](https://arxiv.org/abs/2605.25239)
 | Delay compensation | `smooth_lagged_data` + `history_length` | IMU ring-buffer replay |
 | GPS fix quality gating | Not built-in | HDOP, satellite count, fix type |
 | Wheel encoder yaw bias | Not in state vector | 23rd state, estimated online |
-| GPS velocity fusion | Not built-in | Yes (slip detection via Doppler) |
-| VSLAM pose fusion | Not built-in | Yes: `vslam.topic` |
-| Dual IMU | Not built-in | Yes: `imu2.topic` |
-| RL-UKF on GPS sequences | Diverges (NaN) | Stable on all twelve sequences |
+| GPS velocity fusion | Any twist input (`twistN`), no slip detection | Yes, with slip detection (Doppler against wheel innovation) |
+| VSLAM pose fusion | Any pose input (`poseN`) | Yes: `vslam.topic` |
+| Multiple IMUs | Any number (`imu0`, `imu1`, ...) | Two: `imu.topic` and `imu2.topic` |
 | ROS 2 native | Ported from ROS 1 | Written from scratch for ROS 2 |
 
 ---
 
-## Why RL-EKF fails on GPS-heavy sequences
+## Benchmark
 
-This is the central finding from the NCLT benchmark and it affects anyone using robot_localization with GPS, not just people evaluating FusionCore.
+**There is currently no FusionCore against robot_localization comparison to cite.** The
+NCLT comparison that stood here ("FusionCore wins 10 of 12") is withdrawn: it was measured
+through our dataset player with two input errors that fed both filters wrong data, a wheel
+odometry yaw rate in the wrong frame (#169) and an accelerometer-derived tilt declared as a
+0.57 degree attitude. The explanation of robot_localization's losses that came with it (a
+gate calibrated to optimistic GPS covariance) was built on those runs and is withdrawn with
+them.
 
-The NCLT GPS driver reports `var_xy = 9` (3m sigma), matching the Novatel SPAN-CPT open-sky specification. Measured against RTK ground truth, actual p95 error ranges from **9.7m to 53.1m** across sequences: 2 to 18 times the stated sigma.
+The corrected twelve-sequence evaluation ran on 2026-10-25 and 26. Its robot_localization arm
+is withheld: the corrected player stopped supplying an attitude, and with this config
+robot_localization then removed gravity using a level attitude, so real tilt leaked into the
+fused acceleration and it diverged on nine sequences. That was our input change meeting that
+config, not a property of robot_localization. It is being re-run on all twelve sequences with
+a config that follows robot_localization's own planar wheeled-robot example, and the results
+will be published per sequence and per metric, with no aggregate and no winner.
 
-robot_localization calibrates its chi-squared gate to the stated covariance. When actual GPS error reaches 40-200m, those fixes land far outside the expected window and get rejected. With GPS effectively disabled, RL-EKF reverts to wheel-encoder dead-reckoning. The two worst sequences show **31.84 m/km and 50.11 m/km drift**: diagnostic of open-loop operation across full runs.
+What the corrected run does show, against raw unfiltered GPS rather than robot_localization:
+the shipped default does not beat raw GPS (raw GPS lower on 11 of 12, one tie), and with
+opt-in re-anchoring FusionCore is lower on 2 of 12 held-out sequences. Every number is in the
+[benchmark reference](reference/benchmark.md).
 
-This is not a bug in robot_localization. It is what happens when you trust the covariance your GPS driver reports. Most GPS drivers report optimistic covariance. The problem compounds in any real deployment.
+On hardware, FusionCore has not been shown to beat robot_localization either: on two
+frozen-config rover runs robot_localization closed 0.68 m against FusionCore's 1.48 m, then
+an exact 1.05 m tie.
 
-FusionCore maintains a 50-sample innovation window per sensor and adapts the noise model in real time:
-
-```
-R ← (1 - α)R + α·Ĉ
-```
-
-where `Ĉ` is the empirical innovation covariance and `α = 0.01`. A floor prevents collapse. The chi-squared gate stays calibrated to actual error levels regardless of what the driver reports.
-
----
-
-## Benchmark: 12 NCLT sequences, same config, no per-sequence tuning
-
-| Sequence | Season | Duration | FC ATE | RL-EKF ATE | Winner |
-|---|---|---|---|---|---|
-| 2012-01-08 | Winter | 92 min | **18.6 m** | 41.2 m | FC +55% |
-| 2012-02-04 | Winter | 77 min | **49.7 m** | 265.5 m | FC +81% |
-| 2012-03-31 | Spring | 87 min | **22.0 m** | 156.5 m | FC +86% |
-| 2012-05-11 | Spring | 84 min | **9.7 m** | 11.5 m | FC +16% |
-| 2012-06-15 | Summer | 55 min | 49.2 m | **18.2 m** | RL +63% |
-| 2012-08-20 | Summer | 83 min | 98.3 m | **10.6 m** | RL +89% |
-| 2012-09-28 | Fall | 77 min | **22.4 m** | 53.8 m | FC +58% |
-| 2012-10-28 | Fall | 85 min | **15.6 m** | 56.4 m | FC +72% |
-| 2012-11-04 | Fall | 79 min | **60.1 m** | 122.0 m | FC +51% |
-| 2012-12-01 | Winter | 75 min | **21.0 m** | 90.7 m | FC +77% |
-| 2013-02-23 | Winter | 78 min | **59.4 m** | 82.2 m | FC +28% |
-| 2013-04-05 | Spring | 68 min | **12.1 m** | 268.9 m | FC +96% |
-
-RL-UKF diverged with NaN on all twelve sequences. FusionCore wins 10 of 12.
-
-> **Note on these numbers.** This table is a snapshot pending a controlled full-suite re-run on the current `main`. The 10-of-12 result holds, but treat the individual magnitudes as directional: at least one sequence (2013-04-05) has regressed since this snapshot, so the 12.1 m figure above is stale. The regression-tracking harness and current baseline live in `tools/benchmark_regression.md` and `tools/benchmark_baseline.json`. The table will be refreshed once a verified full re-run lands.
-
-Metric: ATE RMSE (meters), SE3-aligned to RTK ground truth using EVO. Same IMU, wheel odometry, and GPS inputs. Full methodology in the [benchmark reference](reference/benchmark.md).
-
----
-
-## The two FusionCore losses
-
-Both losses have identified root causes. They are documented here rather than hidden.
-
-**2012-06-15 (FC 49.2m, RL 18.2m):** The dataset's GPS-sparsest sequence, with a 462-second blackout. During coast mode, residual wheel-encoder yaw bias (`b_ewz`) and gyro drift accumulate into quadratic position error over the multi-minute outage. RL-EKF's 2D mode has fewer divergence degrees of freedom. The lever for this is an absolute heading source during the outage: `magnetometer.enabled: true` bounds heading drift instead of letting it accumulate (demonstrated in a unit test with slipping wheel odometry). **Honesty caveat:** this cannot be validated against *this NCLT number*, the dataset publishes no usable magnetometer and its ground-truth orientation is too noisy to score a few-metre change. So the magnetometer is validated by construction and in test, and awaits real-hardware confirmation; it is not proven to close this specific loss.
-
-**2012-08-20 (FC 98.3m, RL 10.6m):** 105 mode-3 GPS fixes located 720-840m from RTK ground truth appear in a 24-second window at a blackout boundary. Coast mode relaxes the chi-squared gate slightly to re-acquire GPS after the blackout; the adversarial cluster each individually pass the gate and collectively pull the estimate. RL-EKF incidentally rejects them through its miscalibrated gate (the same gate that causes its ten other losses). FusionCore now ships a physical-plausibility gate (`gnss.max_speed`) that rejects this cluster and cuts the peak spike. **Honesty caveat:** this does *not* fix the score. The sequence's ATE is dominated by dead-reckoning drift accumulated *during* the 211-second blackout, not by the cluster spike, so rejecting the cluster lowers the peak but not the overall number. The real lever, as with 2012-06-15, is an absolute heading source during the outage.
+What does not need a reference is outlier rejection, which rests on kinematics: a 60 m GPS
+jump in one second is impossible for a robot moving at 1 m/s.
 
 ---
 
