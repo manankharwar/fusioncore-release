@@ -519,3 +519,129 @@ TEST(GnssReacquireTest, BlackoutDoesNotUnlockRecoveryForALaterSpike) {
   EXPECT_LT(err_end, SPIKE_M * 0.25)
       << "the filter followed the spike";
 }
+
+// The confirmation count is a parameter now, so sweep it and assert the output
+// changes. That rule came out of the confirmation-count knob of issue #126: it had
+// been dead, and sweeping it through its range produced byte-identical results,
+// which is what exposed the bug. A knob that compiles and passes tests is not a
+// knob that does anything.
+//
+// The observable is the latch's downstream effect, because the latch itself is
+// private (#125). Scenario is the one above: blackout, clean recovery, then a
+// sustained offset. Set the confirmation count higher than the number of clean
+// fixes available and the latch never clears, so the later spike inherits the
+// blackout's verdict, unlocks the recovery inflation and drags the filter onto
+// the offset. Set it to 0 or 3 and the latch clears, so the spike is rejected.
+TEST(GnssReacquireTest, SweepTheReacquireConfirmCount) {
+  auto run = [](int confirm_fixes) {
+    FusionCoreConfig cfg = blackout_config();
+    cfg.gnss_reacquire_confirm_fixes = confirm_fixes;
+    FusionCore fc(cfg);
+    State s0;
+    fc.init(s0, 0.0);
+
+    const double dt = 0.01, g = 9.80665;
+    const double TRUE_SPEED = 1.5, SLIP_SPEED = 2.1;
+    const double T_PRE = 120.0, T_BLACKOUT = 460.0, T_CLEAN = 120.0, T_SPIKE = 120.0;
+    const double t_out_start = T_PRE;
+    const double t_out_end   = T_PRE + T_BLACKOUT;
+    const double t_spike_beg = t_out_end + T_CLEAN;
+    const double t_end       = t_spike_beg + T_SPIKE;
+    const double SPIKE_M     = 300.0;
+
+    double true_x = 0.0;
+    int spike_accepted = 0;
+
+    for (int step = 1; step * dt <= t_end + 1e-9; ++step) {
+      const double t = step * dt;
+      true_x += TRUE_SPEED * dt;
+      const bool blackout = (t >= t_out_start && t < t_out_end);
+      const bool spiking  = (t >= t_spike_beg);
+
+      fc.update_imu(t, 0, 0, 0, 0, 0, g);
+      if (step % 2 == 0) {
+        fc.update_encoder(t, blackout ? SLIP_SPEED : TRUE_SPEED, 0.0, 0.0);
+        fc.update_ground_constraint(t);
+      }
+      if (step % 20 == 0 && !blackout) {
+        fc.update_gnss(t, fix_at(true_x + (spiking ? SPIKE_M : 0.0), 0.0));
+        if (spiking && fc.get_gnss_debug().accepted) ++spike_accepted;
+      }
+    }
+    struct R { double err_end; int spike_accepted; };
+    return R{std::abs(fc.get_state().x[X] - true_x), spike_accepted};
+  };
+
+  // 600 clean fixes are available between the blackout and the spike, so
+  // 100000 is "never confirmed" and 0, 1 and 3 all confirm well before it.
+  const int sweep[] = {0, 1, 3, 100000};
+  double err[4];
+  int acc[4];
+  for (int i = 0; i < 4; ++i) {
+    auto r = run(sweep[i]);
+    err[i] = r.err_end;
+    acc[i] = r.spike_accepted;
+    std::cerr << "  confirm_fixes " << sweep[i]
+              << "  spike fixes accepted " << r.spike_accepted
+              << "  error at the end " << r.err_end << " m\n";
+  }
+
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_LT(acc[i], 10)
+        << "confirm_fixes " << sweep[i] << " should have cleared the latch, so "
+           "the sustained offset should have been rejected";
+  }
+  EXPECT_GT(acc[3], acc[0])
+      << "a confirmation count that can never be reached left the latch set, so "
+         "the spike should have been accepted where it was not at 0. The knob "
+         "reached the filter and changed nothing: that is the dead-knob bug again.";
+}
+
+// ─── #151: a blackout that begins DURING a rejection cascade ─────────────────
+//
+// note_rejection_cascade_start decided "was there a gap" once, on a cascade's first
+// rejection, and never revisited it. That is right for a sustained spike, which must not
+// reclassify itself as an outage. It is wrong when a cascade is already running and a
+// real outage then begins: the decision was made before the outage, it is false, and
+// because recovery cannot fire the cascade never ends, the counter never resets, and the
+// decision is never re-made. Self-perpetuating.
+//
+// The discriminator is the gap in the RECEIVED stream, not the gap to the last ACCEPTED
+// fix. During a spike fixes keep arriving on cadence; during an outage they do not. A
+// first attempt at this keyed off the accepted-fix gap, which never advances during a
+// lockout and therefore looks like a permanent outage, and it broke
+// BlackoutDoesNotUnlockRecoveryForALaterSpike and SustainedSpikeStaysRejected.
+
+TEST(GnssReacquireTest, OutageStartingMidCascadeStillArmsRecovery)
+{
+  FusionCoreConfig cfg = blackout_config();
+  FusionCore fc(cfg);
+  State s0;
+  fc.init(s0, 0.0);
+
+  const double dt = 0.01, g = 9.80665;
+  double t = 0.0;
+  auto drive = [&](double secs, bool feed_fix, double fix_offset) {
+    const int n = static_cast<int>(secs / dt);
+    for (int i = 0; i < n; ++i) {
+      t += dt;
+      fc.update_imu(t, 0, 0, 0, 0, 0, g);
+      if (i % 2 == 0) fc.update_encoder(t, 1.0, 0.0, 0.0);
+      if (feed_fix && i % 100 == 0) {
+        fc.update_gnss(t, fix_at(t * 1.0 + fix_offset, 0.0));
+      }
+    }
+  };
+
+  drive(30.0, true, 0.0);                    // healthy, fixes accepted
+  drive(40.0, true, 400.0);                  // a spike: fixes keep arriving, all rejected
+  const long fired_before_outage = fc.get_status().gnss_recovery_inflations;
+  drive(180.0, false, 0.0);                  // OUTAGE begins mid-cascade, no fixes at all
+  drive(30.0, true, 0.0);                    // receiver returns, honest fixes again
+
+  const auto st = fc.get_status();
+  EXPECT_GT(st.gnss_recovery_inflations, fired_before_outage)
+      << "an outage that began while a cascade was already running must still arm the "
+         "post-blackout recovery; it fired " << st.gnss_recovery_inflations
+         << " times, unchanged from " << fired_before_outage << " before the outage";
+}
