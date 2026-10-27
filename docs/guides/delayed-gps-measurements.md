@@ -85,17 +85,27 @@ This is exact replay, not approximation. The same sigma points are re-propagated
 # Handles any delay up to 1 second automatically
 ```
 
-The buffer is always active. No parameters to set unless you want to adjust the buffer size:
+The buffer is always active and **there is nothing to configure from ROS.**
 
-```yaml
-imu.buffer_duration: 1.0   # seconds; increase if GPS delays exceed 1s
+The size is a COUNT of IMU messages, not a duration: `imu_buffer_size`, default 100,
+and it is a `FusionCoreConfig` field rather than a ROS parameter. That means the
+delay it covers depends on your IMU rate:
+
+```
+delay covered  =  imu_buffer_size / IMU rate
+
+  100 messages at 400 Hz  ->  0.25 s
+  100 messages at 100 Hz  ->  1.0 s
+  100 messages at  20 Hz  ->  5.0 s
 ```
 
-For zero-stamped GPS messages, FusionCore uses wall clock as fallback:
+So "one second" is only true at 100 Hz. Work out your own number before relying on
+it. Changing it requires linking `fusioncore_core` directly; it cannot be set from a
+params file.
 
-```yaml
-gnss.use_wall_clock_stamp: true   # use /clock if stamp=0
-```
+Zero-stamped GPS is handled **automatically**, with no parameter. When a driver
+publishes a fix with a zero stamp, FusionCore falls back to the receive time rather
+than treating it as an ancient measurement.
 
 ---
 
@@ -104,9 +114,9 @@ gnss.use_wall_clock_stamp: true   # use /clock if stamp=0
 | Aspect | robot_localization | FusionCore |
 |---|---|---|
 | Mechanism | State rewind + re-processing | IMU ring buffer exact replay |
-| Max delay handled | Configurable via `history_length` | 1 second (default), configurable |
+| Max delay handled | Configurable via `history_length` | 0.5 s default, `max_measurement_delay` |
 | Accuracy | Approximate (re-linearization at old state) | Exact (sigma point replay) |
-| Zero-stamped GPS | Not handled | Fallback to wall clock via `gnss.use_wall_clock_stamp` |
+| Zero-stamped GPS | Not handled | Not handled either: a zero stamp is treated as a real time |
 | CPU cost | Proportional to delay and sensor rate | Constant (O(N) buffer lookup) |
 | Configuration | `smooth_lagged_data: true` + `history_length` | Always on |
 
@@ -123,10 +133,23 @@ gnss.use_wall_clock_stamp: true   # use /clock if stamp=0
 
 **For FusionCore users:**
 
-Delay compensation is automatic. If you see delay-correlated errors, the likely causes are:
-- Zero-stamped GPS messages: enable `gnss.use_wall_clock_stamp: true`
-- GPS delay exceeding 1 second: increase `imu.buffer_duration`
-- Driver adding its own timestamp offset: check the driver documentation
+Delay compensation is automatic, and there is no parameter to turn it on. If you
+see delay-correlated errors, the causes worth checking are:
+
+- **A GPS driver that stamps on arrival rather than at observation.** This is the
+  common one and FusionCore cannot detect it: the stamp looks perfectly valid, it is
+  just late by a constant amount. Fix it in the driver.
+- **Delay beyond the gate.** A fix older than `max_measurement_delay` (0.5 s by
+  default, declared without a `gnss.` prefix) is rejected outright rather than
+  replayed. Raise it if your link is genuinely slower than that, but understand you
+  are then fusing half-second-old position.
+- **A zero or unset stamp.** FusionCore treats it as a real time, which places the
+  measurement at the epoch and it is then rejected as impossibly old. There is no
+  wall-clock fallback. Fix the driver.
+
+The IMU ring buffer holds `imu_buffer_size` samples, 100 by default, which is one
+second at 100 Hz. That is a `FusionCoreConfig` field rather than a ROS parameter, so
+it cannot be changed from a YAML.
 
 ---
 

@@ -59,7 +59,12 @@ The core library (`fusioncore_core`) has zero ROS dependency. It can be used in 
 
 **Working and tested:**
 
-- UKF core: 64 unit tests passing (57 in fusioncore_core, 7 in fusioncore_ros)
+- 370 individual test cases (293 in fusioncore_core, 53 in fusioncore_ros,
+  24 in fusioncore_ublox). Of these, 7 are disabled on purpose: they encode the
+  acceptance criteria for issue #150 and report as skipped until it lands.
+  `colcon test-result --all` reports 409, which adds the 39 per-package CTest
+  wrapper entries. `tools/check_docs_test_count.py` fails CI if these figures drift
+  from the source.
 - IMU + encoder + GPS fusion
 - Automatic IMU bias estimation
 - ECEF GPS conversion with quality-aware noise scaling
