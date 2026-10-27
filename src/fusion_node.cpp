@@ -1,3 +1,5 @@
+#include <tuple>
+#include <atomic>
 #include "fusioncore/fusioncore.hpp"
 #include "fusioncore/motion_model.hpp"
 #include "fusioncore/sensors/gnss.hpp"
@@ -44,6 +46,7 @@
 #include "fusioncore_ros/gnss_dop_gate_warning.hpp"
 #include "fusioncore_ros/min_satellites_gate.hpp"
 #include "fusioncore_ros/gnss_frame.hpp"
+#include "fusioncore_ros/lever_arm_config.hpp"
 
 using namespace std::chrono_literals;
 using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
@@ -97,6 +100,135 @@ public:
 
   // ─── Lifecycle: Configure ──────────────────────────────────────────────────
 
+  // Apply a platform profile as DEFAULTS, never as overrides.
+  //
+  // The layering matters and is easy to get backwards. A profile says "on this kind
+  // of robot these states are not worth estimating". An explicit parameter says "I
+  // know what I am doing on this particular robot". The explicit one must win, or the
+  // profile becomes a trap: a user sets a value, sees it ignored, and has no way to
+  // tell why. The live value is compared against the declared default, as distinct
+  // from parameter_overrides(), which does not see command-line -p values at all.
+  //
+  // Everything is logged, both what the profile supplied and what the user overrode.
+  // A profile that changes the filter's behaviour without saying so would be the same
+  // failure as a parameter accepted and never read, which this repo has shipped
+  // three times (the #126 knob, replay.cpp, and a rover params file keyed to the wrong
+  // node).
+  bool apply_platform_profile()
+  {
+    const std::string profile = get_parameter("platform.profile").as_string();
+    if (profile == "general") {
+      RCLCPP_INFO(get_logger(),
+        "Platform profile: general. Every state is estimated. Set platform.profile to "
+        "ground_robot or ground_robot_flat if this robot has wheel encoders and stays "
+        "on the ground; see docs for what that changes and what it measured.");
+      return true;
+    }
+
+    const bool flat = (profile == "ground_robot_flat");
+    if (profile != "ground_robot" && !flat) {
+      RCLCPP_ERROR(get_logger(),
+        "platform.profile '%s' is not a profile. Valid: general, ground_robot, "
+        "ground_robot_flat. Refusing to configure rather than silently running "
+        "'general', because you asked for something specific and did not get it.",
+        profile.c_str());
+      return false;
+    }
+
+    // Each row is {name, what the profile wants, what the node declares by default}.
+    // The third column is how we tell "the user set this" from "nobody set this":
+    // if the live value already differs from the declared default, the caller supplied
+    // it and the profile must not touch it.
+    //
+    // get_node_options().parameter_overrides() does NOT work for this. It holds only
+    // overrides passed programmatically through NodeOptions; a --ros-args -p value is
+    // applied by rcl at declare time and never appears there. Using it silently
+    // overwrote an explicitly-set q_gyro_bias in testing, which is exactly the trap
+    // this layering exists to avoid.
+    //
+    // Freezing a bias is only safe because the encoder measures yaw rate with no bias
+    // term and takes over the constraint. Without encoders this profile is wrong.
+    struct Row { const char* name; double profile; double declared; };
+    std::vector<Row> defaults = {
+      {"ukf.q_acceleration",              0.0,    1.0   },
+      {"ukf.q_accel_bias",                0.0,    1.0e-5},
+      {"ukf.q_gyro_bias",                 0.0,    1.0e-5},
+      {"ukf.q_encoder_wz_bias",           0.0,    1.0e-7},
+      {"imu.gyro_bias_initial_sigma",     1.0e-6, 0.175 },
+      {"imu.accel_bias_initial_sigma",    1.0e-6, 0.30  },
+      {"encoder.wz_scale_initial_sigma",  1.0e-6, 0.30  },
+    };
+    if (flat) defaults.push_back({"ground_constraint.z_position_sigma", 0.3, 0.0});
+
+    int applied = 0, kept = 0;
+    for (const auto& row : defaults) {
+      if (!has_parameter(row.name)) {
+        RCLCPP_ERROR(get_logger(),
+          "platform.profile '%s' wants to set '%s', which this node does not declare. "
+          "The profile and the node have drifted apart; refusing to configure.",
+          profile.c_str(), row.name);
+        return false;
+      }
+      const double live = get_parameter(row.name).as_double();
+      const bool user_set = std::abs(live - row.declared) >
+                            1e-12 * std::max(1.0, std::abs(row.declared));
+      if (user_set) {
+        RCLCPP_INFO(get_logger(), "  %-34s %-10g KEPT (you set it, profile wanted %g)",
+                    row.name, live, row.profile);
+        ++kept;
+        continue;
+      }
+      set_parameter(rclcpp::Parameter(row.name, row.profile));
+      RCLCPP_INFO(get_logger(), "  %-34s %-10g from profile", row.name, row.profile);
+      ++applied;
+    }
+
+    // Booleans need a different "did the caller set it" test. An explicit false is the
+    // same value as the declared default, so comparing against the default cannot see
+    // it, and a ground_robot user who turned re-anchoring off would have it silently
+    // turned back on. The node's resolved overrides hold every value given through a
+    // params file or -p, including one equal to the default.
+    //
+    // gnss.reanchor_enabled: on in ground_robot from 0.5.0. It failed its ship rule on
+    // two secondary clauses (median +3.3% and +4.4% on two held-out sequences, jitter
+    // +0.126 on one) while lowering RMSE on 10 of 12 NCLT sequences and raising it on
+    // none; through this node on 2012-01-08 it read 10.882 m against replay's 10.898 m.
+    // Enabling it here is a product decision with those costs, not a pass.
+    struct BoolRow { const char* name; bool profile; };
+    const std::vector<BoolRow> bool_defaults = {
+      {"gnss.reanchor_enabled", true},
+    };
+    const auto& overrides = get_node_parameters_interface()->get_parameter_overrides();
+    for (const auto& row : bool_defaults) {
+      if (!has_parameter(row.name)) {
+        RCLCPP_ERROR(get_logger(),
+          "platform.profile '%s' wants to set '%s', which this node does not declare. "
+          "The profile and the node have drifted apart; refusing to configure.",
+          profile.c_str(), row.name);
+        return false;
+      }
+      if (overrides.count(row.name)) {
+        RCLCPP_INFO(get_logger(), "  %-34s %-10s KEPT (you set it, profile wanted %s)",
+                    row.name, get_parameter(row.name).as_bool() ? "true" : "false",
+                    row.profile ? "true" : "false");
+        ++kept;
+        continue;
+      }
+      set_parameter(rclcpp::Parameter(row.name, row.profile));
+      RCLCPP_INFO(get_logger(), "  %-34s %-10s from profile", row.name,
+                  row.profile ? "true" : "false");
+      ++applied;
+    }
+
+    RCLCPP_INFO(get_logger(),
+      "Platform profile: %s. %d parameter(s) supplied, %d kept from your config. "
+      "This stops the filter estimating states a wheeled robot cannot observe. It "
+      "REQUIRES wheel encoders%s.",
+      profile.c_str(), applied, kept,
+      flat ? ", and assumes the ground is flat" : "");
+    return true;
+  }
+
   CallbackReturn on_configure(const rclcpp_lifecycle::State &)
   {
     RCLCPP_INFO(get_logger(), "Configuring FusionCore...");
@@ -146,9 +278,9 @@ public:
     // IMU lever arm (offset from base_link to IMU sensing point, body frame).
     // Leave at 0 to auto-resolve from TF (base_frame -> imu_frame translation
     // via the URDF). Set non-zero to override the TF value.
-    declare_parameter("imu.lever_arm_x", 0.0);
-    declare_parameter("imu.lever_arm_y", 0.0);
-    declare_parameter("imu.lever_arm_z", 0.0);
+    declare_parameter("imu.lever_arm_x", fusioncore_ros::lever_arm_unset());
+    declare_parameter("imu.lever_arm_y", fusioncore_ros::lever_arm_unset());
+    declare_parameter("imu.lever_arm_z", fusioncore_ros::lever_arm_unset());
 
     // Optional second IMU source. When non-empty, FusionCore subscribes to this
     // topic and calls update_imu() for each message, treating the two sensors as
@@ -282,6 +414,12 @@ public:
     // Optional second GNSS receiver topic: set to empty string to disable
     declare_parameter("gnss.fix2_topic", "");
 
+    // Same idea as gnss.frame_id but for the second receiver. Only needed when
+    // that driver publishes an empty header.frame_id, or publishes a frame that
+    // is not the one in your URDF. Left empty, the message's own frame_id is
+    // used, which is what lets the second antenna's lever arm resolve itself.
+    declare_parameter("gnss.frame_id2", std::string(""));
+
     // compass_msgs/Azimuth heading topic: peci1 standard
     // Set to empty string to disable (use sensor_msgs/Imu heading instead)
     declare_parameter("gnss.azimuth_topic", "");
@@ -289,17 +427,17 @@ public:
     // Read gnss.fix_topic as gps_msgs/GPSFix instead of sensor_msgs/NavSatFix.
     // GPSFix carries RTK_FLOAT status (unreachable via NavSatFix), separate hdop/vdop
     // from the receiver, satellites_used, and err_horz/err_vert position bounds.
-    // Required when your GNSS driver publishes gps_msgs/GPSFix (e.g. nmea_navsat_driver
-    // with fix_type=RTK_FLOAT or ublox_dgnss in GPSFix mode).
+    // Required when your GNSS driver publishes gps_msgs/GPSFix. nmea_navsat_driver does
+    // not: it publishes sensor_msgs/NavSatFix, so leave this false for it (#73).
     // Set false (default) to use sensor_msgs/NavSatFix: works with all receivers.
     declare_parameter("gnss.use_gps_fix", false);
 
     // Antenna lever arm params: primary receiver.
     // Leave at 0 to auto-resolve from TF (base_frame -> GNSS msg frame_id
     // translation, via URDF); set non-zero to override.
-    declare_parameter("gnss.lever_arm_x", 0.0);
-    declare_parameter("gnss.lever_arm_y", 0.0);
-    declare_parameter("gnss.lever_arm_z", 0.0);
+    declare_parameter("gnss.lever_arm_x", fusioncore_ros::lever_arm_unset());
+    declare_parameter("gnss.lever_arm_y", fusioncore_ros::lever_arm_unset());
+    declare_parameter("gnss.lever_arm_z", fusioncore_ros::lever_arm_unset());
 
     // When true, the GNSS lever arm is applied from the very first fix, not
     // only after heading_validated_. Let RTK-grade fixes observe yaw directly
@@ -309,11 +447,13 @@ public:
     declare_parameter("gnss.apply_lever_arm_pre_heading", false);
 
     // Antenna lever arm params: secondary receiver (gnss.fix2_topic)
-    // Leave at 0.0 if second antenna is at the same position as the first,
-    // or if fix2_topic is not used.
-    declare_parameter("gnss.lever_arm2_x", 0.0);
-    declare_parameter("gnss.lever_arm2_y", 0.0);
-    declare_parameter("gnss.lever_arm2_z", 0.0);
+    // Same rule as the primary above: leave at 0 to auto-resolve from TF
+    // (base_frame -> the second receiver's frame), set non-zero to override.
+    // On a dual-antenna robot the URDF already knows where both antennas are,
+    // so there is usually nothing to fill in here.
+    declare_parameter("gnss.lever_arm2_x", fusioncore_ros::lever_arm_unset());
+    declare_parameter("gnss.lever_arm2_y", fusioncore_ros::lever_arm_unset());
+    declare_parameter("gnss.lever_arm2_z", fusioncore_ros::lever_arm_unset());
 
     // PROJ coordinate reference system parameters
     // input.gnss_crs: CRS of incoming NavSatFix messages (default: WGS84 lat/lon)
@@ -351,7 +491,6 @@ public:
     declare_parameter("vslam.topic",              std::string(""));
     declare_parameter("vslam.position_noise",     0.1);
     declare_parameter("vslam.orientation_noise",  0.02);
-    declare_parameter("vslam.frame_id",           std::string(""));
     declare_parameter("vslam.reinit_n",           10);
 
     declare_parameter("gnss.coast_n",               5);
@@ -361,7 +500,29 @@ public:
     declare_parameter("gnss.coast_q_bias_factor",   100.0);
     declare_parameter("gnss.coast_imu_wz_scale",    1.0);
     declare_parameter("gnss.recovery_rejection_n",  15);
+    // Accepted fixes in a row before an outage is treated as genuinely over.
+    // Was a hardcoded 3, which is 0.6 s on a 5 Hz receiver and 15 s on a 0.2 Hz
+    // one: the same constant means very different things depending on the fix
+    // rate, which is what #126 is about. 0 clears the latch on the first fix.
+    declare_parameter("gnss.reacquire_confirm_fixes", 3);
     declare_parameter("gnss.p_inflate_sigma",       50.0);
+    // Re-anchoring after a blackout. DEFAULT OFF, so no existing deployment
+    // changes behaviour by upgrading. On seven held-out NCLT sequences (2026-10-25,
+    // node-faithful replay) it lowered full-trajectory RMSE on 6 of 7 and raised it on
+    // none, but raised median error 3.3%/4.4% on two and jitter on one, so it failed
+    // the default-change rule in tools/ship_rule.md. Recommended as opt-in; see
+    // docs/configuration.md.
+    declare_parameter("gnss.reanchor_enabled",       false);
+    declare_parameter("gnss.reanchor_window",        20);
+    declare_parameter("gnss.reanchor_reject_frac",   0.6);
+    // The persistent-bias trigger. Off because the ablation says the events it
+    // adds are net harmful: see the table in fusioncore.hpp next to this field.
+    declare_parameter("gnss.reanchor_bias_trigger",  false);
+    declare_parameter("gnss.reanchor_bias_m",        8.0);
+    declare_parameter("gnss.reanchor_buffer_n",      5);
+    declare_parameter("gnss.reanchor_odom_tol_m",    4.0);
+    declare_parameter("gnss.reanchor_sigma_xy",      5.0);
+    declare_parameter("gnss.reanchor_cooldown_s",    20.0);
     declare_parameter("gnss.recovery_timeout_s",    0.0);
     // How far the robot must travel before heading is declared observable and
     // heading_validated flips true. This was hardcoded at 5.0 and unreachable
@@ -384,7 +545,55 @@ public:
     // never overrides the heading source. 0 = off. See issue #73.
     declare_parameter("gnss.track_heading_cross_check_deg", 15.0);
     declare_parameter("gnss.track_heading_min_speed",    0.2);
+
+    // Inter-sensor time offset. The filter has always GUARDED against clock
+    // disagreement by dropping late measurements; this measures the offset so it can
+    // be corrected instead. The gyro z rate and a differential drive's encoder yaw
+    // rate are the same signal observed twice, so the lag that maximises their
+    // agreement is the offset.
+    //
+    // Estimating is on by default because it only reports. APPLYING is manual: a
+    // filter that silently shifted a sensor stream would be very hard to debug the
+    // first time it was wrong.
+    // How well the gyro's zero-rate offset is known at STARTUP, 1-sigma. Not an
+    // ordinary tuning knob: it sets how a gyro reading is divided between the true
+    // rate and the bias, which is otherwise arbitrary because the two are not
+    // separately observable. 0.02 rad/s is about 1.1 deg/s. RAISE it for a poorly
+    // calibrated or hot-running gyro, because a tight prior that is WRONG is worse
+    // than a loose one. See docs/observability.md.
+    // Encoder yaw-error model. false = additive bias (default), true = multiplicative
+    // scale. An encoder has no constant additive yaw-rate offset; its errors are
+    // scale, speed-proportional and slip. Modelling scale as a bias creates a null
+    // direction the gyro bias hides in. OFF until measured on real data.
+    declare_parameter("encoder.yaw_scale_model", false);
+    declare_parameter("encoder.wz_scale_initial_sigma", 0.30);
+    declare_parameter("imu.gyro_bias_initial_sigma",  0.175);
+    declare_parameter("imu.accel_bias_initial_sigma", 0.30);
+    declare_parameter("time_offset.estimate_interval_s", 10.0);
+    declare_parameter("encoder.time_offset", 0.0);
+
+    // GNSS rotation heading bootstrap (#67). RTK only in practice: the noise model
+    // requires the lateral sigma of the displacement between the two fixes to be
+    // under about 10 cm, so roughly 7 cm per fix, and consumer GNSS at 2 to 5 m is
+    // far outside that. Leaving it enabled costs nothing on such a receiver because
+    // it simply never fires. It also needs a BRISK rotation: yaw 1-sigma grows about
+    // 0.2 rad/s while turning, so a slow turn loses the rotation before it has swept
+    // enough arc, and the delta-yaw gate correctly refuses.
+    declare_parameter("gnss.rotation_heading_enabled",              true);
+    declare_parameter("gnss.rotation_heading_min_yaw_delta",        1.0);
+    declare_parameter("gnss.rotation_heading_min_arc_baseline",     0.25);
+    declare_parameter("gnss.rotation_heading_max_base_translation", 0.20);
+    declare_parameter("gnss.rotation_heading_max_sigma",            0.4);
+    declare_parameter("gnss.rotation_heading_sigma_floor",          0.05);
+    declare_parameter("gnss.rotation_heading_delta_yaw_sigma",      0.03);
+    declare_parameter("gnss.rotation_heading_max_window_s",         10.0);
+    declare_parameter("gnss.rotation_heading_max_len_residual_sigma", 3.0);
     declare_parameter("gnss.track_heading_max_yaw_rate", 0.3);
+    // #144: discard the bearing window on the ANGLE turned across it rather than
+    // on one instantaneous yaw-rate sample. 0.0 keeps the rate check, so this is
+    // off by default and changes nothing until set. 5.0 is the value validated
+    // over five rover bags; see the core header for the numbers.
+    declare_parameter("gnss.track_heading_max_window_turn_deg", 0.0);
     declare_parameter("gnss.lever_arm_max_heading_sigma_deg", 20.0);
 
     declare_parameter("adaptive.imu",               true);
@@ -527,6 +736,48 @@ public:
     declare_parameter("ukf.q_gyro_bias",         1e-5);
     declare_parameter("ukf.q_accel_bias",        1e-5);
     declare_parameter("ukf.q_encoder_wz_bias",   1e-7);
+    declare_parameter("ukf.max_sigma_rotation_deg", 0.0);
+    declare_parameter("ukf.max_sigma_rotation_relax_s", 0.0);
+
+    // WHAT PLATFORM IS THIS? The filter cannot work that out, and the answer decides
+    // which states are worth estimating. A ground robot with wheel encoders cannot
+    // observe its accelerometer bias in straight motion and does not need to: the
+    // encoder measures body velocity directly and carries the constraint instead.
+    // Estimating it anyway costs accuracy, because WZ and B_GZ then slide along an
+    // unobservable line (r = -0.998 on a synthetic in-place spin, -0.63 to -0.04 on
+    // NCLT) and anything integrating WZ alone inherits
+    // the error.
+    //
+    //   general           estimate everything. Correct for drones, boats, handhelds,
+    //                     and anything that leaves the ground plane. The default, so
+    //                     this parameter changes nothing unless you set it.
+    //   ground_robot      REQUIRES WHEEL ENCODERS. Stops estimating acceleration and
+    //                     the bias states, and from 0.5.0 turns on gnss.reanchor_enabled
+    //                     (see apply_platform_profile for what that costs).
+    //   ground_robot_flat ground_robot plus a Z-position constraint, for terrain that
+    //                     really is flat: campus, warehouse, yard, most field work.
+    //
+    // Measured on NCLT at 1x, 2026-10-17, with the dataset player as it was before the
+    // 2026-10-25 tilt fix, so these are the profile's direction, not current figures. The
+    // last column is how far the robot_localization control moved on the same run, which
+    // is what makes the change attributable: it reads the same input and runs none of
+    // this code.
+    //   2012-06-15   82.011 -> 32.149   -60.8%   ctrl -0.05%
+    //   2013-04-05   14.058 ->  9.193   -34.6%   ctrl +0.50%
+    //   2012-08-20  155.618 -> 157.591   +1.3%   ctrl +0.04%   worse, so it is not uniform
+    //   2012-09-28   18.594 ->  8.872   -52.3%   ctrl +11.2%   weak: see the note below
+    //
+    // That 2012-09-28 control move would normally void the row. It is kept because this
+    // sequence has a measured control-side spread of 11.05% of its own, so the move is
+    // consistent with its noise rather than with a changed input. Four of twelve
+    // sequences measured, no hardware bag yet.
+    //
+    // A profile only ever supplies DEFAULTS. Anything you set explicitly wins, and the
+    // node logs every value it supplied and every one you overrode, because a setting
+    // that changes behaviour silently is worse than no setting at all.
+    declare_parameter("platform.profile", std::string("general"));
+
+    if (!apply_platform_profile()) return CallbackReturn::FAILURE;
 
     base_frame_   = get_parameter("base_frame").as_string();
     odom_frame_   = get_parameter("odom_frame").as_string();
@@ -536,6 +787,7 @@ public:
     heading_topic_ = get_parameter("gnss.heading_topic").as_string();
     gnss_fix_topic_ = get_parameter("gnss.fix_topic").as_string();
     gnss_frame_override_ = get_parameter("gnss.frame_id").as_string();
+    gnss2_frame_override_ = get_parameter("gnss.frame_id2").as_string();
     gnss_frame_validated_ = false;
     gnss2_topic_    = get_parameter("gnss.fix2_topic").as_string();
     azimuth_topic_  = get_parameter("gnss.azimuth_topic").as_string();
@@ -559,10 +811,15 @@ public:
     // wrapper will auto-resolve from TF (base_frame -> imu_frame) on the
     // first IMU message and call fc_->set_imu_lever_arm() with
     // the translation it extracts from URDF.
-    config.imu.lever_arm.x = get_parameter("imu.lever_arm_x").as_double();
-    config.imu.lever_arm.y = get_parameter("imu.lever_arm_y").as_double();
-    config.imu.lever_arm.z = get_parameter("imu.lever_arm_z").as_double();
-    imu_lever_arm_explicit_ = !config.imu.lever_arm.is_zero();
+    {
+      const double lx = get_parameter("imu.lever_arm_x").as_double();
+      const double ly = get_parameter("imu.lever_arm_y").as_double();
+      const double lz = get_parameter("imu.lever_arm_z").as_double();
+      imu_lever_arm_explicit_ = fusioncore_ros::lever_arm_was_set(lx, ly, lz);
+      config.imu.lever_arm.x = fusioncore_ros::lever_arm_or_zero(lx);
+      config.imu.lever_arm.y = fusioncore_ros::lever_arm_or_zero(ly);
+      config.imu.lever_arm.z = fusioncore_ros::lever_arm_or_zero(lz);
+    }
     if (imu_lever_arm_explicit_) {
       RCLCPP_INFO(get_logger(),
         "IMU lever arm (explicit): x=%.3f y=%.3f z=%.3f m",
@@ -634,10 +891,15 @@ public:
     RCLCPP_INFO(get_logger(),
                 "GNSS min_fix_type: %d (1=GPS, 2=DGPS, 3=RTK_FLOAT, 4=RTK_FIXED)",
                 static_cast<int>(min_fix_type_));
-    gnss_lever_arm_.x = get_parameter("gnss.lever_arm_x").as_double();
-    gnss_lever_arm_.y = get_parameter("gnss.lever_arm_y").as_double();
-    gnss_lever_arm_.z = get_parameter("gnss.lever_arm_z").as_double();
-    gnss_lever_arm_explicit_ = !gnss_lever_arm_.is_zero();
+    {
+      const double lx = get_parameter("gnss.lever_arm_x").as_double();
+      const double ly = get_parameter("gnss.lever_arm_y").as_double();
+      const double lz = get_parameter("gnss.lever_arm_z").as_double();
+      gnss_lever_arm_explicit_ = fusioncore_ros::lever_arm_was_set(lx, ly, lz);
+      gnss_lever_arm_.x = fusioncore_ros::lever_arm_or_zero(lx);
+      gnss_lever_arm_.y = fusioncore_ros::lever_arm_or_zero(ly);
+      gnss_lever_arm_.z = fusioncore_ros::lever_arm_or_zero(lz);
+    }
     config.gnss.apply_lever_arm_pre_heading =
       get_parameter("gnss.apply_lever_arm_pre_heading").as_bool();
     if (config.gnss.apply_lever_arm_pre_heading) {
@@ -652,10 +914,29 @@ public:
       warn_if_lever_arm_unset("gnss.apply_lever_arm_pre_heading is true");
     }
 
-    gnss_lever_arm2_.x = get_parameter("gnss.lever_arm2_x").as_double();
-    gnss_lever_arm2_.y = get_parameter("gnss.lever_arm2_y").as_double();
-    gnss_lever_arm2_.z = get_parameter("gnss.lever_arm2_z").as_double();
+    {
+      const double lx = get_parameter("gnss.lever_arm2_x").as_double();
+      const double ly = get_parameter("gnss.lever_arm2_y").as_double();
+      const double lz = get_parameter("gnss.lever_arm2_z").as_double();
+      gnss_lever_arm2_explicit_ = fusioncore_ros::lever_arm_was_set(lx, ly, lz);
+      gnss_lever_arm2_.x = fusioncore_ros::lever_arm_or_zero(lx);
+      gnss_lever_arm2_.y = fusioncore_ros::lever_arm_or_zero(ly);
+      gnss_lever_arm2_.z = fusioncore_ros::lever_arm_or_zero(lz);
+    }
 
+    // Say which of the three states this is, always, including "explicitly zero".
+    // Gating the message on !is_zero() meant a deliberate zero logged NOTHING, so the
+    // only evidence that the TF auto-resolve had been skipped was the ABSENCE of a
+    // later line. Inferring behaviour from silence is how #148 survived a full
+    // benchmark run, so this now states it.
+    if (!gnss_lever_arm_explicit_) {
+      RCLCPP_INFO(get_logger(),
+        "GNSS lever arm (primary): unset, will auto-resolve from TF on the first fix");
+    } else if (gnss_lever_arm_.is_zero()) {
+      RCLCPP_INFO(get_logger(),
+        "GNSS lever arm (primary): explicitly ZERO, so the TF auto-resolve is skipped. "
+        "Remove gnss.lever_arm_x/y/z entirely to auto-resolve instead.");
+    }
     if (!gnss_lever_arm_.is_zero()) {
       RCLCPP_INFO(get_logger(),
         "GNSS lever arm (primary) set: x=%.3f y=%.3f z=%.3f m",
@@ -704,11 +985,23 @@ public:
     config.outlier_threshold_vslam = get_parameter("outlier_threshold_vslam").as_double();
 
     vslam_topic_          = get_parameter("vslam.topic").as_string();
-    vslam_frame_override_ = get_parameter("vslam.frame_id").as_string();
     config.vslam.position_noise    = get_parameter("vslam.position_noise").as_double();
     config.vslam.orientation_noise = get_parameter("vslam.orientation_noise").as_double();
     vslam_reinit_n_       = get_parameter("vslam.reinit_n").as_int();
 
+    config.gnss_reanchor_enabled      = get_parameter("gnss.reanchor_enabled").as_bool();
+    config.gnss_reanchor_window       = get_parameter("gnss.reanchor_window").as_int();
+    config.gnss_reanchor_reject_frac  =
+      get_parameter("gnss.reanchor_reject_frac").as_double();
+    config.gnss_reanchor_bias_trigger =
+      get_parameter("gnss.reanchor_bias_trigger").as_bool();
+    config.gnss_reanchor_bias_m       = get_parameter("gnss.reanchor_bias_m").as_double();
+    config.gnss_reanchor_buffer_n     = get_parameter("gnss.reanchor_buffer_n").as_int();
+    config.gnss_reanchor_odom_tol_m   =
+      get_parameter("gnss.reanchor_odom_tol_m").as_double();
+    config.gnss_reanchor_sigma_xy     = get_parameter("gnss.reanchor_sigma_xy").as_double();
+    config.gnss_reanchor_cooldown_s   =
+      get_parameter("gnss.reanchor_cooldown_s").as_double();
     config.gnss_coast_n               = get_parameter("gnss.coast_n").as_int();
     config.gnss_coast_min_gap_s       = get_parameter("gnss.coast_min_gap_s").as_double();
     config.gnss_coast_q_factor        = get_parameter("gnss.coast_q_factor").as_double();
@@ -716,6 +1009,8 @@ public:
     config.gnss_coast_q_bias_factor   = get_parameter("gnss.coast_q_bias_factor").as_double();
     config.gnss_coast_imu_wz_scale    = get_parameter("gnss.coast_imu_wz_scale").as_double();
     config.gnss_recovery_rejection_n  = get_parameter("gnss.recovery_rejection_n").as_int();
+    config.gnss_reacquire_confirm_fixes =
+      static_cast<int>(get_parameter("gnss.reacquire_confirm_fixes").as_int());
     config.gnss_p_inflate_sigma       = get_parameter("gnss.p_inflate_sigma").as_double();
     // gnss.recovery_timeout_s is still DECLARED so existing configs keep loading,
     // but the filter never read it and the behaviour its documentation described
@@ -737,7 +1032,37 @@ public:
         get_parameter("gnss.track_heading_cross_check_deg").as_double();
     heading_xcheck_deg_ = config.gps_track_heading_cross_check_deg;
     config.gps_track_heading_min_speed     = get_parameter("gnss.track_heading_min_speed").as_double();
+    config.encoder_yaw_scale_model =
+      get_parameter("encoder.yaw_scale_model").as_bool();
+    bias_gyro_sigma_  = get_parameter("imu.gyro_bias_initial_sigma").as_double();
+    bias_accel_sigma_ = get_parameter("imu.accel_bias_initial_sigma").as_double();
+    bias_enc_scale_sigma_ = get_parameter("encoder.wz_scale_initial_sigma").as_double();
+    config.time_offset_estimate_interval_s =
+      get_parameter("time_offset.estimate_interval_s").as_double();
+    config.encoder_time_offset =
+      get_parameter("encoder.time_offset").as_double();
+
+    config.gps_rotation_heading_enabled =
+      get_parameter("gnss.rotation_heading_enabled").as_bool();
+    config.gps_rotation_heading_min_yaw_delta =
+      get_parameter("gnss.rotation_heading_min_yaw_delta").as_double();
+    config.gps_rotation_heading_min_arc_baseline =
+      get_parameter("gnss.rotation_heading_min_arc_baseline").as_double();
+    config.gps_rotation_heading_max_base_translation =
+      get_parameter("gnss.rotation_heading_max_base_translation").as_double();
+    config.gps_rotation_heading_max_sigma =
+      get_parameter("gnss.rotation_heading_max_sigma").as_double();
+    config.gps_rotation_heading_sigma_floor =
+      get_parameter("gnss.rotation_heading_sigma_floor").as_double();
+    config.gps_rotation_heading_delta_yaw_sigma =
+      get_parameter("gnss.rotation_heading_delta_yaw_sigma").as_double();
+    config.gps_rotation_heading_max_window_s =
+      get_parameter("gnss.rotation_heading_max_window_s").as_double();
+    config.gps_rotation_heading_max_len_residual_sigma =
+      get_parameter("gnss.rotation_heading_max_len_residual_sigma").as_double();
     config.gps_track_heading_max_yaw_rate  = get_parameter("gnss.track_heading_max_yaw_rate").as_double();
+    config.gps_track_heading_max_window_turn_deg =
+      get_parameter("gnss.track_heading_max_window_turn_deg").as_double();
     config.gnss_lever_arm_max_heading_sigma_deg =
       get_parameter("gnss.lever_arm_max_heading_sigma_deg").as_double();
 
@@ -763,6 +1088,10 @@ public:
     config.ukf.q_gyro_bias          = get_parameter("ukf.q_gyro_bias").as_double();
     config.ukf.q_accel_bias         = get_parameter("ukf.q_accel_bias").as_double();
     config.ukf.q_encoder_wz_bias    = get_parameter("ukf.q_encoder_wz_bias").as_double();
+    config.ukf.max_sigma_rotation_deg =
+      get_parameter("ukf.max_sigma_rotation_deg").as_double();
+    config.ukf.max_sigma_rotation_relax_s =
+      get_parameter("ukf.max_sigma_rotation_relax_s").as_double();
 
     zupt_enabled_            = get_parameter("zupt.enabled").as_bool();
     zupt_velocity_threshold_ = get_parameter("zupt.velocity_threshold").as_double();
@@ -882,6 +1211,33 @@ public:
       "FusionCore configured. base_frame=%s odom_frame=%s rate=%.0fHz",
       base_frame_.c_str(), odom_frame_.c_str(), publish_rate_);
 
+    // Say which node name the parameters were matched against, and print a few
+    // whose defaults nobody should be running outdoors.
+    //
+    // A ROS 2 params file is keyed by node name. If the running node is not
+    // called what the YAML says, the whole file is ignored and every setting
+    // silently falls back to its library default. Nothing errors, and
+    // `ros2 param get` returns the default as though it were configured, so the
+    // usual way of checking agrees with you.
+    //
+    // It does not degrade gracefully either. The two defaults below are the two
+    // worst configurations this project has measured: imu.accel_noise 0.1 tells
+    // the filter to trust an accelerometer reading several m/s^2 of chassis
+    // vibration, which drew 53 m of path against 27.73 m actually travelled, and
+    // gnss.max_hdop 4.0 compared against a synthesised DOP in metres rejected
+    // 500 of 500 fixes on a u-blox M9N. Anyone who namespaces or renames the node
+    // can land on both at once. Printing the name beside the values lets a user
+    // spot the mismatch in one line instead of debugging the filter. See #134.
+    RCLCPP_INFO(get_logger(),
+      "Parameters matched against node '%s' in namespace '%s'. If your YAML is "
+      "keyed to a different name, none of it applied: imu.accel_noise=%.4g "
+      "gnss.max_hdop=%.4g gnss.base_noise_xy=%.4g imu.gyro_noise=%.4g",
+      get_name(), get_namespace(),
+      get_parameter("imu.accel_noise").as_double(),
+      get_parameter("gnss.max_hdop").as_double(),
+      get_parameter("gnss.base_noise_xy").as_double(),
+      get_parameter("imu.gyro_noise").as_double());
+
     // Say out loud what the output frame's yaw is referenced to. The filter's
     // state is local ENU (x=east, y=north), so with a 9-axis IMU the output is
     // world-referenced from the first message, while wheel odometry uses
@@ -933,6 +1289,31 @@ public:
 
     rclcpp::SubscriptionOptions sensor_opts;
     sensor_opts.callback_group = sensor_cb_group_;
+
+    // Ask the middleware how many messages it DROPPED, because nothing else can tell
+    // us. Every sensor subscription here uses SensorDataQoS, which is KEEP_LAST with a
+    // depth of FIVE and BEST_EFFORT delivery, and all of these callbacks share one
+    // MutuallyExclusive group, so they serialise behind a single thread. A slow GNSS
+    // update at 100 Hz IMU is enough to overflow five, and the drop is silent.
+    //
+    // This exists to settle the node-versus-replay gap: the same sequence, same commit
+    // and same data scores 137 m through the offline replay and 194 m through this
+    // node, about 40%, which is far outside the node's own 14.8% run-to-run spread.
+    // Replay reads a file and cannot drop anything. If this counter stays at zero the
+    // hypothesis is dead and the gap is arrival-order processing or predict cadence.
+    //
+    // A zero is only weak evidence though: whether the middleware reports sample-lost
+    // for a best-effort reader is an rmw implementation detail, so a zero here must be
+    // cross-checked against published-versus-consumed counts before it is believed.
+    sensor_opts.event_callbacks.message_lost_callback =
+      [this](rclcpp::QOSMessageLostInfo & info) {
+        messages_lost_.fetch_add(info.total_count_change, std::memory_order_relaxed);
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+          "middleware dropped %zu sensor message(s), %zu total. The sensor "
+          "subscriptions are BEST_EFFORT with a queue depth of 5; a drop here means "
+          "the filter never saw that measurement.",
+          info.total_count_change, info.total_count);
+      };
     // BEST_EFFORT QoS: compatible with both BEST_EFFORT and RELIABLE publishers.
     // Most hardware drivers (ublox, Septentrio, Microstrain, etc.) publish sensor
     // data as BEST_EFFORT. Using RELIABLE here silently drops all messages from
@@ -1135,6 +1516,7 @@ public:
         fusioncore::State initial;
         initial.x = fusioncore::StateVector::Zero();
         initial.P = fusioncore::StateMatrix::Identity() * 0.1;
+        apply_bias_priors(initial.P);
         initial.P(0,0) = 1000.0;
         initial.P(1,1) = 1000.0;
         initial.P(2,2) = 1000.0;
@@ -1491,6 +1873,7 @@ private:
 
   void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg)
   {
+    ++cb_imu_;
     double t = rclcpp::Time(msg->header.stamp).seconds();
     check_sensor_clock("IMU", t, imu_clock_checked_);
 
@@ -1531,6 +1914,7 @@ private:
       if (init_window_duration_ <= 0.0) {
         fusioncore::State initial;
         initial.P = fusioncore::StateMatrix::Identity() * 0.1;
+        apply_bias_priors(initial.P);
         initial.P(0,0) = 1000.0;
         initial.P(1,1) = 1000.0;
         initial.P(2,2) = 1000.0;
@@ -1600,6 +1984,7 @@ private:
         if (window_elapsed >= init_window_duration_) {
           fusioncore::State initial;
           initial.P = fusioncore::StateMatrix::Identity() * 0.1;
+        apply_bias_priors(initial.P);
           initial.P(0,0) = 1000.0;
           initial.P(1,1) = 1000.0;
           initial.P(2,2) = 1000.0;
@@ -1924,6 +2309,22 @@ private:
     double roll, pitch, yaw;
     tf2::Matrix3x3(q_base).getRPY(roll, pitch, yaw);
 
+    // An orientation whose roll/pitch come from the same accelerometer this node already
+    // fuses double-counts it, and is off by about atan(a/g) whenever the robot accelerates:
+    // more than a degree at ordinary accelerations. Declared tighter than 1 deg, that is
+    // the input that put NCLT 2012-01-08 into an 800 s GPS lock-out (2026-10-25). The node
+    // cannot tell from one message whether the orientation is a real attitude estimate,
+    // so it says so once; tools/bag_report.py can tell from a recorded log.
+    if (!warned_tight_orientation_ && msg->orientation_covariance[0] > 0.0 &&
+        msg->orientation_covariance[0] < kTightTiltVar) {
+      warned_tight_orientation_ = true;
+      RCLCPP_WARN(get_logger(),
+        "Fusing IMU roll/pitch declared at %.2f deg 1-sigma. If this orientation is derived "
+        "from the IMU's own accelerometer (not a gyro-integrated attitude), that double-counts "
+        "the accelerometer and is wrong by atan(a/g) while accelerating. Check with "
+        "tools/bag_report.py, or set orientation_covariance[0] to -1 to stop fusing it.",
+        std::sqrt(msg->orientation_covariance[0]) * 180.0 / M_PI);
+    }
     fc_->update_imu_orientation(
       t, roll, pitch, yaw,
       msg->orientation_covariance.data());
@@ -1933,6 +2334,7 @@ private:
 
   void encoder_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
+    ++cb_enc_;
     mark_sensor_received("Encoder");
     // If collecting the bias window, abort it if the robot moves.
     if (init_window_collecting_) {
@@ -2272,8 +2674,80 @@ private:
       max_sigma_xy_, max_sigma_z_, max_hdop_, max_vdop_);
   }
 
+  // ─── GNSS antenna lever arm, auto-resolved from TF ────────────────────────
+  // Runs once per RECEIVER, for whichever antenna this fix arrived on.
+  //
+  // This used to sit inline in the NavSatFix callback hardcoded to
+  // source_id == 0, which left two holes. A dual-antenna robot had to type the
+  // second antenna's offset into the YAML even though the URDF already knew
+  // exactly where it was, and anyone reading gps_msgs/GPSFix got no
+  // auto-resolve at all. Issue #4 asked for this per topic, which is what the
+  // source_id argument is for.
+  //
+  // The explicit-value guard matters more than it looks: a lever arm written in
+  // the YAML is never overwritten from TF. TF says where the antenna is bolted,
+  // the YAML says what the operator wants used, and those are allowed to
+  // disagree.
+  void resolve_gnss_lever_arm_from_tf(int source_id, const std::string & msg_frame)
+  {
+    const bool secondary = (source_id != 0);
+    if (secondary ? gnss_lever_arm2_explicit_ : gnss_lever_arm_explicit_) return;
+    if (secondary ? gnss_lever_arm2_tf_resolved_ : gnss_lever_arm_tf_resolved_) return;
+
+    auto & lever_arm = secondary ? gnss_lever_arm2_ : gnss_lever_arm_;
+    bool & resolved  = secondary ? gnss_lever_arm2_tf_resolved_
+                                 : gnss_lever_arm_tf_resolved_;
+    int  & warns     = secondary ? gnss2_la_warns_ : gnss_la_warns_;
+    auto & last_warn = secondary ? gnss2_la_last_warn_ : gnss_la_last_warn_;
+    const std::string & override_frame =
+      secondary ? gnss2_frame_override_ : gnss_frame_override_;
+    const char * label = secondary ? "secondary" : "primary";
+
+    // Empty override AND empty message frame means the frame is unknown.
+    // Complete the one-shot as a no-op rather than probing a synthetic frame on
+    // every fix and blocking this callback for the TF timeout each time.
+    if (fusioncore_ros::gnss_lever_arm_tf_action(override_frame, msg_frame, base_frame_) ==
+        fusioncore_ros::GnssLeverArmTfAction::MarkResolved) {
+      resolved = true;
+      return;
+    }
+
+    const std::string frame =
+      fusioncore_ros::resolve_gnss_frame(override_frame, msg_frame);
+    try {
+      auto tf = tf_buffer_->lookupTransform(
+        base_frame_, frame, tf2::TimePointZero, tf2::durationFromSec(0.2));
+      lever_arm.x = tf.transform.translation.x;
+      lever_arm.y = tf.transform.translation.y;
+      lever_arm.z = tf.transform.translation.z;
+      if (!lever_arm.is_zero()) {
+        RCLCPP_INFO(get_logger(),
+          "GNSS lever arm (%s) auto-resolved from TF %s -> %s: x=%.3f y=%.3f z=%.3f m",
+          label, base_frame_.c_str(), frame.c_str(),
+          lever_arm.x, lever_arm.y, lever_arm.z);
+      } else {
+        RCLCPP_INFO(get_logger(),
+          "GNSS lever arm (%s) auto-resolved to zero (antenna at base_frame origin)",
+          label);
+      }
+      resolved = true;
+    } catch (const tf2::TransformException & ex) {
+      // Each receiver carries its own warn budget. Sharing one meant a silent
+      // second antenna could spend the primary's and hide a real fault.
+      if (report_lever_arm_tf_failure(warns, last_warn)) {
+        RCLCPP_WARN(get_logger(),
+          "GNSS lever arm (%s) auto-resolve failed (%s -> %s): %s. "
+          "Leaving it at zero; set gnss.lever_arm%s_x/y/z explicitly to override.%s",
+          label, base_frame_.c_str(), frame.c_str(), ex.what(),
+          secondary ? "2" : "",
+          warns >= kLeverArmTfMaxWarns ? "  Not reporting this again." : "");
+      }
+    }
+  }
+
   void gnss_callback(const sensor_msgs::msg::NavSatFix::SharedPtr msg, int source_id = 0)
   {
+    ++cb_gnss_;
     if (source_id == 0) mark_sensor_received("GNSS");
     else                mark_sensor_received("GNSS2");
     if (!fc_->is_initialized()) return;
@@ -2295,48 +2769,8 @@ private:
       (void)validate_primary_gnss_frame(gnss_frame);
     }
 
-    // One-shot auto-resolve of the GNSS lever arm from TF, primary receiver
-    // only. Empty override + empty message frame means the frame is unknown:
-    // complete the one-shot as a no-op instead of probing a synthetic frame on
-    // every fix and blocking this callback for the TF timeout each time.
-    if (source_id == 0 && !gnss_lever_arm_explicit_ && !gnss_lever_arm_tf_resolved_) {
-      const auto tf_action = fusioncore_ros::gnss_lever_arm_tf_action(
-        gnss_frame_override_, msg->header.frame_id, base_frame_);
-      if (tf_action == fusioncore_ros::GnssLeverArmTfAction::MarkResolved) {
-        gnss_lever_arm_tf_resolved_ = true;
-      } else {
-        try {
-          auto tf = tf_buffer_->lookupTransform(
-            base_frame_, gnss_frame, tf2::TimePointZero,
-            tf2::durationFromSec(0.2));
-          gnss_lever_arm_.x = tf.transform.translation.x;
-          gnss_lever_arm_.y = tf.transform.translation.y;
-          gnss_lever_arm_.z = tf.transform.translation.z;
-          if (!gnss_lever_arm_.is_zero()) {
-            RCLCPP_INFO(get_logger(),
-              "GNSS lever arm auto-resolved from TF %s -> %s: x=%.3f y=%.3f z=%.3f m",
-              base_frame_.c_str(), gnss_frame.c_str(),
-              gnss_lever_arm_.x, gnss_lever_arm_.y, gnss_lever_arm_.z);
-          } else {
-            RCLCPP_INFO(get_logger(),
-              "GNSS lever arm auto-resolved to zero (antenna at base_frame origin)");
-          }
-          gnss_lever_arm_tf_resolved_ = true;
-        } catch (const tf2::TransformException &ex) {
-          // Both sides of this: the rate limit from 45a1ef5, and gnss_frame
-          // from #96 so the message names the frame actually looked up rather
-          // than the raw message frame_id, which may have been overridden.
-          if (report_lever_arm_tf_failure(gnss_la_warns_, gnss_la_last_warn_)) {
-            RCLCPP_WARN(get_logger(),
-              "GNSS lever arm auto-resolve failed (%s -> %s): %s. "
-              "Leaving lever arm at zero; set gnss.lever_arm_x/y/z explicitly to "
-              "override.%s",
-              base_frame_.c_str(), gnss_frame.c_str(), ex.what(),
-              gnss_la_warns_ >= kLeverArmTfMaxWarns ? "  Not reporting this again." : "");
-          }
-        }
-      }
-    }
+    // Auto-resolve this receiver's antenna lever arm from TF, once per receiver.
+    resolve_gnss_lever_arm_from_tf(source_id, msg->header.frame_id);
 
     fusioncore::sensors::LLAPoint lla;
     lla.lat_rad = msg->latitude  * M_PI / 180.0;
@@ -2507,6 +2941,7 @@ private:
 
     auto fc_status = fc_->get_status();
     announce_heading_validated(fc_status);
+    announce_observability(fc_status);
     if (!fc_status.heading_validated) {
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
         "Heading not yet validated: lever arm inactive. "
@@ -2534,6 +2969,70 @@ private:
   // so it is roughly (GNSS sigma / distance travelled). At a 6 m sigma, 5 m of
   // travel is more than a radian. The number was always available; it was just
   // never surfaced at the one moment a user would look.
+  // Say what the filter cannot currently see, and what to drive to fix it.
+  //
+  // The failure this exists for: heading_validated_ can be true while carrying 100
+  // degrees of uncertainty, the lever arm can be configured and never applied, and
+  // the yaw rate and its bias can slide against each other all run. None of that
+  // looks like an error from outside, so a user concludes the filter is bad when the
+  // robot was never driven in a way that made the quantity observable.
+  //
+  // Logged on CHANGE, not on a timer, so it is quiet once things are observable and
+  // it never floods. The instruction text lives in the core next to the thresholds
+  // that choose it, so this cannot drift from what the filter actually requires.
+  // Build the bias blocks of the initial covariance from the node's parameters.
+  //
+  // This lives in the node on purpose. Initial covariance is not filter config, it is
+  // the State handed to init(), and check_config_wiring.py rejected the version that
+  // put it in FusionCoreConfig because the core never read it. A library user sets P
+  // directly and needs no parameter.
+  void apply_bias_priors(fusioncore::StateMatrix& P) const
+  {
+    const double g = bias_gyro_sigma_, a = bias_accel_sigma_;
+    P(fusioncore::B_GX, fusioncore::B_GX) = g * g;
+    P(fusioncore::B_GY, fusioncore::B_GY) = g * g;
+    P(fusioncore::B_GZ, fusioncore::B_GZ) = g * g;
+    P(fusioncore::B_AX, fusioncore::B_AX) = a * a;
+    P(fusioncore::B_AY, fusioncore::B_AY) = a * a;
+    P(fusioncore::B_AZ, fusioncore::B_AZ) = a * a;
+    const double e = get_parameter("encoder.yaw_scale_model").as_bool()
+                   ? bias_enc_scale_sigma_ : g;
+    P(fusioncore::B_EWZ, fusioncore::B_EWZ) = e * e;
+  }
+
+  void announce_observability(const fusioncore::FusionCoreStatus& st)
+  {
+    const auto& o = st.observability;
+    if (o.heading == fusioncore::Observability::UNKNOWN) return;   // nothing to say
+
+    const auto key = std::make_tuple(o.heading, o.gyro_bias_z, o.lever_arm, o.next);
+    if (obs_announced_ && key == obs_last_) return;
+    obs_announced_ = true;
+    obs_last_ = key;
+
+    if (o.next == fusioncore::ExcitationManoeuvre::NONE) {
+      RCLCPP_INFO(get_logger(),
+        "Observability: heading %s (%.1f deg), yaw gyro bias %s, GNSS lever arm %s. "
+        "Nothing further needed.",
+        fusioncore::observability_name(o.heading), o.heading_sigma_deg,
+        fusioncore::observability_name(o.gyro_bias_z),
+        fusioncore::observability_name(o.lever_arm));
+      return;
+    }
+
+    RCLCPP_WARN(get_logger(),
+      "Observability: heading %s (%.1f deg), yaw gyro bias %s "
+      "(sigma %.4f rad/s, r(WZ,B_GZ) %+.3f), GNSS lever arm %s.\n"
+      "  TO FIX: %s\n"
+      "  Until then those quantities are not constrained by anything, and waiting "
+      "does not change that. See docs/observability.md.",
+      fusioncore::observability_name(o.heading), o.heading_sigma_deg,
+      fusioncore::observability_name(o.gyro_bias_z),
+      o.gyro_bias_z_sigma, o.wz_bgz_correlation,
+      fusioncore::observability_name(o.lever_arm),
+      fusioncore::excitation_instruction(o.next));
+  }
+
   void announce_heading_validated(const fusioncore::FusionCoreStatus& st)
   {
     // Same place, same once-only shape: the IMU and the encoders disagreeing about
@@ -2625,6 +3124,9 @@ private:
         !gnss_frame_validated_ && !gnss_lever_arm_.is_zero()) {
       (void)validate_primary_gnss_frame(gnss_frame);
     }
+
+    // GPSFix users never got this at all before #4.
+    resolve_gnss_lever_arm_from_tf(source_id, msg->header.frame_id);
 
     fusioncore::sensors::LLAPoint lla;
     lla.lat_rad = msg->latitude  * M_PI / 180.0;
@@ -2787,6 +3289,7 @@ private:
 
     auto fc_status = fc_->get_status();
     announce_heading_validated(fc_status);
+    announce_observability(fc_status);
     if (!fc_status.heading_validated) {
       RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
         "Heading not yet validated: lever arm inactive. "
@@ -3003,6 +3506,46 @@ private:
       case fusioncore::EncoderRejectionReason::NOT_PROCESSED: return "NOT_PROCESSED";
       case fusioncore::EncoderRejectionReason::ACCEPTED:      return "ACCEPTED";
       case fusioncore::EncoderRejectionReason::CHI2_FAILED:   return "CHI2_FAILED";
+      case fusioncore::EncoderRejectionReason::NOT_FINITE:    return "NOT_FINITE";
+    }
+    return "unknown";
+  }
+
+  // Three gates share imu_outliers, so the count cannot say which one fired.
+  // They point at different parameters: rate at a noisy gyro or accelerometer,
+  // roll/pitch at a tilted or vibrating mount, orientation at a 9-axis IMU
+  // disagreeing with the filter's own attitude. See #124.
+  static const char * imu_reason_str(fusioncore::ImuRejectionReason r)
+  {
+    switch (r) {
+      case fusioncore::ImuRejectionReason::NOT_PROCESSED:    return "NOT_PROCESSED";
+      case fusioncore::ImuRejectionReason::ACCEPTED:         return "ACCEPTED";
+      case fusioncore::ImuRejectionReason::CHI2_RATE:        return "CHI2_RATE";
+      case fusioncore::ImuRejectionReason::CHI2_ROLL_PITCH:  return "CHI2_ROLL_PITCH";
+      case fusioncore::ImuRejectionReason::CHI2_ORIENTATION: return "CHI2_ORIENTATION";
+      case fusioncore::ImuRejectionReason::NOT_FINITE:       return "NOT_FINITE";
+    }
+    return "unknown";
+  }
+
+  static const char * vslam_reason_str(fusioncore::VslamRejectionReason r)
+  {
+    switch (r) {
+      case fusioncore::VslamRejectionReason::NOT_PROCESSED: return "NOT_PROCESSED";
+      case fusioncore::VslamRejectionReason::ACCEPTED:      return "ACCEPTED";
+      case fusioncore::VslamRejectionReason::CHI2_FAILED:   return "CHI2_FAILED";
+      case fusioncore::VslamRejectionReason::NOT_FINITE:    return "NOT_FINITE";
+    }
+    return "unknown";
+  }
+
+  static const char * heading_reason_str(fusioncore::HeadingRejectionReason r)
+  {
+    switch (r) {
+      case fusioncore::HeadingRejectionReason::NOT_PROCESSED: return "NOT_PROCESSED";
+      case fusioncore::HeadingRejectionReason::ACCEPTED:      return "ACCEPTED";
+      case fusioncore::HeadingRejectionReason::CHI2_FAILED:   return "CHI2_FAILED";
+      case fusioncore::HeadingRejectionReason::NOT_FINITE:    return "NOT_FINITE";
     }
     return "unknown";
   }
@@ -3149,6 +3692,7 @@ private:
     switch (r) {
       case fusioncore::MagRejectionReason::CHI2_FAILED:     return "CHI2_FAILED";
       case fusioncore::MagRejectionReason::FIELD_MAGNITUDE: return "FIELD_MAGNITUDE";
+      case fusioncore::MagRejectionReason::NOT_FINITE:      return "NOT_FINITE";
       case fusioncore::MagRejectionReason::NOT_PROCESSED:   return "NOT_PROCESSED";
       case fusioncore::MagRejectionReason::ACCEPTED:        return "ACCEPTED";
     }
@@ -3181,21 +3725,55 @@ private:
     msg.heading_sigma_deg = d.heading_sigma_deg;
     msg.track_heading_state       = track_heading_state_str(d.track_heading_state);
     msg.track_heading_baseline_m  = d.track_heading_baseline_m;
+    msg.track_heading_window_turn_deg = d.track_heading_window_turn_deg;
     {
       const auto st_now = fc_->get_status();
       msg.heading_vs_track_deg = st_now.heading_vs_track_deg;
       msg.heading_vs_track_n   = st_now.heading_vs_track_n;
       msg.continuity_limit_m   = st_now.continuity_limit_m;
       msg.continuity_learned   = st_now.continuity_learned;
+      // reanchored is an EDGE, true on exactly the fix that re-anchored, so a
+      // consumer can act on the event instead of polling a counter and guessing
+      // when it moved.
+      msg.reanchor_count     = static_cast<int32_t>(st_now.gnss_reanchors);
+      msg.reanchored         = st_now.gnss_reanchors > last_reanchor_count_;
+      msg.reanchor_jump_m    = st_now.gnss_reanchor_last_jump_m;
+      if (msg.reanchored) {
+        RCLCPP_WARN(get_logger(),
+          "GNSS re-anchor: position jumped %.2f m. This is a deliberate "
+          "discontinuity, not divergence, and it moves position only. "
+          "Re-anchor %d this run.",
+          msg.reanchor_jump_m, msg.reanchor_count);
+      }
+      last_reanchor_count_ = st_now.gnss_reanchors;
     }
     msg.track_heading_sigma_rad   = d.track_heading_sigma_rad;
 
     gnss_status_pub_->publish(msg);
   }
 
+  long last_reanchor_count_ = 0;
+  // Written from a middleware thread, read from diagnostics, so atomic.
+  std::atomic<long> messages_lost_{0};
+  // Messages that actually reached a callback, per sensor. Compared against what a
+  // publisher sent, the shortfall is what the depth-5 BEST_EFFORT queue dropped. That
+  // overwrite need not count as "lost" to the middleware, so messages_lost alone can
+  // read 0 while messages are skipped. Logged once a minute so a harness that kills
+  // the node with SIGKILL still has the last count.
+  long cb_imu_ = 0, cb_enc_ = 0, cb_gnss_ = 0;
+  bool warned_tight_orientation_ = false;
+  // (1 deg)^2 in rad^2: tighter than accelerometer-only tilt can be while accelerating.
+  static constexpr double kTightTiltVar = (M_PI / 180.0) * (M_PI / 180.0);
+
   // Extracts heading 1-sigma in degrees from the filter covariance via quaternion Jacobian.
   bool heading_announced_ = false;
   bool yaw_sign_announced_ = false;
+  bool obs_announced_ = false;
+  double bias_gyro_sigma_      = 0.175;
+  double bias_accel_sigma_     = 0.30;
+  double bias_enc_scale_sigma_ = 0.30;
+  std::tuple<fusioncore::Observability, fusioncore::Observability,
+             fusioncore::Observability, fusioncore::ExcitationManoeuvre> obs_last_{};
 
   double compute_heading_sigma_deg(const fusioncore::State& s) const
   {
@@ -3449,7 +4027,9 @@ private:
     diag_array.status.push_back(make_status("IMU",
       health_to_level(status.imu_health),
       health_to_str(status.imu_health),
-      {{"outlier_count", std::to_string(status.imu_outliers)}}));
+      {{"outlier_count",  std::to_string(status.imu_outliers)},
+       {"last_reason",    imu_reason_str(status.imu_reason)},
+       {"last_chi2",      std::to_string(status.imu_chi2)}}));
 
     // Encoder
     diag_array.status.push_back(make_status("Encoder",
@@ -3458,18 +4038,29 @@ private:
       {{"outlier_count", std::to_string(status.enc_outliers)}}));
 
     // GNSS
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 60000,
+      "sensor callbacks consumed: imu %ld enc %ld gnss %ld, middleware messages_lost %ld",
+      cb_imu_, cb_enc_, cb_gnss_, messages_lost_.load());
     diag_array.status.push_back(make_status("GNSS",
       health_to_level(status.gnss_health),
       health_to_str(status.gnss_health),
-      {{"outlier_count",     std::to_string(status.gnss_outliers)},
-       {"heading_outliers",  std::to_string(status.hdg_outliers)}}));
+      {{"outlier_count",        std::to_string(status.gnss_outliers)},
+       {"heading_outliers",     std::to_string(status.hdg_outliers)},
+       {"heading_last_reason",  heading_reason_str(status.heading_reason)},
+       {"heading_last_chi2",    std::to_string(status.heading_chi2)},
+       {"messages_lost",        std::to_string(messages_lost_.load())},
+       {"reanchors",            std::to_string(status.gnss_reanchors)},
+       {"reanchor_last_jump_m",
+          std::to_string(status.gnss_reanchor_last_jump_m)}}));
 
     // VSLAM (only shown when configured)
     if (!vslam_topic_.empty()) {
       diag_array.status.push_back(make_status("VSLAM",
         health_to_level(status.vslam_health),
         health_to_str(status.vslam_health),
-        {{"outlier_count", std::to_string(status.vslam_outliers)}}));
+        {{"outlier_count", std::to_string(status.vslam_outliers)},
+         {"last_reason",   vslam_reason_str(status.vslam_reason)},
+         {"last_chi2",     std::to_string(status.vslam_chi2)}}));
     }
 
     // Magnetometer (only shown when configured)
@@ -3766,8 +4357,10 @@ private:
   double heading_xcheck_deg_    = 15.0;
   int    imu_la_warns_      = 0;
   int    gnss_la_warns_     = 0;
+  int    gnss2_la_warns_    = 0;
   rclcpp::Time imu_la_last_warn_{0, 0, RCL_ROS_TIME};
   rclcpp::Time gnss_la_last_warn_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time gnss2_la_last_warn_{0, 0, RCL_ROS_TIME};
   bool   apply_lever_arm_pre_heading_ = false;
   double gnss_min_sigma_xy_ = 0.02;   // metres: floor on the receiver's reported sigma
   double gnss_min_sigma_z_  = 0.05;
@@ -3821,6 +4414,7 @@ private:
   std::string heading_topic_;
   std::string gnss_fix_topic_;
   std::string gnss_frame_override_;
+  std::string gnss2_frame_override_;
   std::string gnss2_topic_;
   std::string azimuth_topic_;
   std::string mag_topic_;
@@ -3837,7 +4431,6 @@ private:
   double      max_sigma_z_  = 50.0;
   fusioncore_ros::GnssDopGateWarning dop_gate_warning_;
   std::string vslam_topic_;
-  std::string vslam_frame_override_;
   // VSLAM map-to-odom frame offset: applied to every VSLAM measurement.
   // Set on first measurement; re-computed on reinitialization detection.
   bool   vslam_origin_set_         = false;
@@ -3884,8 +4477,10 @@ private:
   // one-shot TF resolution on the first matching message.
   bool imu_lever_arm_explicit_    = false;
   bool gnss_lever_arm_explicit_   = false;
+  bool gnss_lever_arm2_explicit_  = false;
   bool imu_lever_arm_tf_resolved_  = false;
   bool gnss_lever_arm_tf_resolved_ = false;
+  bool gnss_lever_arm2_tf_resolved_ = false;
   bool gnss_frame_validated_        = false;
 
   // ZUPT parameters
