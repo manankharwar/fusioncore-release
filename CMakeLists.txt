@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(fusioncore_ros VERSION 0.4.0)
+project(fusioncore_ros VERSION 0.5.0)
 
 # Default to Release when the caller has not chosen. A plain "colcon build" sets
 # no build type, which means no optimisation flags at all, and Eigen without
@@ -71,6 +71,8 @@ if(BUILD_TESTING)
   target_include_directories(test_min_satellites_gate PRIVATE include)
 
   ament_add_gtest(test_gnss_frame tests/test_gnss_frame.cpp)
+  ament_add_gtest(test_lever_arm_config tests/test_lever_arm_config.cpp)
+  target_include_directories(test_lever_arm_config PRIVATE include)
   target_include_directories(test_gnss_frame PRIVATE include)
 
   # Launches the real node and asserts /fromLL is advertised with the type
@@ -80,8 +82,20 @@ if(BUILD_TESTING)
   find_package(launch_testing_ament_cmake QUIET)
   if(launch_testing_ament_cmake_FOUND)
     add_launch_test(tests/test_from_ll_service.py TIMEOUT 180)
+    add_launch_test(tests/test_rl_interface_conformance.py TIMEOUT 180)
+    add_launch_test(tests/test_gnss_lever_arm_tf.py TIMEOUT 180)
   else()
     message(WARNING "launch_testing_ament_cmake not found: skipping the /fromLL service type test")
+  endif()
+
+  # Starts the real node and reads back resolved parameters, because a profile that
+  # only looks right in the source is the PR #129 failure mode: the layering has to
+  # be checked against what rcl actually resolved, not against what the code intends.
+  find_package(ament_cmake_pytest QUIET)
+  if(ament_cmake_pytest_FOUND)
+    ament_add_pytest_test(test_platform_profile tests/test_platform_profile.py TIMEOUT 600)
+  else()
+    message(WARNING "ament_cmake_pytest not found: skipping the platform profile test")
   endif()
 endif()
 
