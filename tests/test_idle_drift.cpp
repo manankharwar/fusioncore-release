@@ -309,9 +309,18 @@ TEST(IdleDriftTest, DeadEncodersDoNotFreezeTheEstimate) {
   const double dt = 0.01, g = 9.80665;
   double t = 0.0;
   // The robot really is driving east at 0.5 m/s, but every encoder reads zero.
+  // It also SHAKES, because a robot rolling over ground does. Measured on six
+  // 2026-09 rover logs the accel-magnitude std is 1.69 to 2.25 m/s^2 driving
+  // against 0.013 to 0.021 parked, and the detector now requires that evidence
+  // before calling the wheels liars. A perfectly still accelerometer on a
+  // moving robot is not a robot this test should be describing.
   for (int step = 1; step * dt <= 40.0 + 1e-9; ++step) {
     t = step * dt;
-    fc.update_imu(t, 0, 0, 0, 0, 0, g);
+    // On the gravity axis. The published figure is the std of accelerometer
+    // MAGNITUDE, and a 2 m/s^2 wobble sideways of a 9.81 vector barely changes
+    // its length, so shaking in y would not describe a robot that is rolling.
+    const double shake = 2.0 * std::sin(37.0 * t);
+    fc.update_imu(t, 0, 0, 0, 0, 0, g + shake);
     if (step % 2 == 0) {
       fc.update_encoder(t, 0.0, 0.0, 0.0);     // the lie
       fc.update_zupt(t, 0.01);                 // which ZUPT believes
@@ -326,6 +335,67 @@ TEST(IdleDriftTest, DeadEncodersDoNotFreezeTheEstimate) {
   EXPECT_GT(fc.get_state().x[X], 8.0)
     << "the estimate stayed put while the robot drove 20 m. It reached only "
     << fc.get_state().x[X] << " m, which is the failure this check exists to stop.";
+}
+
+// ─── The indoor false positive, 2026-09-15 ─────────────────────────────────
+// Indoors the receiver reported sigma_xy 14 m, so two consecutive fixes sat 6 m
+// apart. That is one segment, and over one segment displacement and path length
+// are the same line, so straightness is exactly 1.00 no matter what the receiver
+// did. The check fired 2.8 s after the first fix of the run, announced that the
+// wheel odometry was lying, and disabled ZUPT and the parked-GNSS suppression
+// for the rest of the run. The robot was sitting on a table.
+TEST(IdleDriftTest, TwoFixesAreNotEvidenceOfAnything) {
+  FusionCore fc(idle_config(0.001, 100.0));
+  State s0;
+  fc.init(s0, 0.0);
+
+  const double dt = 0.01, g = 9.80665;
+  int fix_n = 0;
+  for (int step = 1; step * dt <= 12.0 + 1e-9; ++step) {
+    const double t = step * dt;
+    fc.update_imu(t, 0, 0, 0, 0, 0, g);   // dead still, it is on a table
+    if (step % 2 == 0) {
+      fc.update_encoder(t, 0.0, 0.0, 0.0);
+      fc.update_zupt(t, 0.01);
+    }
+    // 1 Hz, and each fix lands 6 m further out: the worst case for this check,
+    // a receiver whose error walks one way under bad indoor geometry.
+    if (step % 100 == 0) fc.update_gnss(t, fix_at(6.0 * (++fix_n), 0.0));
+  }
+
+  const auto st = fc.get_status();
+  EXPECT_FALSE(st.zupt_parked_but_moving)
+    << "a stationary robot was told its wheel odometry was lying, on "
+    << fix_n << " fixes at straightness " << st.zupt_parked_straightness
+    << ". Straightness is 1.00 by construction over one segment.";
+}
+
+// The same shape, but the accelerometer is what saves it. Ten-plus segments of
+// genuinely straight drift satisfy every geometric test the check has, so
+// geometry alone would fire. The robot is still sitting on a table.
+TEST(IdleDriftTest, StraightDriftOnAStillRobotIsNotDeadEncoders) {
+  FusionCore fc(idle_config(0.001, 100.0));
+  State s0;
+  fc.init(s0, 0.0);
+
+  const double dt = 0.01, g = 9.80665;
+  int fix_n = 0;
+  for (int step = 1; step * dt <= 40.0 + 1e-9; ++step) {
+    const double t = step * dt;
+    fc.update_imu(t, 0, 0, 0, 0, 0, g);
+    if (step % 2 == 0) {
+      fc.update_encoder(t, 0.0, 0.0, 0.0);
+      fc.update_zupt(t, 0.01);
+    }
+    if (step % 100 == 0) fc.update_gnss(t, fix_at(1.5 * (++fix_n), 0.0));
+  }
+
+  const auto st = fc.get_status();
+  EXPECT_GE(st.zupt_parked_straightness, 0.85)
+    << "the scenario is meant to be geometrically indistinguishable from real "
+       "motion; if it is not, it is not testing what it claims to";
+  EXPECT_FALSE(st.zupt_parked_but_moving)
+    << "geometry alone fired on a robot whose accelerometer read dead flat";
 }
 
 // ─── And it must NOT fire on a robot that is genuinely parked ───────────────
@@ -433,4 +503,162 @@ TEST(IdleDriftTest, WithoutTheImuCheckTheDeadEncoderIsBelieved) {
   EXPECT_TRUE(zupt_fired_with_vibration(2.0, /*threshold=*/0.0))
       << "with the check disabled ZUPT should still fire on the lying wheels, "
          "otherwise the two tests above prove nothing";
+}
+
+// ─── #145: the parked inflation must stand down for a BIASED filter ──────────
+//
+// The inflation cannot tell a receiver repeating a correlated error from a filter that
+// is simply wrong, and it refuses the correction for both. Measured on
+// fc_field_20260926_1755: the filter sat 8.20 m from a receiver scattering 2.8 m,
+// accepted all 150 parked fixes, and moved 0.279 m in total. Effective gain 0.0002.
+
+namespace {
+
+// Park the filter, feed it fixes offset by `offset_m` from where it thinks it is, and
+// report how far it actually moved toward them.
+double parked_pull(double offset_m, double bias_ratio)
+{
+  FusionCoreConfig cfg = idle_config(0.001, 100.0);
+  cfg.zupt_gnss_bias_ratio = bias_ratio;
+  // Match the FIELD geometry, or the scenario tests a different mechanism. On
+  // fc_field_20260926_1755 the offset was 8.20 m against a receiver reporting 2.8 m, so
+  // the chi2 distance was about 2 sigma and every fix was ACCEPTED. With the harness
+  // default of 1.0 m noise the same offset is a gross outlier: it fails the gate, arms
+  // coast, inflates P and then jumps, which is not the defect under test.
+  cfg.gnss.base_noise_xy = 2.8;
+  cfg.gnss.base_noise_z  = 2.8;
+  FusionCore fc(cfg);
+  State s0;
+  fc.init(s0, 0.0);
+
+  const double dt = 0.01, g = 9.80665;
+  double t = 0.0;
+  // Settle a parked window first so the scatter statistics exist.
+  for (int i = 0; i < 6000; ++i) {
+    t += dt;
+    fc.update_imu(t, 0, 0, 0, 0, 0, g);
+    if (i % 2 == 0) fc.update_encoder(t, 0.0, 0.0, 0.0);
+    if (i % 100 == 0) fc.update_gnss(t, fix_at(wander(t), wander(t + 7.0)));
+  }
+  const double x_before = fc.get_state().x[X];
+  // Now every fix sits offset_m away, which is what a biased filter sees.
+  for (int i = 0; i < 20000; ++i) {
+    t += dt;
+    fc.update_imu(t, 0, 0, 0, 0, 0, g);
+    if (i % 2 == 0) fc.update_encoder(t, 0.0, 0.0, 0.0);
+    if (i % 100 == 0) fc.update_gnss(t, fix_at(offset_m + wander(t), wander(t + 7.0)));
+  }
+  return std::abs(fc.get_state().x[X] - x_before);
+}
+
+}  // namespace
+
+TEST(IdleDrift, BiasRatioDefaultIsTheMeasuredValue) {
+  // Swept on the rover bags: 5.0 keeps ALL the idle-drift benefit (1810 excursion 0.36 m
+  // against 0.37 m with the check off) while halving the closure cost (1755 3.80 -> 1.83).
+  // At 3.0 closure is better still at 1.18 m but idle drift degrades to 1.59 m, which
+  // gives away the thing the inflation exists for.
+  EXPECT_DOUBLE_EQ(FusionCoreConfig{}.zupt_gnss_bias_ratio, 5.0);
+}
+
+// NOT TESTED HERE, deliberately: the full freeze.
+//
+// On fc_field_20260926_1755 the effective per-fix gain was 0.0002 and the filter moved
+// 0.279 m across 150 fixes showing it 8.20 m of error. This synthetic reaches a gain
+// around 0.01 and converges 7.88 m over 200 fixes even with the inflation at 100, so it
+// does NOT reproduce the freeze and an assertion here would be testing something else.
+//
+// What makes the field case 50x stiffer is not captured by a smooth synthetic wander:
+// the real receiver's lag-1 correlation saturates the cap for far longer while the held
+// covariance stays small. The freeze is covered against the REAL bag instead, by
+// hardware/replay.cpp on fc_field_20260926_1755, where closure goes 3.80 m to 1.83 m
+// with only zupt.gnss_bias_ratio changed. Do not add a synthetic assertion for it
+// without first reproducing the 0.0002 gain, or it will pass for the wrong reason.
+
+TEST(IdleDrift, BiasCheckLetsAGrossOffsetCorrect) {
+  const double moved = parked_pull(8.2, 5.0);
+  EXPECT_GT(moved, 5.0)
+      << "the bias check should let an 8.2 m offset pull the estimate in, it moved " << moved;
+}
+
+TEST(IdleDrift, BiasCheckDoesNotFireOnOrdinaryParkedWander) {
+  // The other half. A receiver wandering within its own scatter must STILL be
+  // suppressed, or the check has simply disabled the feature by another route.
+  const double moved = parked_pull(0.0, 5.0);
+  EXPECT_LT(moved, 2.0)
+      << "ordinary parked wander must stay suppressed, it moved " << moved;
+}
+
+// ─── A parked window must not span a GNSS solution-type change ───────────────
+//
+// Suggested by a Septentrio integrator replying to the ROS Discourse thread this
+// estimator came from: "reset your correlation estimate whenever the mode changes,
+// because the error process is different on each side of the switch."
+//
+// That is right, and the rover has the evidence. The same receiver measured 160x
+// MORE SMOOTHED than it declared on one pass, and 13.6x MORE OPTIMISTIC than it
+// declared after it acquired SBAS later the same day. Standalone, SBAS, DGNSS, RTK
+// float and RTK fixed each have their own magnitude and their own correlation time.
+// A window straddling a switch reports an r that describes neither side.
+namespace {
+
+// Park the robot and feed it `n_before` fixes in one solution type, then `n_after`
+// in another, and report the observed-sigma the estimator ends up with. After a mode
+// change that number must describe only the fixes since the change.
+double parked_sigma_after_mode_change(sensors::GnssFixType before,
+                                      sensors::GnssFixType after,
+                                      int n_before, int n_after) {
+  FusionCoreConfig cfg = idle_config(0.001, 100.0);
+  cfg.zupt_gnss_min_samples = 3;
+  FusionCore fc(cfg);
+  State s0;
+  fc.init(s0, 0.0);
+  const double DT = 0.01, G = 9.80665;
+  int step = 0;
+  auto feed = [&](sensors::GnssFixType ft, int n, double amp) {
+    for (int i = 0; i < n; ++i) {
+      for (int k = 0; k < 100; ++k) {           // 1 s of IMU and stationary encoder
+        const double t = (++step) * DT;
+        fc.update_imu(t, 0, 0, 0, 0, 0, G);
+        if (step % 2 == 0) {
+          fc.update_encoder(t, 0.0, 0.0, 0.0);
+          fc.update_ground_constraint(t);
+          fc.update_zupt(t, 0.01);            // the wheels assert stillness
+        }
+      }
+      sensors::GnssFix f = fix_at(amp * wander(step * DT), 0.0);
+      f.fix_type = ft;
+      fc.update_gnss(step * DT, f);
+    }
+  };
+  feed(before, n_before, 4.0);                  // a wide, wandering mode
+  feed(after,  n_after,  0.02);                 // then a tight one
+  return fc.get_status().gnss_parked_sigma_observed;
+}
+
+}  // namespace
+
+TEST(IdleDrift, ParkedEvidenceRestartsWhenTheSolutionTypeChanges)
+{
+  // The reference: a window that only ever saw the WIDE mode. Its observed sigma is
+  // metres, because that is what those fixes actually spread.
+  const double wide_only = parked_sigma_after_mode_change(
+      sensors::GnssFixType::GPS_FIX, sensors::GnssFixType::GPS_FIX, 30, 0);
+
+  // 30 wide fixes, then the receiver switches to RTK fixed and sends 5 tight ones.
+  // If the window carried across the switch the sigma would still be dominated by
+  // the wide mode. It must instead describe only the fixes since the change.
+  const double after_change = parked_sigma_after_mode_change(
+      sensors::GnssFixType::GPS_FIX, sensors::GnssFixType::RTK_FIXED, 30, 5);
+
+  ASSERT_GT(wide_only, 0.1) << "the wide mode is not wide enough to make this a test";
+  ASSERT_GT(after_change, 0.0) << "estimator produced no observed sigma";
+
+  // Not "approximately equal to a tight-only run": the two runs sample different
+  // phases of the wander, so their sigmas legitimately differ. What matters is the
+  // order of magnitude, which is the whole point of restarting the window.
+  EXPECT_LT(after_change, wide_only / 10.0)
+      << "after=" << after_change << " wide_only=" << wide_only
+      << ": the window still reflects the mode it was in BEFORE the switch, so a "
+         "solution-type change is not restarting the parked evidence";
 }
